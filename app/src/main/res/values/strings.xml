@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">YggGram</string>
+    <string name="nav_chats">Чаты</string>
+    <string name="nav_network">Сеть и ТСПУ</string>
+    <string name="nav_vault">Ключи и Синхр.</string>
+    <string name="nav_profile">Профиль</string>
+    <string name="status_online_ygg">Yggdrasil Userspace • Защищено</string>
+    <string name="status_offline_sf">Офлайн-режим • Очередь Store &amp; Forward</string>
+    <string name="search_chats_hint">Поиск по чатам, IPv6 200:... или ключам</string>
+    <string name="new_chat_button">Новый чат или P2P-контакт</string>
+    <string name="send_message_desc">Отправить зашифрованное сообщение</string>
+    <string name="attach_file_desc">Передать файл по P2P</string>
+</resources>

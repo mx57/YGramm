@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer cryptographic hexagon shield inside 66dp safe zone -->
+    <path
+        android:fillColor="#1410B981"
+        android:strokeColor="#10B981"
+        android:strokeWidth="2.8"
+        android:pathData="M54,24 L80,39 L80,69 L54,84 L28,69 L28,39 Z" />
+    <!-- Yggdrasil mesh tree branches & central routing trunk -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#34D399"
+        android:strokeWidth="3.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,74 L54,48 M54,52 L38,38 M54,52 L70,38 M54,48 L54,33 M44,70 L54,62 L64,70" />
+    <!-- Mesh routing nodes -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,33 m-4.5,0 a4.5,4.5 0 1,0 9,0 a4.5,4.5 0 1,0 -9,0" />
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M38,38 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path
+        android:fillColor="#06B6D4"
+        android:pathData="M70,38 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M54,52 m-4.2,0 a4.2,4.2 0 1,0 8.4,0 a4.2,4.2 0 1,0 -8.4,0" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M44,70 m-3.2,0 a3.2,3.2 0 1,0 6.4,0 a3.2,3.2 0 1,0 -6.4,0" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M64,70 m-3.2,0 a3.2,3.2 0 1,0 6.4,0 a3.2,3.2 0 1,0 -6.4,0" />
+</vector>

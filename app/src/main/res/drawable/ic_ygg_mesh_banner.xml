@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="360dp"
+    android:height="120dp"
+    android:viewportWidth="360"
+    android:viewportHeight="120">
+    <path android:pathData="M0,0h360v120h-360z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="360"
+                android:endY="120"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#090D12" />
+                <item android:offset="0.5" android:color="#0E1B24" />
+                <item android:offset="1.0" android:color="#07221B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Encrypted Mesh Edges -->
+    <path
+        android:strokeColor="#3310B981"
+        android:strokeWidth="1.5"
+        android:pathData="M30,90 L95,35 L175,75 L255,28 L330,65 M95,35 L180,22 L255,28 M30,90 L120,98 L175,75 L270,92 L330,65" />
+    <path
+        android:strokeColor="#6606B6D4"
+        android:strokeWidth="2"
+        android:pathData="M30,90 L95,35 L180,22 L255,28 L330,65" />
+    <!-- Active Mesh Nodes -->
+    <path android:fillColor="#10B981" android:pathData="M30,90 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <path android:fillColor="#06B6D4" android:pathData="M95,35 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+    <path android:fillColor="#34D399" android:pathData="M180,22 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+    <path android:fillColor="#F59E0B" android:pathData="M175,75 m-5.5,0 a5.5,5.5 0 1,0 11,0 a5.5,5.5 0 1,0 -11,0" />
+    <path android:fillColor="#10B981" android:pathData="M255,28 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0" />
+    <path android:fillColor="#06B6D4" android:pathData="M330,65 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0" />
+</vector>

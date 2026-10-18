@@ -1,0 +1,6 @@
+{
+  "name": "YggGram",
+  "description": "Децентрализованный P2P-мессенджер на базе оверлейной сети Yggdrasil со сквозным шифрованием, защитой от ТСПУ/DPI, обходом белых списков, передачей файлов и кроссплатформенной синхронизацией.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
