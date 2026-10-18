@@ -171,61 +171,13 @@ class YggTwinP2PBridge(
                     )
                     sendRawToPort(ackFrame, localUdpPort)
 
-                    // Step 2: Generate realistic peer reply over UDP
-                    if (!externalTwinSeen || chatId != "chat_twin_node") {
-                        delay(280)
-                        val rtt = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L)
-                        val replyText = buildSmartYggReply(chatId, peerTitle, plainText, rtt)
-                        val replyCipher = YggCryptoEngine.encryptDoubleRatchetEnvelope(
-                            plainText = replyText,
-                            peerPublicKeyHex = YggCryptoEngine.sha256Hex(peerIpv6),
-                            ratchetStep = ((System.currentTimeMillis() / 1000L) % 500).toInt() + 20,
-                            sealedSender = true
-                        )
-                        val replyPow = YggCryptoEngine.computeHashcashStamp(
-                            recipientIpv6 = peerIpv6,
-                            payloadHashHex = replyCipher,
-                            difficultyBits = 8
-                        )
-                        val replyFrame = encodeWireFrame(
-                            mapOf(
-                                "type" to "MSG_LOOPBACK_REPLY",
-                                "chatId" to chatId,
-                                "senderNodeLabel" to peerTitle,
-                                "senderIpv6" to peerIpv6,
-                                "plainText" to replyText,
-                                "cipherPayloadHex" to replyCipher,
-                                "hashcashToken" to replyPow,
-                                "sentAt" to sentAt.toString(),
-                                "timestamp" to System.currentTimeMillis().toString()
-                            )
-                        )
-                        sendRawToPort(replyFrame, localUdpPort)
-                    }
+                    // Step 2: Only real message dispatching. Fake replies are strictly removed.
                 }
             }
         } catch (_: Exception) {
         }
     }
 
-    private fun buildSmartYggReply(
-        chatId: String,
-        peerTitle: String,
-        userText: String,
-        rttMs: Long
-    ): String {
-        val cleanTitle = peerTitle.substringBefore(" (")
-        return when {
-            userText.contains("пинг", ignoreCase = true) || userText.contains("тест", ignoreCase = true) ->
-                "[$cleanTitle • Yggdrasil P2P]: Пакет принят и расшифрован! Маршрут 0200::/7 активен, RTT = ${rttMs} мс, потерь 0%."
-            chatId == "chat_twin_node" ->
-                "[$cleanTitle]: Сообщение «${userText.take(45)}» доставлено через локальный UDP-мост Yggdrasil (Double Ratchet + Sealed Sender ОК)."
-            chatId == "chat_mls_ru_mesh" ->
-                "[Координатор MLS TreeKEM]: Пакет от вашего узла верифицирован группой (${rttMs} мс). Обход белых списков через WSS CDN работает штатно."
-            else ->
-                "[$cleanTitle]: Принято по прямому маршруту Yggdrasil («${userText.take(40)}»). Подпись Ed25519 и шаг рэтчета подтверждены."
-        }
-    }
 
     private suspend fun handleIncomingNodeFrame(rawFrame: String) {
         try {

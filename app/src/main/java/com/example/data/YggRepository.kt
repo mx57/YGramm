@@ -627,6 +627,11 @@ class YggRepository(private val dao: YggDao) {
         }
     }
 
+    suspend fun deleteConversation(chatId: String) {
+        dao.clearMessagesInChat(chatId)
+        dao.deleteConversation(chatId)
+    }
+
     suspend fun createNewConversation(
         title: String,
         yggIpv6Input: String,

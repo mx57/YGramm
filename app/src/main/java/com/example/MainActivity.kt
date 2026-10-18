@@ -59,6 +59,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.ui.components.NetworkStatusIndicator
+import com.example.ui.components.YggNetworkStatus
 import com.example.ui.screens.ChatsScreen
 import com.example.ui.screens.NetworkDpiScreen
 import com.example.ui.screens.ProfilePrivacyScreen
@@ -162,13 +164,26 @@ fun YggGramRootApp(
                                         )
                                     }
                                 }
-                                Text(
-                                    text = "${uiState.identity.yggIpv6Address.take(21)}... • Пиров: $connectedPeers",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = CyberTealSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    val networkStatus = when {
+                                        !uiState.isNetworkAvailable -> YggNetworkStatus.ERROR
+                                        connectedPeers > 0 -> YggNetworkStatus.CONNECTED
+                                        else -> YggNetworkStatus.SEARCHING
+                                    }
+                                    NetworkStatusIndicator(
+                                        status = networkStatus,
+                                        connectedPeersCount = connectedPeers,
+                                        onClick = { viewModel.selectTab(YggNavTab.NETWORK_DPI) }
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "${uiState.identity.yggIpv6Address.take(18)}...",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = CyberTealSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     },
@@ -338,6 +353,7 @@ fun YggGramRootApp(
                                 onToggleOfflineMode = viewModel::toggleOfflineStoreAndForwardMode,
                                 onSendMessage = viewModel::sendMessage,
                                 onCreateNewChat = viewModel::createNewChatOrGroup,
+                                onDeleteChat = viewModel::deleteChat,
                                 onToggleTransferState = viewModel::toggleFileTransferState,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest
                             )
