@@ -46,6 +46,9 @@ interface YggDao {
     @Query("DELETE FROM messages WHERE chatId = :chatId")
     suspend fun clearMessagesInChat(chatId: String)
 
+    @Query("DELETE FROM conversations WHERE chatId = :chatId")
+    suspend fun deleteConversation(chatId: String)
+
     @Query("SELECT * FROM p2p_file_transfers ORDER BY timestamp DESC")
     fun observeFileTransfers(): Flow<List<P2PFileTransferEntity>>
 

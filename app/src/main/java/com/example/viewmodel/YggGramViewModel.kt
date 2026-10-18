@@ -117,6 +117,7 @@ data class YggGramUiState(
     val searchQuery: String = "",
     val selectedChatFilter: String = "ALL",
     val isOfflineStoreAndForwardMode: Boolean = false,
+    val isNetworkAvailable: Boolean = true,
     val isCloneInstance: Boolean = false,
     val isTwinAppReachable: Boolean = true,
     val localUdpPort: Int = 51921,
@@ -237,6 +238,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             repository.ensureSeeded(initialIdentity, isCloneNode = isCloneNode)
             twinBridge.startBridgeListener()
+            startNetworkConnectivityObserver()
+        }
+    }
+
+    private fun startNetworkConnectivityObserver() {
+        val connectivityManager = application.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+        if (connectivityManager != null) {
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+
+            val initialHasInternet = connectivityManager.activeNetwork != null
+            _uiState.update { it.copy(isNetworkAvailable = initialHasInternet) }
+
+            connectivityManager.registerNetworkCallback(
+                request,
+                object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: android.net.Network) {
+                        _uiState.update { it.copy(isNetworkAvailable = true) }
+                    }
+
+                    override fun onLost(network: android.net.Network) {
+                        _uiState.update { it.copy(isNetworkAvailable = false) }
+                    }
+                }
+            )
         }
     }
 
@@ -254,6 +281,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (chatId != null) {
             viewModelScope.launch {
                 repository.markConversationRead(chatId)
+            }
+        }
+    }
+
+    fun deleteChat(chatId: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId }
+            repository.deleteConversation(chatId)
+            if (_uiState.value.selectedChatId == chatId) {
+                _uiState.update { it.copy(selectedChatId = null) }
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Чат «${targetConv?.title ?: "Диалог"}» и вся его история сообщений удалены"
+                )
             }
         }
     }

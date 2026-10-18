@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudQueue
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Groups
@@ -104,6 +105,7 @@ fun ChatsScreen(
     onToggleOfflineMode: () -> Unit,
     onSendMessage: (String, String, String?, Long) -> Unit,
     onCreateNewChat: (String, String, Boolean, Boolean, Int) -> Unit,
+    onDeleteChat: (String) -> Unit = {},
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onRunSendReceiveTest: (String?) -> Unit = {}
 ) {
@@ -159,6 +161,7 @@ fun ChatsScreen(
                         onSearchQueryChange = onSearchQueryChange,
                         onFilterChange = onFilterChange,
                         onToggleOfflineMode = onToggleOfflineMode,
+                            onDeleteChat = onDeleteChat,
                         onToggleTransferState = onToggleTransferState,
                         onOpenNewChatDialog = { showNewChatDialog = true },
                         onRunSendReceiveTest = { onRunSendReceiveTest(uiState.selectedChatId) }
@@ -181,6 +184,7 @@ fun ChatsScreen(
                                 onSendMessage(activeConversation.chatId, text, null, 0L)
                             },
                             onOpenP2PAttach = { showP2PAttachDialog = true },
+                            onDeleteChat = { onDeleteChat(activeConversation.chatId) },
                             onToggleTransferState = onToggleTransferState,
                             onRunSendReceiveTest = { onRunSendReceiveTest(activeConversation.chatId) }
                         )
@@ -203,6 +207,7 @@ fun ChatsScreen(
                         onSendMessage(activeConversation.chatId, text, null, 0L)
                     },
                     onOpenP2PAttach = { showP2PAttachDialog = true },
+                    onDeleteChat = { onDeleteChat(activeConversation.chatId) },
                     onToggleTransferState = onToggleTransferState,
                     onRunSendReceiveTest = { onRunSendReceiveTest(activeConversation.chatId) }
                 )
@@ -216,6 +221,7 @@ fun ChatsScreen(
                     onSearchQueryChange = onSearchQueryChange,
                     onFilterChange = onFilterChange,
                     onToggleOfflineMode = onToggleOfflineMode,
+                    onDeleteChat = onDeleteChat,
                     onToggleTransferState = onToggleTransferState,
                     onOpenNewChatDialog = { showNewChatDialog = true },
                     onRunSendReceiveTest = { onRunSendReceiveTest(null) }
@@ -256,6 +262,7 @@ private fun ChatListPane(
     onSearchQueryChange: (String) -> Unit,
     onFilterChange: (String) -> Unit,
     onToggleOfflineMode: () -> Unit,
+    onDeleteChat: (String) -> Unit,
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onOpenNewChatDialog: () -> Unit,
     onRunSendReceiveTest: () -> Unit
@@ -336,7 +343,8 @@ private fun ChatListPane(
                 ConversationRowCard(
                     conversation = conv,
                     isSelected = conv.chatId == uiState.selectedChatId,
-                    onClick = { onSelectChat(conv.chatId) }
+                    onClick = { onSelectChat(conv.chatId) },
+                    onDelete = { onDeleteChat(conv.chatId) }
                 )
             }
         }
@@ -571,8 +579,10 @@ private fun P2PFileTransfersStrip(
 private fun ConversationRowCard(
     conversation: ConversationEntity,
     isSelected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onDelete: () -> Unit
 ) {
+    var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     Card(
         modifier = Modifier
@@ -692,9 +702,46 @@ private fun ConversationRowCard(
                             )
                         }
                     }
+                    IconButton(
+                        onClick = { showDeleteConfirm = true },
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("delete_chat_icon_${conversation.chatId}")
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Удалить чат",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
             }
         }
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Удалить чат?") },
+            text = { Text("Вы уверены, что хотите удалить чат «${conversation.title}» и всю историю сообщений? Это действие нельзя отменить.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showDeleteConfirm = false
+                        onDelete()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Удалить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 }
 
@@ -708,11 +755,13 @@ private fun ChatDetailPane(
     onBack: () -> Unit,
     onSendMessage: (String) -> Unit,
     onOpenP2PAttach: () -> Unit,
+    onDeleteChat: () -> Unit = {},
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onRunSendReceiveTest: () -> Unit = {}
 ) {
     var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
+    var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // E2EE Header
@@ -777,6 +826,16 @@ private fun ChatDetailPane(
                             style = MaterialTheme.typography.labelMedium
                         )
                     }
+                    IconButton(
+                        onClick = { showDeleteConfirmDialog = true },
+                        modifier = Modifier.testTag("delete_chat_in_detail_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Удалить чат",
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
 
                 AnimatedVisibility(visible = showCipherInspector) {
@@ -830,6 +889,30 @@ private fun ChatDetailPane(
                     showCipherHex = showCipherInspector
                 )
             }
+        }
+
+        if (showDeleteConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showDeleteConfirmDialog = false },
+                title = { Text("Удалить чат «${conversation.title}»?") },
+                text = { Text("Это действие удалит весь диалог и связанную с ним историю сообщений из памяти устройства.") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showDeleteConfirmDialog = false
+                            onDeleteChat()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("Удалить")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                        Text("Отмена")
+                    }
+                }
+            )
         }
 
         // Message Composer
