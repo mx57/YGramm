@@ -636,11 +636,6 @@ class YggRepository(
         if (conv == null) {
             val newChatId = "chat_${targetOwnerProfileId}_${packet.senderIpv6.hashCode().toUInt()}"
             val senderProfile = allProfiles.find { it.yggIpv6Address.equals(packet.senderIpv6, ignoreCase = true) }
-            val endpointHint = if (senderProfile != null) {
-                "127.0.0.1:${senderProfile.allocatedTcpPort}"
-            } else {
-                "Входящий пир Yggdrasil"
-            }
             val created = ConversationEntity(
                 chatId = newChatId,
                 title = packet.senderNodeLabel.ifBlank { "Пир ${packet.senderIpv6.take(16)}" },
@@ -655,12 +650,8 @@ class YggRepository(
                 lastTimestamp = packet.timestamp,
                 isOnlineInMesh = true,
                 avatarColorHex = senderProfile?.avatarColorHex ?: "#10B981",
-                bioStatus = endpointHint,
-                routeTransportSummary = if (senderProfile != null) {
-                    "Direct P2P (127.0.0.1:${senderProfile.allocatedTcpPort})"
-                } else {
-                    "Yggdrasil Mesh (${packet.rttMs} мс)"
-                },
+                bioStatus = "Маршрут через внешние пиры Yggdrasil 0200::/7",
+                routeTransportSummary = "Yggdrasil Overlay 0200::/7 (${packet.rttMs} мс)",
                 ownerProfileId = targetOwnerProfileId
             )
             dao.upsertConversation(created)
@@ -827,7 +818,7 @@ class YggRepository(
                 it.yggIpv6Address.equals(cleanIpv6, ignoreCase = true)
         }
         if (existingForProfile != null) {
-            if (extractedLanHint.isNotBlank()) {
+            if (extractedLanHint.isNotBlank() && !extractedLanHint.startsWith("127.0.0.1:")) {
                 dao.upsertConversation(
                     existingForProfile.copy(
                         bioStatus = extractedLanHint,
@@ -835,12 +826,22 @@ class YggRepository(
                         isOnlineInMesh = true
                     )
                 )
+            } else if (existingForProfile.bioStatus.startsWith("127.0.0.1:") ||
+                existingForProfile.routeTransportSummary.contains("127.0.0.1:")
+            ) {
+                dao.upsertConversation(
+                    existingForProfile.copy(
+                        bioStatus = "Маршрут через внешние пиры Yggdrasil 0200::/7",
+                        routeTransportSummary = "Yggdrasil 0200::/7 Overlay"
+                    )
+                )
             }
             return existingForProfile.chatId
         }
 
+        val effectiveHint = extractedLanHint.takeUnless { it.startsWith("127.0.0.1:") }.orEmpty()
         val endpointSummary = when {
-            extractedLanHint.isNotBlank() -> "Direct P2P ($extractedLanHint)"
+            effectiveHint.isNotBlank() -> "Direct P2P ($effectiveHint)"
             extractedAddress.contains(".") && extractedAddress.contains(":") -> "Direct P2P ($extractedAddress)"
             else -> "Yggdrasil 0200::/7 Overlay"
         }
@@ -858,9 +859,9 @@ class YggRepository(
             unreadCount = 0,
             lastMessagePreview = "Нет сообщений • Начните диалог",
             lastTimestamp = now,
-            isOnlineInMesh = extractedLanHint.startsWith("127.0.0.1:"),
+            isOnlineInMesh = false,
             avatarColorHex = if (isMlsGroup) "#06B6D4" else "#10B981",
-            bioStatus = extractedLanHint.ifBlank { "Контакт в сети Yggdrasil" },
+            bioStatus = effectiveHint.ifBlank { "Маршрут через внешние пиры Yggdrasil 0200::/7" },
             routeTransportSummary = endpointSummary,
             ownerProfileId = ownerProfileId
         )

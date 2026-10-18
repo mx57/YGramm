@@ -798,8 +798,8 @@ fun ProfilePrivacyScreen(
                     )
 
                     PrivacyToggleItem(
-                        title = "Локальное обнаружение устройств (Zero-Conf LAN P2P)",
-                        subtitle = "Позволяет синхронизировать телефон и ПК в одной Wi-Fi/Ethernet сети на максимальной скорости без интернета",
+                        title = "Ручной переключатель LAN (Резервный обход при отсутствии пиров Yggdrasil)",
+                        subtitle = "По умолчанию ВЫКЛ: все сообщения, звонки и файлы между профилями идут строго через внешние пиры Yggdrasil 0200::/7",
                         checked = privacy.allowDirectLanDiscovery,
                         tag = "privacy_lan_discovery_switch",
                         onCheckedChange = {

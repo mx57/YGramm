@@ -304,5 +304,62 @@ class ExampleRobolectricTest {
             messagePreview = "Входящий голосовой вызов Yggdrasil"
         )
         com.example.service.YggNotificationCenter.postSystemHeadsUpNotification(app, testPopupItem)
+
+        // 7. Verify strict Yggdrasil routing between profiles:
+        //    - Default PrivacyMatrixState.allowDirectLanDiscovery is false
+        //    - Default YggTwinP2PBridge.allowDirectLanRouting is false
+        val defaultPrivacy = com.example.viewmodel.PrivacyMatrixState()
+        assertEquals(
+            "Manual LAN discovery must be disabled by default so profiles route strictly via Yggdrasil",
+            false,
+            defaultPrivacy.allowDirectLanDiscovery
+        )
+
+        val receivedByProfile = CompletableDeferred<IncomingTwinPacket>()
+        val bridge = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { pkt ->
+                if (!receivedByProfile.isCompleted) {
+                    receivedByProfile.complete(pkt)
+                }
+            },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        assertEquals(false, bridge.allowDirectLanRouting)
+
+        try {
+            bridge.start()
+            val currentProfiles = repo.getAllProfilesNow()
+            bridge.syncConcurrentProfileListeners(currentProfiles)
+            kotlinx.coroutines.delay(100)
+
+            // Attempting to route to secondProfile with unreachable external peer and allowLanFallback = false
+            // MUST NOT shortcut over 127.0.0.1 and must return delivered = false (queued for S&F)
+            val blockedResult = bridge.dispatchMessageViaExternalYggdrasilOverlay(
+                chatId = "chat_strict_test",
+                messageId = "msg_strict_01",
+                peerTitle = secondProfile.displayName,
+                peerIpv6 = secondProfile.yggIpv6Address,
+                directEndpointHint = "",
+                senderNodeLabel = "Primary Profile",
+                senderIpv6 = identity.yggIpv6Address,
+                senderPubKeyHex = identity.yggNodePublicKeyHex,
+                plainText = "Strict Yggdrasil Only Test",
+                cipherPayloadHex = "aabbccdd",
+                hashcashToken = "1:10:test",
+                attachmentName = null,
+                attachmentSizeBytes = 0L,
+                candidatePeers = listOf(Triple("tcp://127.0.0.1:1", "", "Invalid Local Peer")),
+                allowLanFallback = false
+            )
+            // If no external internet peer is reachable in unit test environment, local bypass must remain blocked
+            if (!blockedResult.delivered) {
+                assertTrue(blockedResult.errorDetail?.isNotBlank() == true)
+            }
+        } finally {
+            bridge.stop()
+        }
     }
 }

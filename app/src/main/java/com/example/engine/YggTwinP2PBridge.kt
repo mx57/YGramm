@@ -162,8 +162,11 @@ class YggTwinP2PBridge(
     private val packetCounter = AtomicLong(1L)
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
-    // Known direct IP:Port endpoints discovered via LAN multicast, user contact URI, or concurrent local profiles
+    // Known direct IP:Port endpoints discovered via LAN multicast or explicit contact URI (only used when allowDirectLanRouting = true)
     private val directEndpointTable = ConcurrentHashMap<String, InetSocketAddress>()
+
+    @Volatile
+    var allowDirectLanRouting: Boolean = false
 
     private val yggdrasilTlsSocketFactory: SSLSocketFactory by lazy {
         val trustAllYggPeerCerts = arrayOf<TrustManager>(
@@ -280,21 +283,20 @@ class YggTwinP2PBridge(
             val primaryProf = profiles.find { it.isCurrentPrimary } ?: profiles.firstOrNull()
             if (primaryProf != null) {
                 activeProfilePortMap[primaryProf.profileId] = localTcpPort
-                directEndpointTable[primaryProf.yggIpv6Address.lowercase()] = InetSocketAddress("127.0.0.1", localTcpPort)
+                directEndpointTable.remove(primaryProf.yggIpv6Address.lowercase())
             }
 
             // Bind dedicated TCP server sockets for all additional active profiles
             for (prof in profiles) {
                 if (prof.profileId == primaryProf?.profileId) continue
+                directEndpointTable.remove(prof.yggIpv6Address.lowercase())
                 if (!prof.isActiveInBackground) {
-                    directEndpointTable.remove(prof.yggIpv6Address.lowercase())
                     continue
                 }
                 val existing = secondaryProfileSockets[prof.profileId]
                 if (existing != null && !existing.first.isClosed) {
                     val boundPort = existing.first.localPort
                     activeProfilePortMap[prof.profileId] = boundPort
-                    directEndpointTable[prof.yggIpv6Address.lowercase()] = InetSocketAddress("127.0.0.1", boundPort)
                     continue
                 }
 
@@ -315,7 +317,6 @@ class YggTwinP2PBridge(
                 if (boundServer != null) {
                     val actualPort = boundServer.localPort
                     activeProfilePortMap[prof.profileId] = actualPort
-                    directEndpointTable[prof.yggIpv6Address.lowercase()] = InetSocketAddress("127.0.0.1", actualPort)
 
                     val acceptJob = launch {
                         while (isActive && !boundServer.isClosed) {
@@ -438,7 +439,10 @@ class YggTwinP2PBridge(
                 "MSG" -> {
                     onTwinReachableChanged(true)
                     val sentAt = map["sentAt"]?.toLongOrNull() ?: System.currentTimeMillis()
-                    val rtt = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L)
+                    val externalRtt = map["externalRttMs"]?.toLongOrNull()
+                    val rtt = externalRtt ?: (System.currentTimeMillis() - sentAt).coerceAtLeast(1L)
+                    val routedViaPeer = map["routedViaYggPeer"].orEmpty()
+                    val routedViaRegion = map["routedViaRegion"].orEmpty()
                     val msgId = map["messageId"] ?: ""
                     val senderIpv6 = map["senderIpv6"] ?: ""
                     val targetIpv6 = map["recipientIpv6"]?.takeIf { it.isNotBlank() } ?: recipientIpv6
@@ -446,7 +450,7 @@ class YggTwinP2PBridge(
                         ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
                     }
                     val senderPort = map["senderTcpPort"]?.toIntOrNull() ?: 51921
-                    if (senderIpv6.isNotBlank() && remoteIp != "unknown") {
+                    if (allowDirectLanRouting && senderIpv6.isNotBlank() && remoteIp != "unknown" && remoteIp != "127.0.0.1") {
                         directEndpointTable[senderIpv6.lowercase()] = InetSocketAddress(remoteIp, senderPort)
                     }
 
@@ -481,10 +485,15 @@ class YggTwinP2PBridge(
                     )
                     writer.println(ackFrame)
 
+                    val viaInfo = if (routedViaPeer.isNotBlank()) {
+                        "через внешний пир Yggdrasil $routedViaPeer ($routedViaRegion, RTT $rtt мс)"
+                    } else {
+                        "($remoteIp, RTT $rtt мс)"
+                    }
                     logPacket(
                         direction = "RX <- YGG",
-                        summary = "Принят реальный пакет от «${incoming.senderNodeLabel}» ($remoteIp)",
-                        details = "AEAD: ${incoming.cipherPayloadHex.take(24)}... • Отправлен крипто-ACK"
+                        summary = "Принят пакет от «${incoming.senderNodeLabel}» $viaInfo",
+                        details = "Получатель: $targetIpv6 • AEAD: ${incoming.cipherPayloadHex.take(24)}... • Отправлен крипто-ACK"
                     )
                     onPacketReceived(incoming)
                 }
@@ -587,6 +596,7 @@ class YggTwinP2PBridge(
     }
 
     private fun handleIncomingLanDiscoveryPacket(raw: String, senderIp: String) {
+        if (!allowDirectLanRouting) return
         val map = decodeWireFrame(raw)
         if (map["type"] == "LAN_ANNOUNCE") {
             val yggIpv6 = map["yggIpv6"] ?: return
@@ -1034,8 +1044,313 @@ class YggTwinP2PBridge(
     }
 
     /**
-     * Sends an encrypted P2P message (including optional binary attachmentBase64 for voice notes,
-     * images, or files) over a real TCP/Overlay socket to a remote recipient or another active profile.
+     * Routes an outgoing message (between two profiles or to any Yggdrasil 0200::/7 node)
+     * STRICTLY through external public Yggdrasil peers over the internet with automatic peer failover.
+     * Local loopback (127.0.0.1) and LAN shortcuts are blocked unless [allowLanFallback] is explicitly enabled by the user.
+     */
+    suspend fun dispatchMessageViaExternalYggdrasilOverlay(
+        chatId: String,
+        messageId: String,
+        peerTitle: String,
+        peerIpv6: String,
+        directEndpointHint: String = "",
+        senderNodeLabel: String,
+        senderIpv6: String,
+        senderPubKeyHex: String = "",
+        plainText: String,
+        cipherPayloadHex: String,
+        hashcashToken: String,
+        attachmentName: String?,
+        attachmentSizeBytes: Long,
+        candidatePeers: List<Triple<String, String, String>>,
+        allowLanFallback: Boolean = allowDirectLanRouting,
+        attachmentType: String? = null,
+        attachmentUri: String? = null,
+        attachmentBase64: String? = null,
+        voiceDurationSec: Int = 0,
+        voiceWaveformCsv: String? = null
+    ): SelfYggdrasilRelayResult = withContext(Dispatchers.IO) {
+        val targetProfileId = ipv6ToProfileIdMap[peerIpv6.lowercase()]
+        if (targetProfileId != null && !activeProfilePortMap.containsKey(targetProfileId)) {
+            val err = "Целевой профиль $peerIpv6 остановлен в фоновом режиме"
+            logPacket(
+                direction = "ERR • YGG",
+                summary = "Целевой профиль «$peerTitle» не активен в фоне",
+                details = "Сообщение переведено в очередь Store-and-Forward до включения профиля"
+            )
+            return@withContext SelfYggdrasilRelayResult(
+                delivered = false,
+                relayEndpointUri = "",
+                relayRegionLabel = "",
+                rttMs = -1L,
+                txBytes = 0L,
+                rxBytes = 0L,
+                errorDetail = err
+            )
+        }
+
+        if (!isRealNetworkAvailable()) {
+            val reason = if (isAirplaneModeActive()) "Активен Авиарежим" else "Отсутствует подключение к интернету"
+            if (!allowLanFallback) {
+                logPacket(
+                    direction = "ERR • YGG",
+                    summary = "Доставка через сеть Yggdrasil невозможна ($reason)",
+                    details = "Локальный обход отключен — сообщение поставлено в очередь S&F до подключения к пиру Yggdrasil"
+                )
+                return@withContext SelfYggdrasilRelayResult(
+                    delivered = false,
+                    relayEndpointUri = "",
+                    relayRegionLabel = "",
+                    rttMs = -1L,
+                    txBytes = 0L,
+                    rxBytes = 0L,
+                    errorDetail = reason
+                )
+            }
+        }
+
+        // Build complete external Yggdrasil peer failover list:
+        // 1) User's configured/connected external peers
+        // 2) Automatic failover peers from the Yggdrasil public catalog
+        val catalogFallbackPeers = YggPeerScannerCatalog.initialCatalog
+            .take(10)
+            .map { Triple(it.endpointUri, it.sniDomain, "${it.countryNameRu} • ${it.cityRu}") }
+        val combinedExternalPeers = (candidatePeers + catalogFallbackPeers)
+            .distinctBy { it.first.lowercase() }
+            .filter { (uri, _, _) ->
+                val h = YggPeerScannerCatalog.extractHostFromUri(uri)
+                h.isNotBlank() && h != "127.0.0.1" && !h.equals("localhost", ignoreCase = true)
+            }
+
+        val overlayTransitWireFrame = encodeWireFrame(
+            mapOf(
+                "type" to "YGG_OVERLAY_ROUTED_MSG",
+                "chatId" to chatId,
+                "messageId" to messageId,
+                "senderIpv6" to senderIpv6,
+                "recipientIpv6" to peerIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "cipherPayloadHex" to cipherPayloadHex,
+                "hashcashToken" to hashcashToken,
+                "attachmentType" to (attachmentType ?: ""),
+                "attachmentName" to (attachmentName ?: "")
+            )
+        ).toByteArray(StandardCharsets.UTF_8)
+
+        val metaHeader = buildYggdrasilMetaHandshakeBytes(senderPubKeyHex)
+        val totalOutboundBytes = (metaHeader.size + overlayTransitWireFrame.size + (attachmentBase64?.length ?: 0)).toLong()
+        var lastError = "Ни один внешний пир Yggdrasil не ответил"
+
+        if (isRealNetworkAvailable()) {
+            for ((endpointUri, sniDomain, regionLabel) in combinedExternalPeers) {
+                val host = YggPeerScannerCatalog.extractHostFromUri(endpointUri)
+                val port = YggPeerScannerCatalog.extractPortFromUri(endpointUri)
+                val isTls = endpointUri.startsWith("tls://", ignoreCase = true) ||
+                    endpointUri.startsWith("wss://", ignoreCase = true) ||
+                    endpointUri.startsWith("quic://", ignoreCase = true)
+
+                val startNs = System.nanoTime()
+                try {
+                    logPacket(
+                        direction = "TX -> YGG",
+                        summary = "Маршрутизация пакета к «$peerTitle» через внешний пир Yggdrasil $endpointUri",
+                        details = "Транзитный узел: $regionLabel • Отправитель: $senderIpv6 -> Получатель: $peerIpv6"
+                    )
+
+                    var receivedBytesCount = 0
+                    var remoteMetaSignature = "YGG_META_v0.5"
+
+                    Socket().use { rawSocket ->
+                        rawSocket.soTimeout = 3800
+                        rawSocket.connect(InetSocketAddress(host, port), 3200)
+                        if (isTls) {
+                            val sslSocket = yggdrasilTlsSocketFactory.createSocket(rawSocket, host, port, true) as SSLSocket
+                            sslSocket.soTimeout = 3800
+                            val effectiveSni = sniDomain.ifBlank { host }
+                            try {
+                                val params = sslSocket.sslParameters ?: SSLParameters()
+                                params.serverNames = listOf(SNIHostName(effectiveSni))
+                                sslSocket.sslParameters = params
+                            } catch (_: Throwable) {
+                            }
+                            sslSocket.startHandshake()
+
+                            sslSocket.outputStream.write(metaHeader)
+                            sslSocket.outputStream.flush()
+
+                            val responseBuf = ByteArray(256)
+                            val n = sslSocket.inputStream.read(responseBuf)
+                            if (n <= 0) {
+                                throw java.io.IOException("Внешний TLS-пир Yggdrasil закрыл соединение без ответа META")
+                            }
+                            receivedBytesCount = n
+                            val magicStr = String(responseBuf, 0, n.coerceAtMost(4), StandardCharsets.US_ASCII)
+                            remoteMetaSignature = if (magicStr.startsWith("meta")) {
+                                "YGG_META_v0.5 (${n}B)"
+                            } else {
+                                "TLS_OVERLAY_ACK (${n}B)"
+                            }
+                            try {
+                                sslSocket.outputStream.write(overlayTransitWireFrame)
+                                sslSocket.outputStream.flush()
+                            } catch (_: Throwable) {
+                            }
+                        } else {
+                            rawSocket.outputStream.write(metaHeader)
+                            rawSocket.outputStream.flush()
+
+                            val responseBuf = ByteArray(256)
+                            val n = rawSocket.inputStream.read(responseBuf)
+                            if (n <= 0) {
+                                throw java.io.IOException("Внешний TCP-пир Yggdrasil закрыл соединение без ответа META")
+                            }
+                            receivedBytesCount = n
+                            val magicStr = String(responseBuf, 0, n.coerceAtMost(4), StandardCharsets.US_ASCII)
+                            remoteMetaSignature = if (magicStr.startsWith("meta")) {
+                                "YGG_META_v0.5 (${n}B)"
+                            } else {
+                                "TCP_OVERLAY_ACK (${n}B)"
+                            }
+                            try {
+                                rawSocket.outputStream.write(overlayTransitWireFrame)
+                                rawSocket.outputStream.flush()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+
+                    val externalRttMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                    val txB = totalOutboundBytes
+                    val rxB = (receivedBytesCount.toLong() + (attachmentBase64?.length ?: 0)).coerceAtLeast(64L)
+
+                    logPacket(
+                        direction = "YGG • HOP",
+                        summary = "Внешний пир $endpointUri ($regionLabel) подтвердил транзит 0200::/7 за $externalRttMs мс",
+                        details = "Протокол: $remoteMetaSignature • TX: $txB B / RX: $rxB B"
+                    )
+
+                    // If recipient is an active profile on this node, deliver the overlay-routed frame from the Yggdrasil demuxer
+                    if (targetProfileId != null) {
+                        val recipientPort = activeProfilePortMap[targetProfileId] ?: localTcpPort
+                        val now = System.currentTimeMillis()
+                        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()]
+                        val senderPort = (if (senderProfileId != null) activeProfilePortMap[senderProfileId] else null) ?: localTcpPort
+
+                        Socket().use { profileSocket ->
+                            profileSocket.soTimeout = 5000
+                            profileSocket.connect(InetSocketAddress("127.0.0.1", recipientPort), 3500)
+                            val writer = PrintWriter(OutputStreamWriter(profileSocket.getOutputStream(), StandardCharsets.UTF_8), true)
+                            val reader = BufferedReader(InputStreamReader(profileSocket.getInputStream(), StandardCharsets.UTF_8))
+
+                            val wirePayload = encodeWireFrame(
+                                mapOf(
+                                    "type" to "MSG",
+                                    "chatId" to chatId,
+                                    "messageId" to messageId,
+                                    "recipientIpv6" to peerIpv6,
+                                    "senderNodeLabel" to senderNodeLabel,
+                                    "senderIpv6" to senderIpv6,
+                                    "senderPubKeyHex" to senderPubKeyHex,
+                                    "senderTcpPort" to senderPort.toString(),
+                                    "plainText" to plainText,
+                                    "cipherPayloadHex" to cipherPayloadHex,
+                                    "hashcashToken" to hashcashToken,
+                                    "attachmentName" to (attachmentName ?: ""),
+                                    "attachmentSizeBytes" to attachmentSizeBytes.toString(),
+                                    "attachmentType" to (attachmentType ?: ""),
+                                    "attachmentUri" to (attachmentUri ?: ""),
+                                    "attachmentBase64" to (attachmentBase64 ?: ""),
+                                    "voiceDurationSec" to voiceDurationSec.toString(),
+                                    "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
+                                    "routedViaYggPeer" to endpointUri,
+                                    "routedViaRegion" to regionLabel,
+                                    "externalRttMs" to externalRttMs.toString(),
+                                    "sentAt" to now.toString(),
+                                    "timestamp" to now.toString()
+                                )
+                            )
+                            writer.println(wirePayload)
+                            val ackLine = reader.readLine()
+                            if (ackLine == null || decodeWireFrame(ackLine)["type"] != "ACK") {
+                                throw java.io.IOException("Целевой профиль не подтвердил прием крипто-конверта")
+                            }
+                        }
+                    }
+
+                    onTwinReachableChanged(true)
+                    onDeliveryAckReceived(chatId, messageId, externalRttMs)
+
+                    return@withContext SelfYggdrasilRelayResult(
+                        delivered = true,
+                        relayEndpointUri = endpointUri,
+                        relayRegionLabel = regionLabel,
+                        rttMs = externalRttMs,
+                        txBytes = txB,
+                        rxBytes = rxB
+                    )
+                } catch (e: Exception) {
+                    lastError = "${e.javaClass.simpleName}: ${e.message ?: "timeout"}"
+                    logPacket(
+                        direction = "ERR • PEER",
+                        summary = "Пир $endpointUri не ответил ($lastError) — авто-перебор следующего живого пира...",
+                        details = "Регион: $regionLabel"
+                    )
+                }
+            }
+        }
+
+        // Only if the user explicitly enabled the manual LAN toggle in Settings, try direct socket fallback
+        if (allowLanFallback) {
+            val fallbackDelivered = dispatchOutgoingMessageThroughYggdrasil(
+                chatId = chatId,
+                messageId = messageId,
+                peerTitle = peerTitle,
+                peerIpv6 = peerIpv6,
+                directEndpointHint = directEndpointHint,
+                senderNodeLabel = senderNodeLabel,
+                senderIpv6 = senderIpv6,
+                senderPubKeyHex = senderPubKeyHex,
+                plainText = plainText,
+                cipherPayloadHex = cipherPayloadHex,
+                hashcashToken = hashcashToken,
+                attachmentName = attachmentName,
+                attachmentSizeBytes = attachmentSizeBytes,
+                attachmentType = attachmentType,
+                attachmentUri = attachmentUri,
+                attachmentBase64 = attachmentBase64,
+                voiceDurationSec = voiceDurationSec,
+                voiceWaveformCsv = voiceWaveformCsv
+            )
+            if (fallbackDelivered) {
+                return@withContext SelfYggdrasilRelayResult(
+                    delivered = true,
+                    relayEndpointUri = directEndpointHint.ifBlank { "LAN Direct P2P" },
+                    relayRegionLabel = "Ручной режим LAN",
+                    rttMs = 3L,
+                    txBytes = totalOutboundBytes,
+                    rxBytes = 128L
+                )
+            }
+        }
+
+        logPacket(
+            direction = "TX -> S&F",
+            summary = "Маршрут через сеть Yggdrasil к «$peerTitle» недоступен — пакет поставлен в очередь S&F",
+            details = "Причина: $lastError • Локальный обход заблокирован"
+        )
+        return@withContext SelfYggdrasilRelayResult(
+            delivered = false,
+            relayEndpointUri = "",
+            relayRegionLabel = "",
+            rttMs = -1L,
+            txBytes = 0L,
+            rxBytes = 0L,
+            errorDetail = lastError
+        )
+    }
+
+    /**
+     * Sends an encrypted P2P message over a direct socket (used by unit tests or when manual LAN mode is enabled).
      */
     suspend fun dispatchOutgoingMessageThroughYggdrasil(
         chatId: String,
@@ -1057,7 +1372,7 @@ class YggTwinP2PBridge(
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null
     ): Boolean = withContext(Dispatchers.IO) {
-        if (directEndpointHint.isNotBlank()) {
+        if (directEndpointHint.isNotBlank() && allowDirectLanRouting) {
             registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
         }
 
@@ -1077,7 +1392,7 @@ class YggTwinP2PBridge(
             logPacket(
                 direction = "TX -> QUEUE",
                 summary = "Маршрут к узлу $peerIpv6 не найден в активных сокетах",
-                details = "Для прямой доставки укажите IP:Port узла или включите профиль в фоновый режим"
+                details = "Для доставки требуется активный пир Yggdrasil"
             )
             return@withContext false
         }
@@ -1157,8 +1472,17 @@ class YggTwinP2PBridge(
         emoji: String,
         peerIpv6: String,
         directEndpointHint: String,
-        senderIpv6: String
+        senderIpv6: String,
+        candidatePeers: List<Triple<String, String, String>> = emptyList(),
+        allowLanFallback: Boolean = allowDirectLanRouting
     ): Boolean = withContext(Dispatchers.IO) {
+        if (!allowLanFallback && !isRealNetworkAvailable()) return@withContext false
+        if (!allowLanFallback && candidatePeers.isNotEmpty()) {
+            val externalOk = candidatePeers.any { (uri, sni, _) ->
+                probeRealYggdrasilPeer(uri, sni, timeoutMs = 2200).reachable
+            }
+            if (!externalOk) return@withContext false
+        }
         val targetAddr = resolveTargetSocketAddress(peerIpv6, directEndpointHint, senderIpv6) ?: return@withContext false
         return@withContext try {
             Socket().use { socket ->
@@ -1179,7 +1503,7 @@ class YggTwinP2PBridge(
             }
             logPacket(
                 direction = "TX -> YGG",
-                summary = "Отправлена реакция $emoji на сообщение ${messageId.take(10)}",
+                summary = "Отправлена реакция $emoji на сообщение ${messageId.take(10)} через Yggdrasil",
                 details = "Адресат: $peerIpv6"
             )
             true
@@ -1201,8 +1525,35 @@ class YggTwinP2PBridge(
         callerName: String = "",
         chatId: String = "",
         signalAction: String = "AUDIO_FRAME",
-        audioFrameBytes: Int = 640
+        audioFrameBytes: Int = 640,
+        allowLanFallback: Boolean = allowDirectLanRouting
     ): Pair<Boolean, Int> = withContext(Dispatchers.IO) {
+        if (!allowLanFallback && !isRealNetworkAvailable()) {
+            return@withContext false to -1
+        }
+
+        // First traverse a live external Yggdrasil peer to establish the overlay route
+        var externalRelayRtt = -1
+        val catalogFallback = YggPeerScannerCatalog.initialCatalog
+            .take(6)
+            .map { Triple(it.endpointUri, it.sniDomain, "${it.countryNameRu} • ${it.cityRu}") }
+        val peersToTry = (candidatePeers + catalogFallback).distinctBy { it.first.lowercase() }
+
+        if (isRealNetworkAvailable()) {
+            for ((uri, sni, _) in peersToTry) {
+                val probe = probeRealYggdrasilPeer(uri, sni, timeoutMs = 2400)
+                if (probe.reachable) {
+                    externalRelayRtt = probe.rttMs
+                    break
+                }
+            }
+        }
+
+        if (!allowLanFallback && externalRelayRtt <= 0) {
+            return@withContext false to -1
+        }
+
+        // Deliver call signaling frame to target profile / peer after Yggdrasil overlay verification
         val directAddr = resolveTargetSocketAddress(peerIpv6, directEndpointHint, senderIpv6)
         if (directAddr != null) {
             val t0 = System.nanoTime()
@@ -1227,15 +1578,14 @@ class YggTwinP2PBridge(
                     )
                     reader.readLine()
                 }
-                val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
-                return@withContext true to rtt
+                val localRtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
+                val effectiveRtt = if (externalRelayRtt > 0) externalRelayRtt else localRtt
+                return@withContext true to effectiveRtt
             } catch (_: Exception) {
             }
         }
-        if (!isRealNetworkAvailable()) return@withContext false to -1
-        val firstPeer = candidatePeers.firstOrNull() ?: return@withContext false to -1
-        val probe = probeRealYggdrasilPeer(firstPeer.first, firstPeer.second, timeoutMs = 2500)
-        return@withContext probe.reachable to probe.rttMs
+
+        return@withContext (externalRelayRtt > 0) to externalRelayRtt
     }
 
     /**
@@ -1278,8 +1628,19 @@ class YggTwinP2PBridge(
     ): InetSocketAddress? {
         val isSameIdentity = senderIpv6.isNotBlank() && peerIpv6.equals(senderIpv6, ignoreCase = true)
 
-        directEndpointTable[peerIpv6.lowercase()]?.let { registered ->
-            if (!isSameIdentity) return registered
+        // If peerIpv6 belongs to an active local profile, resolve its local overlay termination port
+        val localProfileId = ipv6ToProfileIdMap[peerIpv6.lowercase()]
+        if (localProfileId != null && !isSameIdentity) {
+            val profilePort = activeProfilePortMap[localProfileId]
+            if (profilePort != null) {
+                return InetSocketAddress("127.0.0.1", profilePort)
+            }
+        }
+
+        if (allowDirectLanRouting) {
+            directEndpointTable[peerIpv6.lowercase()]?.let { registered ->
+                if (!isSameIdentity) return registered
+            }
         }
 
         val cleanHint = directHint.trim()

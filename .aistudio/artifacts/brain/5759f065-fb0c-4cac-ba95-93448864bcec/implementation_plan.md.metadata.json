@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan for YggGram multi-profile pop-up & Android system notifications (incoming calls, missed calls, text/voice/media messages), profile switch confirmation modal, and per-profile Yggdrasil node routing role selector (Client Only, Peer Node, S&F Relay).",
-  "updatedAt": "2026-10-18T20:58:01.253331771Z",
+  "summary": "Implementation plan to enforce strict Yggdrasil overlay routing (via external public Yggdrasil peers) for all inter-profile and P2P messages, voice notes, files, and calls by default, with automatic external peer failover, S&F queueing when offline, and an explicit manual LAN toggle (disabled by default).",
+  "updatedAt": "2026-10-18T21:46:46.677154236Z",
   "requestFeedback": true,
   "userFacing": true
 }
