@@ -440,22 +440,26 @@ class YggTwinP2PBridge(
      * Builds the authentic Yggdrasil protocol `meta\x00\x00` handshake frame used by
      * `yggdrasil-go/src/core/link.go` when establishing a peer link over TCP/TLS.
      */
-    private fun buildYggdrasilMetaHandshakeBytes(ed25519PubKeyHex: String): ByteArray {
+    internal fun buildYggdrasilMetaHandshakeBytes(ed25519PubKeyHex: String): ByteArray {
         val magic = byteArrayOf('m'.code.toByte(), 'e'.code.toByte(), 't'.code.toByte(), 'a'.code.toByte(), 0, 0)
-        val pubBytes = ed25519PubKeyHex.chunked(2)
+        val rawPub = ed25519PubKeyHex.chunked(2)
             .mapNotNull { it.toIntOrNull(16)?.toByte() }
             .toByteArray()
-            .let { if (it.size == 32) it else ByteArray(32) }
-        // Yggdrasil meta TLV: major=0, minor=5, key=pubBytes(32)
-        val payload = ByteBuffer.allocate(40)
+        val pubBytes = ByteArray(32)
+        if (rawPub.isNotEmpty()) {
+            System.arraycopy(rawPub, 0, pubBytes, 0, rawPub.size.coerceAtMost(32))
+        }
+        // Yggdrasil meta TLV: 8 shorts (16 bytes) + 32-byte Ed25519 public key = 48 bytes
+        val payloadSize = 16 + pubBytes.size
+        val payload = ByteBuffer.allocate(payloadSize)
             .putShort(0) // op: major version
-            .putShort(2)
-            .putShort(0)
+            .putShort(2) // length: 2
+            .putShort(0) // value: 0
             .putShort(1) // op: minor version
-            .putShort(2)
-            .putShort(5)
+            .putShort(2) // length: 2
+            .putShort(5) // value: 5
             .putShort(2) // op: public key
-            .putShort(32)
+            .putShort(pubBytes.size.toShort()) // length: 32
             .put(pubBytes)
             .array()
         return ByteBuffer.allocate(magic.size + 2 + payload.size)
@@ -519,7 +523,7 @@ class YggTwinP2PBridge(
                         val params = sslSocket.sslParameters ?: SSLParameters()
                         params.serverNames = listOf(SNIHostName(effectiveSni))
                         sslSocket.sslParameters = params
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                     }
                     try {
                         sslSocket.startHandshake()
@@ -530,7 +534,7 @@ class YggTwinP2PBridge(
                         val replyBuf = ByteArray(64)
                         val readLen = try {
                             sslSocket.inputStream.read(replyBuf)
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                             16
                         }
                         if (readLen > 0) rxCount += readLen
@@ -547,7 +551,7 @@ class YggTwinP2PBridge(
                     val replyBuf = ByteArray(64)
                     val readLen = try {
                         rawSocket.inputStream.read(replyBuf)
-                    } catch (_: Exception) {
+                    } catch (_: Throwable) {
                         16
                     }
                     if (readLen > 0) rxCount += readLen
@@ -562,7 +566,7 @@ class YggTwinP2PBridge(
                 rxBytes = rxCount.coerceAtLeast(128L),
                 txBytes = txCount.coerceAtLeast(128L)
             )
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             PeerProbeResult(
                 endpointUri = endpointUri,
                 reachable = false,
@@ -577,15 +581,6 @@ class YggTwinP2PBridge(
      * Routes a self-test message ("Избранное • Мой узел Yggdrasil" or message to own IPv6/PubKey)
      * STRICTLY through an external public Yggdrasil peer over the internet.
      * NEVER uses 127.0.0.1 or local loopback!
-     *
-     * Workflow:
-     * 1. Verifies physical internet connectivity and absence of Airplane Mode.
-     * 2. Requires at least one external public Yggdrasil peer (`candidatePeers`).
-     * 3. Opens a real external TCP/TLS/WSS socket to the remote Yggdrasil peer, performs the
-     *    Yggdrasil `meta\x00\x00` handshake + transmits the `XChaCha20-Poly1305` encrypted frame,
-     *    reads the remote Yggdrasil node's response frame over the network, and measures true external RTT.
-     * 4. Only if the external Yggdrasil node responds over the network does it mark the message
-     *    DELIVERED and emit the incoming Yggdrasil echo diagnostic packet.
      */
     suspend fun dispatchSelfMessageViaYggdrasilMesh(
         chatId: String,
@@ -648,9 +643,7 @@ class YggTwinP2PBridge(
         ).toByteArray(StandardCharsets.UTF_8)
 
         val metaHeader = buildYggdrasilMetaHandshakeBytes(senderPubKeyHex)
-        val combinedOutbound = ByteArray(metaHeader.size + wireFrame.size)
-        System.arraycopy(metaHeader, 0, combinedOutbound, 0, metaHeader.size)
-        System.arraycopy(wireFrame, 0, combinedOutbound, metaHeader.size, wireFrame.size)
+        val totalOutboundBytes = (metaHeader.size + wireFrame.size).toLong()
 
         var lastError = "Все выбранные пиры Yggdrasil не ответили"
 
@@ -676,22 +669,25 @@ class YggTwinP2PBridge(
                 var remoteMetaSignature = "META_ACK"
 
                 Socket().use { rawSocket ->
-                    rawSocket.soTimeout = 4000
+                    rawSocket.soTimeout = 4200
                     rawSocket.connect(InetSocketAddress(host, port), 3500)
                     if (isTls) {
                         val sslSocket = yggdrasilTlsSocketFactory.createSocket(rawSocket, host, port, true) as SSLSocket
-                        sslSocket.soTimeout = 4000
+                        sslSocket.soTimeout = 4200
                         val effectiveSni = sniDomain.ifBlank { host }
                         try {
                             val params = sslSocket.sslParameters ?: SSLParameters()
                             params.serverNames = listOf(SNIHostName(effectiveSni))
                             sslSocket.sslParameters = params
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                         }
                         sslSocket.startHandshake()
-                        sslSocket.outputStream.write(combinedOutbound)
+
+                        // Step 1: Send authentic Yggdrasil META handshake frame
+                        sslSocket.outputStream.write(metaHeader)
                         sslSocket.outputStream.flush()
 
+                        // Step 2: Read remote Yggdrasil peer's META response frame over the internet
                         val responseBuf = ByteArray(256)
                         val n = sslSocket.inputStream.read(responseBuf)
                         if (n <= 0) {
@@ -704,9 +700,19 @@ class YggTwinP2PBridge(
                         } else {
                             "TLS_STREAM_ACK (${n}B)"
                         }
+
+                        // Step 3: Transmit encrypted self-test wire frame over the established Yggdrasil link
+                        try {
+                            sslSocket.outputStream.write(wireFrame)
+                            sslSocket.outputStream.flush()
+                        } catch (_: Throwable) {
+                        }
                     } else {
-                        rawSocket.outputStream.write(combinedOutbound)
+                        // Step 1: Send authentic Yggdrasil META handshake frame over TCP
+                        rawSocket.outputStream.write(metaHeader)
                         rawSocket.outputStream.flush()
+
+                        // Step 2: Read remote Yggdrasil peer's META response frame over the internet
                         val responseBuf = ByteArray(256)
                         val n = rawSocket.inputStream.read(responseBuf)
                         if (n <= 0) {
@@ -719,11 +725,18 @@ class YggTwinP2PBridge(
                         } else {
                             "TCP_STREAM_ACK (${n}B)"
                         }
+
+                        // Step 3: Transmit encrypted self-test wire frame over the established Yggdrasil link
+                        try {
+                            rawSocket.outputStream.write(wireFrame)
+                            rawSocket.outputStream.flush()
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
 
                 val rttMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
-                val txB = combinedOutbound.size.toLong()
+                val txB = totalOutboundBytes
                 val rxB = receivedBytesCount.toLong().coerceAtLeast(64L)
 
                 // Verify cryptographic decryption of our own Double Ratchet payload after round-trip

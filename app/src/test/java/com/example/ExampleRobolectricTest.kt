@@ -164,6 +164,11 @@ class ExampleRobolectricTest {
             requireNotNull(selfConvo)
             assertEquals(identity.yggIpv6Address, selfConvo.peerYggIpv6)
             assertEquals("YGGDRASIL_MESH_SELF", selfConvo.directEndpointHint)
+
+            // 9. Verify buildYggdrasilMetaHandshakeBytes (6 magic + 2 len + 48 TLV = 56 bytes)
+            val metaFrame = senderNode.buildYggdrasilMetaHandshakeBytes(identity.yggNodePublicKeyHex)
+            assertEquals(56, metaFrame.size)
+            assertEquals("meta", String(metaFrame, 0, 4, Charsets.US_ASCII))
         } finally {
             receiverNode.stop()
             senderNode.stop()
