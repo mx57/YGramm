@@ -16,7 +16,7 @@ import androidx.room.RoomDatabase
         BackupSnapshotEntity::class,
         CryptoKeyRecordEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {

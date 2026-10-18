@@ -1,6 +1,11 @@
 // File: app/src/main/java/com/example/ui/screens/NetworkDpiScreen.kt
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,11 +31,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SwapHoriz
@@ -61,9 +73,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -75,6 +90,12 @@ import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.CensorshipPreset
 import com.example.viewmodel.YggGramUiState
+
+private enum class NetworkSubTab(val title: String) {
+    ROUTES_AND_PEERS("Маршруты"),
+    PEER_SCANNER("Сканер (46+)"),
+    ANTI_DPI_TSPU("Обход ТСПУ")
+}
 
 @Composable
 fun NetworkDpiScreen(
@@ -94,565 +115,810 @@ fun NetworkDpiScreen(
     onConnectScannedPeer: (DiscoveredYggPeer) -> Unit,
     onConnectTopFastestInCountry: () -> Unit,
     onPingTwinNode: () -> Unit,
-    onRunSendReceiveTest: () -> Unit = {}
+    onRunSendReceiveTest: () -> Unit = {},
+    onOpenSelfYggdrasilTest: () -> Unit = {},
+    onUpdateScannerSearch: (String) -> Unit = {},
+    onUpdateScannerSort: (String) -> Unit = {},
+    onImportCustomPeers: (String) -> Unit = {},
+    onClearPacketLogs: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    var activeSubTab by rememberSaveable { mutableStateOf(NetworkSubTab.ROUTES_AND_PEERS) }
     var showAddPeerDialog by rememberSaveable { mutableStateOf(false) }
+    var showBulkImportDialog by rememberSaveable { mutableStateOf(false) }
+    var expandLogs by rememberSaveable { mutableStateOf(true) }
+    var showAllScannedPeers by rememberSaveable { mutableStateOf(false) }
+
     val cfg = uiState.antiDpiConfig
     val scanner = uiState.peerScanner
     val connectedPeersCount = peers.count { it.isConnected }
-    val activeEndpointSet = remember(peers) { peers.map { it.endpointUri }.toSet() }
+    val activeEndpointSet = remember(peers) { peers.map { it.endpointUri.lowercase() }.toSet() }
 
     val filteredScannedPeers = remember(
         scanner.discoveredPeers,
         scanner.selectedCountryCode,
-        scanner.onlyWhitelistCompatible
+        scanner.onlyWhitelistCompatible,
+        scanner.searchQuery,
+        scanner.sortMode
     ) {
-        scanner.discoveredPeers.filter { peer ->
+        val base = scanner.discoveredPeers.filter { peer ->
             val countryMatch = scanner.selectedCountryCode == "ALL" || peer.countryCode == scanner.selectedCountryCode
             val whitelistMatch = !scanner.onlyWhitelistCompatible || peer.whitelistCompatible
-            countryMatch && whitelistMatch
+            val q = scanner.searchQuery.trim()
+            val queryMatch = q.isBlank() ||
+                peer.endpointUri.contains(q, ignoreCase = true) ||
+                peer.cityRu.contains(q, ignoreCase = true) ||
+                peer.countryNameRu.contains(q, ignoreCase = true) ||
+                peer.transportType.contains(q, ignoreCase = true)
+            countryMatch && whitelistMatch && queryMatch
+        }
+        when (scanner.sortMode) {
+            "COUNTRY" -> base.sortedWith(compareBy<DiscoveredYggPeer> { it.countryNameRu }.thenBy { it.cityRu })
+            "UPTIME" -> base.sortedByDescending { it.uptimePercent }
+            else -> base.sortedWith(
+                compareBy<DiscoveredYggPeer> { if (it.latencyMs > 0) 0 else 1 }
+                    .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+            )
         }
     }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        // 1. Hero Yggdrasil Node & Mesh Telemetry Card
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer
-                )
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Top Segmented Sub-Tab Selector
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column {
-                    Box(
+                NetworkSubTab.entries.forEach { tab ->
+                    val selected = activeSubTab == tab
+                    val labelText = when (tab) {
+                        NetworkSubTab.ROUTES_AND_PEERS -> "Маршруты ($connectedPeersCount/${peers.size})"
+                        NetworkSubTab.PEER_SCANNER -> "Сканер (${scanner.discoveredPeers.size})"
+                        NetworkSubTab.ANTI_DPI_TSPU -> "Обход ТСПУ"
+                    }
+                    Surface(
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { activeSubTab = tab }
+                            .testTag("network_subtab_${tab.name}")
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp)
+                        ) {
+                            Text(
+                                text = labelText,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                color = if (selected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // Hero Node Telemetry Card is shown on Routes tab
+            if (activeSubTab == NetworkSubTab.ROUTES_AND_PEERS) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer
+                        )
+                    ) {
+                        Column {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(115.dp)
+                            ) {
+                                Image(
+                                    painter = painterResource(id = R.drawable.ic_ygg_mesh_banner),
+                                    contentDescription = "Топология оверлейной сети Yggdrasil",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(14.dp),
+                                    verticalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Surface(
+                                            color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
+                                                MaterialTheme.colorScheme.errorContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.primaryContainer
+                                            },
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text(
+                                                text = when {
+                                                    uiState.isAirplaneModeOn -> "АВИАРЕЖИМ • ОФЛАЙН"
+                                                    !uiState.isNetworkAvailable -> "НЕТ СЕТИ • ОФЛАЙН"
+                                                    else -> "P2P :${uiState.localUdpPort} • LAN :51920"
+                                                },
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
+                                                    Color(0xFFEF4444)
+                                                } else {
+                                                    EmeraldPrimary
+                                                },
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.secondaryContainer,
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $connectedPeersCount",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = CyberTealSecondary,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                    }
+                                    Column {
+                                        Text(
+                                            text = "IPv6: ${uiState.identity.yggIpv6Address}",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontFamily = FontFamily.Monospace),
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "Подсеть: ${uiState.identity.yggSubnetPrefix} • LAN: ${uiState.localLanIp ?: "не назначен"}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+
+                            Column(modifier = Modifier.padding(14.dp)) {
+                                Text(
+                                    text = cfg.lastProbeReport,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
+                                        Color(0xFFEF4444)
+                                    } else {
+                                        EmeraldPrimary
+                                    }
+                                )
+                                if (cfg.isProbingRoutes) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    LinearProgressIndicator(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(5.dp)
+                                            .clip(RoundedCornerShape(4.dp)),
+                                        color = EmeraldPrimary
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = onRunProbe,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("run_dpi_probe_button")
+                                    ) {
+                                        Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Проверить пиры", maxLines = 1)
+                                    }
+                                    OutlinedButton(
+                                        onClick = onOpenSelfYggdrasilTest,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("network_test_send_receive_button")
+                                    ) {
+                                        Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(17.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Тест себе (Ygg)", maxLines = 1)
+                                    }
+                                }
+
+                                if (uiState.packetLogs.isNotEmpty()) {
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(modifier = Modifier.padding(10.dp)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .clickable { expandLogs = !expandLogs }
+                                                ) {
+                                                    Text(
+                                                        text = "Журнал сокетов (${uiState.packetLogs.size})",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        color = CyberTealSecondary
+                                                    )
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Icon(
+                                                        imageVector = if (expandLogs) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                                        contentDescription = null,
+                                                        tint = CyberTealSecondary,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                }
+                                                TextButton(
+                                                    onClick = onClearPacketLogs,
+                                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                                    modifier = Modifier.height(26.dp)
+                                                ) {
+                                                    Text("Очистить", style = MaterialTheme.typography.labelSmall)
+                                                }
+                                            }
+                                            AnimatedVisibility(visible = expandLogs) {
+                                                Column(
+                                                    modifier = Modifier.padding(top = 6.dp),
+                                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                ) {
+                                                    uiState.packetLogs.take(6).forEach { log ->
+                                                        Text(
+                                                            text = "[${log.timeFormatted}] ${log.direction}: ${log.summary}",
+                                                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                            color = when {
+                                                                log.direction.startsWith("ERR") -> Color(0xFFEF4444)
+                                                                log.direction.startsWith("RX") || log.direction.startsWith("ACK") -> EmeraldPrimary
+                                                                else -> AmberShieldTertiary
+                                                            },
+                                                            maxLines = 2,
+                                                            overflow = TextOverflow.Ellipsis
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Active Yggdrasil Peers & Bridges Header
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Таблица маршрутизации (${peers.size})",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Активных внешних узлов: $connectedPeersCount",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (connectedPeersCount > 0) EmeraldPrimary else AmberShieldTertiary
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = { showBulkImportDialog = true },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("open_bulk_import_peers_button")
+                            ) {
+                                Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Импорт", style = MaterialTheme.typography.labelMedium)
+                            }
+                            Button(
+                                onClick = { showAddPeerDialog = true },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("open_add_peer_dialog_button")
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Свой пир", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                }
+
+                items(peers, key = { it.peerId }) { peer ->
+                    PeerNodeCard(
+                        peer = peer,
+                        onCopyUri = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Yggdrasil Peer URI", peer.endpointUri))
+                            Toast.makeText(context, "Скопирован пир: ${peer.endpointUri}", Toast.LENGTH_SHORT).show()
+                        },
+                        onToggleConnect = { onTogglePeer(peer) },
+                        onRemove = { onRemovePeer(peer.peerId) }
+                    )
+                }
+            }
+
+            // TAB 2: PEER SCANNER (46+ Built-In Peers in 16 Countries + Live Directory + Search & Sort)
+            if (activeSubTab == NetworkSubTab.PEER_SCANNER) {
+                item {
+                    Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(115.dp)
-                    ) {
-                        Image(
-                            painter = painterResource(id = R.drawable.ic_ygg_mesh_banner),
-                            contentDescription = "Топология оверлейной сети Yggdrasil",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                            .border(1.dp, CyberTealSecondary.copy(alpha = 0.5f), RoundedCornerShape(18.dp)),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer
                         )
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(14.dp),
-                            verticalArrangement = Arrangement.SpaceBetween
-                        ) {
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Surface(
-                                    color = MaterialTheme.colorScheme.primaryContainer,
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = if (uiState.isCloneInstance) {
-                                            "УЗЕЛ #2 (КЛОН APK) • ПОРТ ${uiState.localUdpPort}"
-                                        } else {
-                                            "УЗЕЛ #1 (ОСНОВНОЙ APK) • ПОРТ ${uiState.localUdpPort}"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = EmeraldPrimary,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
-                                }
-                                Surface(
-                                    color = MaterialTheme.colorScheme.secondaryContainer,
-                                    shape = RoundedCornerShape(8.dp)
-                                ) {
-                                    Text(
-                                        text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $connectedPeersCount",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = CyberTealSecondary,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                    )
-                                }
-                            }
-                            Column {
-                                Text(
-                                    text = "IPv6: ${uiState.identity.yggIpv6Address}",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = "Подсеть маршрутизации: ${uiState.identity.yggSubnetPrefix} • P2P Мост с клоном: 127.0.0.1:${uiState.remoteTwinUdpPort}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-
-                    Column(modifier = Modifier.padding(14.dp)) {
-                        Text(
-                            text = cfg.lastProbeReport,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = EmeraldPrimary
-                        )
-                        if (cfg.isProbingRoutes) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            LinearProgressIndicator(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(5.dp)
-                                    .clip(RoundedCornerShape(4.dp)),
-                                color = EmeraldPrimary
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(10.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Button(
-                                onClick = onRunProbe,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("run_dpi_probe_button")
-                            ) {
-                                Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Проверить ТСПУ")
-                            }
-                            OutlinedButton(
-                                onClick = onRunSendReceiveTest,
-                                modifier = Modifier.testTag("network_test_send_receive_button")
-                            ) {
-                                Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Тест TX/RX")
-                            }
-                        }
-
-                        if (uiState.packetLogs.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Surface(
-                                color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(10.dp),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Text(
-                                        text = "Живой Журнал Пакетов Yggdrasil (UDP Loopback & P2P):",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = CyberTealSecondary
-                                    )
-                                    uiState.packetLogs.take(4).forEach { log ->
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Default.Radar, contentDescription = null, tint = CyberTealSecondary)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
                                         Text(
-                                            text = "[${log.timeFormatted}] ${log.direction}: ${log.summary}",
+                                            text = "Сканер публичных пиров Yggdrasil",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = scanner.lastScanSummary,
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (log.direction.startsWith("RX") || log.direction.startsWith("ACK")) {
-                                                EmeraldPrimary
-                                            } else {
-                                                AmberShieldTertiary
-                                            },
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
+                                            color = CyberTealSecondary
                                         )
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-        }
 
-        // 2. YGGDRASIL PEER SCANNER WITH COUNTRY FILTER
-        item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, CyberTealSecondary.copy(alpha = 0.5f), RoundedCornerShape(18.dp)),
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer
-                )
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Radar, contentDescription = null, tint = CyberTealSecondary)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = "Сканер пиров Yggdrasil по странам",
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                                Text(
-                                    text = scanner.lastScanSummary,
-                                    style = MaterialTheme.typography.labelSmall,
+                            if (scanner.isScanning) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(5.dp)
+                                        .clip(RoundedCornerShape(4.dp)),
                                     color = CyberTealSecondary
                                 )
                             }
-                        }
-                    }
 
-                    if (scanner.isScanning) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        LinearProgressIndicator(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(5.dp)
-                                .clip(RoundedCornerShape(4.dp)),
-                            color = CyberTealSecondary
-                        )
-                    }
+                            Spacer(modifier = Modifier.height(10.dp))
 
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    // Country Filter Chips
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        scanner.countries.forEach { country ->
-                            val countInCountry = remember(scanner.discoveredPeers, country.code) {
-                                if (country.code == "ALL") {
-                                    scanner.discoveredPeers.size
-                                } else {
-                                    scanner.discoveredPeers.count { it.countryCode == country.code }
-                                }
-                            }
-                            FilterChip(
-                                selected = scanner.selectedCountryCode == country.code,
-                                onClick = { onSelectScanCountry(country.code) },
-                                label = {
+                            // Search Input for Host / City / Country / Protocol
+                            OutlinedTextField(
+                                value = scanner.searchQuery,
+                                onValueChange = onUpdateScannerSearch,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("scanner_search_input"),
+                                placeholder = {
                                     Text(
-                                        "${country.flagEmoji} ${country.nameRu} ($countInCountry)",
-                                        style = MaterialTheme.typography.labelMedium
+                                        "Поиск пира по хосту, IP, городу или протоколу...",
+                                        style = MaterialTheme.typography.bodySmall
                                     )
                                 },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                    selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
-                                ),
-                                modifier = Modifier.testTag("country_filter_${country.code}")
+                                leadingIcon = {
+                                    Icon(Icons.Default.Search, contentDescription = "Поиск пира")
+                                },
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp)
                             )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Country Filter Chips (16 Countries + ALL)
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                scanner.countries.forEach { country ->
+                                    val countInCountry = remember(scanner.discoveredPeers, country.code) {
+                                        if (country.code == "ALL") {
+                                            scanner.discoveredPeers.size
+                                        } else {
+                                            scanner.discoveredPeers.count { it.countryCode == country.code }
+                                        }
+                                    }
+                                    FilterChip(
+                                        selected = scanner.selectedCountryCode == country.code,
+                                        onClick = { onSelectScanCountry(country.code) },
+                                        label = {
+                                            Text(
+                                                "${country.flagEmoji} ${country.nameRu} ($countInCountry)",
+                                                style = MaterialTheme.typography.labelSmall
+                                            )
+                                        },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                            selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                        ),
+                                        modifier = Modifier.testTag("country_filter_${country.code}")
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            // Sort Mode Chips
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Сортировка:",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                val sortOptions = listOf(
+                                    "PING_ASC" to "Быстрые (мин. мс)",
+                                    "COUNTRY" to "По стране",
+                                    "UPTIME" to "По аптайму"
+                                )
+                                sortOptions.forEach { (key, title) ->
+                                    FilterChip(
+                                        selected = scanner.sortMode == key,
+                                        onClick = { onUpdateScannerSort(key) },
+                                        label = { Text(title, style = MaterialTheme.typography.labelSmall) },
+                                        modifier = Modifier.testTag("scanner_sort_$key")
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Только порт 443 / WSS (Обход белых списков)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Switch(
+                                    checked = scanner.onlyWhitelistCompatible,
+                                    onCheckedChange = { onToggleScannerWhitelistOnly() },
+                                    modifier = Modifier.testTag("scanner_whitelist_only_switch")
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = onRunCountryPeerScan,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("scan_peers_country_button")
+                                ) {
+                                    Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(17.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Сканировать пинг", maxLines = 1)
+                                }
+                                OutlinedButton(
+                                    onClick = onConnectTopFastestInCountry,
+                                    modifier = Modifier.testTag("connect_top3_country_button")
+                                ) {
+                                    Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(17.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("+ Топ-3", maxLines = 1)
+                                }
+                                OutlinedButton(
+                                    onClick = { showBulkImportDialog = true },
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
+                                ) {
+                                    Icon(Icons.Default.ContentPaste, contentDescription = "Импорт из буфера", modifier = Modifier.size(17.dp))
+                                }
+                            }
                         }
                     }
+                }
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                val displayedPeers = if (showAllScannedPeers) {
+                    filteredScannedPeers
+                } else {
+                    filteredScannedPeers.take(15)
+                }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Только узлы с обходом Белых списков (WSS/VLESS)",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Switch(
-                            checked = scanner.onlyWhitelistCompatible,
-                            onCheckedChange = { onToggleScannerWhitelistOnly() },
-                            modifier = Modifier.testTag("scanner_whitelist_only_switch")
-                        )
-                    }
+                items(displayedPeers, key = { it.id }) { scannedPeer ->
+                    val isAlreadyAdded = activeEndpointSet.contains(scannedPeer.endpointUri.lowercase())
+                    ScannedPeerCard(
+                        peer = scannedPeer,
+                        isAlreadyAdded = isAlreadyAdded,
+                        onCopyUri = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Yggdrasil Peer", scannedPeer.endpointUri))
+                            Toast.makeText(context, "Скопировано: ${scannedPeer.endpointUri}", Toast.LENGTH_SHORT).show()
+                        },
+                        onConnect = { onConnectScannedPeer(scannedPeer) }
+                    )
+                }
 
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Button(
-                            onClick = onRunCountryPeerScan,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("scan_peers_country_button")
-                        ) {
-                            Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Сканировать пинг")
-                        }
+                if (filteredScannedPeers.size > 15) {
+                    item {
                         OutlinedButton(
-                            onClick = onConnectTopFastestInCountry,
-                            modifier = Modifier.testTag("connect_top3_country_button")
+                            onClick = { showAllScannedPeers = !showAllScannedPeers },
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("+ Топ-3 быстрых")
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        filteredScannedPeers.forEach { scannedPeer ->
-                            val isAlreadyAdded = activeEndpointSet.contains(scannedPeer.endpointUri)
-                            ScannedPeerCard(
-                                peer = scannedPeer,
-                                isAlreadyAdded = isAlreadyAdded,
-                                onConnect = { onConnectScannedPeer(scannedPeer) }
+                            Icon(
+                                imageVector = if (showAllScannedPeers) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                contentDescription = null
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                if (showAllScannedPeers) {
+                                    "Свернуть список до 15 узлов"
+                                } else {
+                                    "Показать все ${filteredScannedPeers.size} узлов"
+                                }
                             )
                         }
                     }
                 }
             }
-        }
 
-        // 3. Censorship & Whitelist Bypass Presets
-        item {
-            Text(
-                text = "Профили обхода ТСПУ, DPI и Белых списков РФ",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                CensorshipPreset.entries.forEach { preset ->
-                    val isSelected = cfg.activePreset == preset
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(
-                                width = if (isSelected) 1.5.dp else 1.dp,
-                                color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.outlineVariant,
-                                shape = RoundedCornerShape(14.dp)
-                            )
-                            .clickable { onSelectPreset(preset) }
-                            .testTag("preset_card_${preset.name}"),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isSelected) {
-                                MaterialTheme.colorScheme.surfaceContainerHigh
-                            } else {
-                                MaterialTheme.colorScheme.surfaceContainer
-                            }
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Shield,
-                                contentDescription = null,
-                                tint = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
+            // TAB 3: ANTI-DPI / TSPU BYPASS SETTINGS
+            if (activeSubTab == NetworkSubTab.ANTI_DPI_TSPU) {
+                item {
+                    Text(
+                        text = "Профили обхода ТСПУ, DPI и Белых списков РФ",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CensorshipPreset.entries.forEach { preset ->
+                            val isSelected = cfg.activePreset == preset
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        width = if (isSelected) 1.5.dp else 1.dp,
+                                        color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.outlineVariant,
+                                        shape = RoundedCornerShape(14.dp)
+                                    )
+                                    .clickable { onSelectPreset(preset) }
+                                    .testTag("preset_card_${preset.name}"),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isSelected) {
+                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainer
+                                    }
+                                )
+                            ) {
                                 Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        text = preset.title,
-                                        style = MaterialTheme.typography.titleMedium,
-                                        modifier = Modifier.weight(1f)
+                                    Icon(
+                                        imageVector = if (isSelected) Icons.Default.CheckCircle else Icons.Default.Shield,
+                                        contentDescription = null,
+                                        tint = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(22.dp)
                                     )
-                                    Surface(
-                                        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest,
-                                        shape = RoundedCornerShape(6.dp)
-                                    ) {
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = preset.title,
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Surface(
+                                                color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest,
+                                                shape = RoundedCornerShape(6.dp)
+                                            ) {
+                                                Text(
+                                                    text = preset.badge,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(3.dp))
                                         Text(
-                                            text = preset.badge,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            text = preset.summary,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(3.dp))
-                                Text(
-                                    text = preset.summary,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
                             }
                         }
                     }
                 }
-            }
-        }
 
-        // 4. Whitelist SNI & uTLS Fingerprint Configurator
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer
-                )
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Public, contentDescription = null, tint = AmberShieldTertiary)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Маскировка под Белые списки (CDN WSS + SNI)",
-                            style = MaterialTheme.typography.titleMedium
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer
                         )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Выберите разрешенный SNI-домен для туннелирования пакетов Yggdrasil поверх HTTPS / WebSocket CDN:",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        cfg.availableWhitelistSnis.forEach { domain ->
-                            FilterChip(
-                                selected = cfg.whitelistSniDomain == domain,
-                                onClick = { onSelectWhitelistSni(domain) },
-                                label = { Text(domain, style = MaterialTheme.typography.labelMedium) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                                    selectedLabelColor = MaterialTheme.colorScheme.onTertiaryContainer
-                                ),
-                                modifier = Modifier.testTag("sni_chip_$domain")
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Public, contentDescription = null, tint = AmberShieldTertiary)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Маскировка под Белые списки (CDN WSS + SNI)",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Выберите разрешенный SNI-домен для TLS/WSS рукопожатия:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                cfg.availableWhitelistSnis.forEach { domain ->
+                                    FilterChip(
+                                        selected = cfg.whitelistSniDomain == domain,
+                                        onClick = { onSelectWhitelistSni(domain) },
+                                        label = { Text(domain, style = MaterialTheme.typography.labelMedium) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                                            selectedLabelColor = MaterialTheme.colorScheme.onTertiaryContainer
+                                        ),
+                                        modifier = Modifier.testTag("sni_chip_$domain")
+                                    )
+                                }
+                            }
+
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 10.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant
+                            )
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Security, contentDescription = null, tint = CyberTealSecondary)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Профиль отпечатка TLS ClientHello (uTLS)",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                val utlsProfiles = listOf(
+                                    "HelloChrome_128_Auto",
+                                    "HelloIOS_18_Auto",
+                                    "HelloFirefox_132_Auto",
+                                    "QUIC_v1_Padded_Jitter"
+                                )
+                                utlsProfiles.forEach { profile ->
+                                    FilterChip(
+                                        selected = cfg.utlsProfile == profile,
+                                        onClick = { onSelectUtlsProfile(profile) },
+                                        label = { Text(profile, style = MaterialTheme.typography.labelMedium) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                            selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                        ),
+                                        modifier = Modifier.testTag("utls_chip_$profile")
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "Модули защиты от анализа трафика (DPI / ТСПУ)",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+
+                            DpiSwitchRow(
+                                title = "Туннель WebSocket поверх CDN (wss:// Белый список)",
+                                subtitle = "Инкапсуляция фреймов Yggdrasil в HTTP/2 и WebSocket через разрешенные IP-диапазоны CDN",
+                                checked = cfg.whitelistCdnWssEnabled,
+                                tag = "switch_whitelist_wss",
+                                onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
+                            )
+
+                            DpiSwitchRow(
+                                title = "ShadowTLS v3 + VLESS Reality (Защита от активного пробинга)",
+                                subtitle = "Перенаправление неавторизованных проверок ТСПУ на реальный TLS-сертификат домена SNI",
+                                checked = cfg.shadowTlsV3Enabled && cfg.vlessRealityEnabled,
+                                tag = "switch_shadowtls_vless",
+                                onToggle = { onToggleAntiDpiFlag("SHADOWTLS") }
+                            )
+
+                            DpiSwitchRow(
+                                title = "Обфускация QUIC UDP (Выравнивание пакетов до ${cfg.quicPaddingMTU} байт)",
+                                subtitle = "Скрывает сигнатуры рукопожатия протокола Yggdrasil и статистику длин пакетов",
+                                checked = cfg.quicPaddingEnabled,
+                                tag = "switch_quic_padding",
+                                onToggle = { onToggleAntiDpiFlag("QUIC_PAD") }
+                            )
+
+                            DpiSwitchRow(
+                                title = "Автономный Bootstrap: BitTorrent Mainline DHT (BEP-44) + DoH",
+                                subtitle = "Поиск подписанных Ed25519 списков пиров без обращения к заблокированным каталогам",
+                                checked = cfg.dhtBep44BootstrapEnabled,
+                                tag = "switch_dht_bep44",
+                                onToggle = { onToggleAntiDpiFlag("DHT_BEP44") }
                             )
                         }
                     }
-
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 10.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant
-                    )
-
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Security, contentDescription = null, tint = CyberTealSecondary)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Профиль отпечатка TLS ClientHello (uTLS)",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        val utlsProfiles = listOf(
-                            "HelloChrome_128_Auto",
-                            "HelloIOS_18_Auto",
-                            "HelloFirefox_132_Auto",
-                            "QUIC_v1_Padded_Jitter"
-                        )
-                        utlsProfiles.forEach { profile ->
-                            FilterChip(
-                                selected = cfg.utlsProfile == profile,
-                                onClick = { onSelectUtlsProfile(profile) },
-                                label = { Text(profile, style = MaterialTheme.typography.labelMedium) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                    selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
-                                ),
-                                modifier = Modifier.testTag("utls_chip_$profile")
-                            )
-                        }
-                    }
                 }
             }
-        }
-
-        // 5. Granular Transport Obfuscation & Bootstrap Switches
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainer
-                )
-            ) {
-                Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = "Модули защиты от анализа трафика (DPI / ТСПУ)",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    DpiSwitchRow(
-                        title = "Туннель WebSocket поверх CDN (wss:// Белый список)",
-                        subtitle = "Инкапсуляция фреймов Yggdrasil в HTTP/2 и WebSocket через разрешенные IP-диапазоны CDN",
-                        checked = cfg.whitelistCdnWssEnabled,
-                        tag = "switch_whitelist_wss",
-                        onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
-                    )
-
-                    DpiSwitchRow(
-                        title = "ShadowTLS v3 + VLESS Reality (Защита от активного пробинга)",
-                        subtitle = "Перенаправление неавторизованных проверок ТСПУ на реальный TLS-сертификат домена SNI",
-                        checked = cfg.shadowTlsV3Enabled && cfg.vlessRealityEnabled,
-                        tag = "switch_shadowtls_vless",
-                        onToggle = { onToggleAntiDpiFlag("SHADOWTLS") }
-                    )
-
-                    DpiSwitchRow(
-                        title = "Обфускация QUIC UDP (Выравнивание пакетов до ${cfg.quicPaddingMTU} байт)",
-                        subtitle = "Скрывает сигнатуры рукопожатия протокола Yggdrasil и статистику длин пакетов",
-                        checked = cfg.quicPaddingEnabled,
-                        tag = "switch_quic_padding",
-                        onToggle = { onToggleAntiDpiFlag("QUIC_PAD") }
-                    )
-
-                    DpiSwitchRow(
-                        title = "Автономный Bootstrap: BitTorrent Mainline DHT (BEP-44) + DoH",
-                        subtitle = "Поиск подписанных Ed25519 списков пиров без обращения к заблокированным каталогам",
-                        checked = cfg.dhtBep44BootstrapEnabled,
-                        tag = "switch_dht_bep44",
-                        onToggle = { onToggleAntiDpiFlag("DHT_BEP44") }
-                    )
-                }
-            }
-        }
-
-        // 6. Active Yggdrasil Peers & Bridges List
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Подключенные пиры в таблице маршрутизации (${peers.size})",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                TextButton(
-                    onClick = { showAddPeerDialog = true },
-                    modifier = Modifier.testTag("open_add_peer_dialog_button")
-                ) {
-                    Text("+ Свой пир")
-                }
-            }
-        }
-
-        items(peers, key = { it.peerId }) { peer ->
-            PeerNodeCard(
-                peer = peer,
-                onToggleConnect = { onTogglePeer(peer) },
-                onRemove = { onRemovePeer(peer.peerId) }
-            )
         }
     }
 
@@ -667,97 +933,148 @@ fun NetworkDpiScreen(
             }
         )
     }
+
+    if (showBulkImportDialog) {
+        BulkImportPeersDialog(
+            onDismiss = { showBulkImportDialog = false },
+            onImport = { rawText ->
+                onImportCustomPeers(rawText)
+                showBulkImportDialog = false
+            }
+        )
+    }
 }
 
 @Composable
 private fun ScannedPeerCard(
     peer: DiscoveredYggPeer,
     isAlreadyAdded: Boolean,
+    onCopyUri: () -> Unit,
     onConnect: () -> Unit
 ) {
+    val isReachable = peer.latencyMs > 0
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(14.dp),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("scanned_peer_${peer.id}")
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+                .padding(12.dp)
         ) {
-            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "${peer.countryFlag} ${peer.countryNameRu} • ${peer.cityRu}",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.primaryContainer,
-                        shape = RoundedCornerShape(6.dp)
-                    ) {
-                        Text(
-                            text = "${peer.latencyMs} мс",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldPrimary,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.height(2.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = peer.endpointUri,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = CyberTealSecondary,
+                    text = "${peer.countryFlag} ${peer.countryNameRu} • ${peer.cityRu}",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
+                Spacer(modifier = Modifier.width(8.dp))
+                Surface(
+                    color = if (isReachable) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainerHighest
+                    },
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = if (isReachable) "${peer.latencyMs} мс" else "Не проверен",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isReachable) EmeraldPrimary else AmberShieldTertiary,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = peer.endpointUri,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                color = CyberTealSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    text = "SNI: ${peer.sniDomain} • Uptime: ${peer.uptimePercent}% • ${peer.bandwidthMbps} Мбит/с • ${peer.ed25519PubKeyShort}",
+                    text = "${peer.transportType} • ${if (peer.whitelistCompatible) "Порт 443/WSS" else "Прямой порт"} • ${peer.uptimePercent}%",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
-            }
 
-            if (isAlreadyAdded) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    shape = RoundedCornerShape(8.dp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    IconButton(
+                        onClick = onCopyUri,
+                        modifier = Modifier.size(30.dp)
                     ) {
                         Icon(
-                            Icons.Default.CheckCircle,
-                            contentDescription = null,
-                            tint = EmeraldPrimary,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "В маршруте",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = EmeraldPrimary
+                            Icons.Default.ContentCopy,
+                            contentDescription = "Скопировать URI пира",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
                         )
                     }
-                }
-            } else {
-                OutlinedButton(
-                    onClick = onConnect,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                    modifier = Modifier.testTag("connect_scanned_${peer.id}")
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(15.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Подключить", style = MaterialTheme.typography.labelMedium)
+
+                    if (isAlreadyAdded) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.CheckCircle,
+                                    contentDescription = null,
+                                    tint = EmeraldPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "В маршрутах",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = EmeraldPrimary
+                                )
+                            }
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = onConnect,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(32.dp)
+                                .testTag("connect_scanned_${peer.id}")
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Подключить", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
                 }
             }
         }
@@ -781,7 +1098,7 @@ private fun DpiSwitchRow(
             Text(text = title, style = MaterialTheme.typography.labelLarge)
             Text(
                 text = subtitle,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
@@ -796,9 +1113,11 @@ private fun DpiSwitchRow(
 @Composable
 private fun PeerNodeCard(
     peer: YggPeerEntity,
+    onCopyUri: () -> Unit,
     onToggleConnect: () -> Unit,
     onRemove: () -> Unit
 ) {
+    val isAlive = peer.isConnected && peer.latencyMs > 0
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -822,12 +1141,13 @@ private fun PeerNodeCard(
                         modifier = Modifier
                             .size(10.dp)
                             .clip(CircleShape)
-                            .background(if (peer.isConnected) EmeraldPrimary else AmberShieldTertiary)
+                            .background(if (isAlive) EmeraldPrimary else Color(0xFFEF4444))
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = peer.regionLabel,
-                        style = MaterialTheme.typography.titleMedium,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -841,25 +1161,50 @@ private fun PeerNodeCard(
                         )
                     }
                 }
-                Text(
-                    text = "${peer.latencyMs} мс",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = EmeraldPrimary,
-                    fontWeight = FontWeight.Bold
-                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Surface(
+                    color = if (isAlive) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = if (isAlive) "${peer.latencyMs} мс" else "ОФЛАЙН",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isAlive) EmeraldPrimary else Color(0xFFEF4444),
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            Text(
-                text = peer.endpointUri,
-                style = MaterialTheme.typography.bodySmall,
-                color = CyberTealSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = peer.endpointUri,
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    color = CyberTealSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(
+                    onClick = onCopyUri,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        contentDescription = "Скопировать адрес пира",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
 
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -868,12 +1213,14 @@ private fun PeerNodeCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "SNI: ${peer.sniDomain} • uTLS: ${peer.utlsFingerprint}",
+                        text = "SNI: ${peer.sniDomain} • ${peer.utlsFingerprint}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "RX: ${peer.rxBytes / 1048576} МБ • TX: ${peer.txBytes / 1048576} МБ • ${if (peer.isWhitelistCompatible) "Белый список ОК" else "Прямой UDP"}",
+                        text = "RX: ${peer.rxBytes} B • TX: ${peer.txBytes} B • ${if (peer.isWhitelistCompatible) "Порт 443 / WSS" else "Прямой TLS/TCP"}",
                         style = MaterialTheme.typography.labelSmall,
                         color = if (peer.isWhitelistCompatible) EmeraldPrimary else AmberShieldTertiary
                     )
@@ -905,20 +1252,20 @@ private fun AddYggPeerModal(
     onDismiss: () -> Unit,
     onAdd: (String, String, String, String, String, Boolean) -> Unit
 ) {
-    var uri by rememberSaveable { mutableStateOf("wss://cdn-edge-kzn.bridge-node.ru:443/ygg-ws") }
+    var uri by rememberSaveable { mutableStateOf("tls://ygg.zbin.eu:7743") }
     var sni by rememberSaveable { mutableStateOf(defaultSni) }
-    var region by rememberSaveable { mutableStateOf("RU-KZN • CDN Мост Белого Списка") }
+    var region by rememberSaveable { mutableStateOf("Пользовательский пир Yggdrasil") }
     var whitelistCompat by rememberSaveable { mutableStateOf(true) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Добавить входной узел / мост Yggdrasil", style = MaterialTheme.typography.titleLarge) },
+        title = { Text("Добавить реальный пир Yggdrasil", style = MaterialTheme.typography.titleLarge) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = uri,
                     onValueChange = { uri = it },
-                    label = { Text("URI пира (wss://, vless+tls://, shadowtls://, quic://)") },
+                    label = { Text("URI пира (tls://, tcp://, wss://, quic://)") },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -927,23 +1274,27 @@ private fun AddYggPeerModal(
                 OutlinedTextField(
                     value = sni,
                     onValueChange = { sni = it },
-                    label = { Text("SNI-домен маскировки (из белого списка)") },
+                    label = { Text("SNI-домен (для TLS/WSS)") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_peer_sni_input")
                 )
                 OutlinedTextField(
                     value = region,
                     onValueChange = { region = it },
-                    label = { Text("Регион / описание узла") },
+                    label = { Text("Описание / локация узла") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_peer_region_input")
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Совместим с режимом Белых списков", style = MaterialTheme.typography.bodyMedium)
+                    Text("Совместим с Белыми списками (порт 443 / WSS)", style = MaterialTheme.typography.bodyMedium)
                     Switch(checked = whitelistCompat, onCheckedChange = { whitelistCompat = it })
                 }
             }
@@ -952,12 +1303,82 @@ private fun AddYggPeerModal(
             Button(
                 onClick = {
                     if (uri.isNotBlank()) {
-                        onAdd(uri, "WSS_CDN_WHITELIST", sni, defaultUtls, region, whitelistCompat)
+                        onAdd(uri, "TLS_YGGDRASIL", sni, defaultUtls, region, whitelistCompat)
                     }
                 },
                 modifier = Modifier.testTag("confirm_add_peer_button")
             ) {
-                Text("Подключить пир")
+                Text("Проверить и добавить")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        }
+    )
+}
+
+@Composable
+private fun BulkImportPeersDialog(
+    onDismiss: () -> Unit,
+    onImport: (String) -> Unit
+) {
+    val context = LocalContext.current
+    var rawText by rememberSaveable {
+        mutableStateOf(
+            "tls://ygg.zbin.eu:7743\ntls://publicpeers.neilalexander.dev:443\ntls://65.21.57.125:61995\ntls://ygg.ace.ctrl-c.liu.se:9999"
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Массовый импорт пиров Yggdrasil", style = MaterialTheme.typography.titleLarge) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Вставьте список URI пиров (по одному на строку или через пробел). Все найденные tls://, tcp://, wss:// и quic:// узлы будут проверены по сети и добавлены.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedButton(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: ""
+                        if (clipText.isNotBlank()) {
+                            rawText = clipText
+                        } else {
+                            Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Вставить из буфера обмена")
+                }
+                OutlinedTextField(
+                    value = rawText,
+                    onValueChange = { rawText = it },
+                    label = { Text("Список URI пиров") },
+                    minLines = 4,
+                    maxLines = 8,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("bulk_import_peers_input")
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (rawText.isNotBlank()) {
+                        onImport(rawText)
+                    }
+                },
+                modifier = Modifier.testTag("confirm_bulk_import_button")
+            ) {
+                Text("Импортировать и проверить")
             }
         },
         dismissButton = {

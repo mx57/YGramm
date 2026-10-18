@@ -355,7 +355,10 @@ fun YggGramRootApp(
                                 onCreateNewChat = viewModel::createNewChatOrGroup,
                                 onDeleteChat = viewModel::deleteChat,
                                 onToggleTransferState = viewModel::toggleFileTransferState,
-                                onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest
+                                onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
+                                onOpenSelfYggdrasilChat = viewModel::openSelfYggdrasilTestChat,
+                                onRetryMessage = viewModel::retrySendMessage,
+                                onPingChatRoute = viewModel::pingConversationRoute
                             )
 
                             YggNavTab.NETWORK_DPI -> NetworkDpiScreen(
@@ -375,7 +378,12 @@ fun YggGramRootApp(
                                 onConnectScannedPeer = viewModel::connectScannedPeer,
                                 onConnectTopFastestInCountry = viewModel::connectTopFastestPeersInSelectedCountry,
                                 onPingTwinNode = viewModel::pingTwinNodeNow,
-                                onRunSendReceiveTest = { viewModel.runLiveMessageSendReceiveTest(null) }
+                                onRunSendReceiveTest = { viewModel.runLiveMessageSendReceiveTest(null) },
+                                onOpenSelfYggdrasilTest = { viewModel.openSelfYggdrasilTestChat(true) },
+                                onUpdateScannerSearch = viewModel::updateScannerSearchQuery,
+                                onUpdateScannerSort = viewModel::updateScannerSortMode,
+                                onImportCustomPeers = viewModel::importCustomPeersFromText,
+                                onClearPacketLogs = viewModel::clearPacketLogs
                             )
 
                             YggNavTab.VAULT_SYNC -> VaultSyncScreen(

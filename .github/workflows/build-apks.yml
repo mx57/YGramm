@@ -1,4 +1,4 @@
-name: Build & Commit YggGram Main + Clone APKs to Repo Root
+name: Build Single YggGram arm64-v8a Release APK
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-commit-apks:
+  build-arm64-v8a-apk:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -33,38 +33,28 @@ jobs:
             base64 -d debug.keystore.base64 > debug.keystore
           fi
 
-      - name: Build YggGram-clone-node2.apk (Node #2 Clone Package)
+      - name: Build YggGram-arm64-v8a.apk and Run Unit Tests
         run: |
-          sed -i 's/applicationId = "com.aistudio.ygggram.vxkprm"/applicationId = "com.aistudio.ygggram.vxkprm.node2"/' app/build.gradle.kts
-          sed -i 's/<string name="app_name">YggGram<\/string>/<string name="app_name">YggGram Клон #2<\/string>/' app/src/main/res/values/strings.xml
-          gradle :app:assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk YggGram-clone-node2.apk
-          mkdir -p apk-releases
-          cp YggGram-clone-node2.apk apk-releases/YggGram-clone-node2.apk
-          git checkout -- app/build.gradle.kts app/src/main/res/values/strings.xml
-
-      - name: Build YggGram-main.apk (Node #1 Main Package) and Run Unit Tests
-        run: |
+          rm -f YggGram-main.apk YggGram-clone-node2.apk apk-releases/YggGram-main.apk apk-releases/YggGram-clone-node2.apk
           gradle :app:testDebugUnitTest --tests com.example.ExampleUnitTest
           gradle :app:assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk YggGram-main.apk
-          cp YggGram-main.apk apk-releases/YggGram-main.apk
+          mkdir -p apk-releases
+          cp app/build/outputs/apk/debug/app-debug.apk apk-releases/YggGram-arm64-v8a.apk
 
-      - name: Commit Compiled APKs to Repository Root
+      - name: Commit Single Release APK to apk-releases/
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f YggGram-main.apk YggGram-clone-node2.apk apk-releases/YggGram-main.apk apk-releases/YggGram-clone-node2.apk
+          git rm -f --ignore-unmatch YggGram-main.apk YggGram-clone-node2.apk apk-releases/YggGram-main.apk apk-releases/YggGram-clone-node2.apk build-root-apks.sh
+          git add -f apk-releases/YggGram-arm64-v8a.apk
           if ! git diff --cached --quiet; then
-            git commit -m "chore(release): place compiled YggGram-main.apk and YggGram-clone-node2.apk in repository root [skip ci]"
+            git commit -m "chore(release): build single YggGram-arm64-v8a.apk in apk-releases/ [skip ci]"
             git push
           fi
 
-      - name: Upload Compiled APKs Artifact
+      - name: Upload Compiled arm64-v8a APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: YggGram-Root-APKs
+          name: YggGram-arm64-v8a-APK
           path: |
-            YggGram-main.apk
-            YggGram-clone-node2.apk
-            apk-releases/*.apk
+            apk-releases/YggGram-arm64-v8a.apk

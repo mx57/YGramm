@@ -2,6 +2,14 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.BackupSnapshotEntity
@@ -20,7 +28,9 @@ import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +39,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class YggNavTab {
     CHATS,
@@ -63,10 +74,12 @@ enum class CensorshipPreset(val title: String, val badge: String, val summary: S
 data class PeerScannerState(
     val countries: List<CountryFilterOption> = YggPeerScannerCatalog.supportedCountries,
     val selectedCountryCode: String = "ALL",
+    val searchQuery: String = "",
+    val sortMode: String = "PING_ASC", // "PING_ASC", "COUNTRY", "UPTIME"
     val onlyWhitelistCompatible: Boolean = false,
     val isScanning: Boolean = false,
     val discoveredPeers: List<DiscoveredYggPeer> = YggPeerScannerCatalog.initialCatalog,
-    val lastScanSummary: String = "Каталог Yggdrasil: доступно 13 публичных узлов в 7 странах (RU, KZ, FI, DE, NL, AM, SE)"
+    val lastScanSummary: String = "В базе ${YggPeerScannerCatalog.initialCatalog.size} пиров в 16 странах • Нажмите «Сканировать пинг»"
 )
 
 data class AntiDpiConfigState(
@@ -88,13 +101,13 @@ data class AntiDpiConfigState(
     val dhtBep44BootstrapEnabled: Boolean = true,
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
-    val lastProbeReport: String = "Маршруты проверены: ТСПУ-фильтр обойден через WSS CDN (SNI: static-mon.yandex.net), задержка 19 мс"
+    val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil..."
 )
 
 data class DecentralizedUserProfile(
-    val displayName: String = "Кирилл Волков",
-    val handle: String = "@k_volkov.ygg",
-    val bio: String = "Системный архитектор • Децентрализованные сети Yggdrasil • Прямой P2P & Zero-Knowledge",
+    val displayName: String = "Узел YggGram",
+    val handle: String = "@node.ygg",
+    val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
     val statusText: String = "В оверлее 200::/7 (Userspace без Root)",
     val profileSignatureHex: String = "ed25519_sig:9f41a08c273b6501e849201c73d6a9021f384e55b601a29c"
 )
@@ -113,17 +126,19 @@ data class PrivacyMatrixState(
 
 data class YggGramUiState(
     val activeTab: YggNavTab = YggNavTab.CHATS,
-    val selectedChatId: String? = "chat_twin_node",
+    val selectedChatId: String? = null,
     val searchQuery: String = "",
     val selectedChatFilter: String = "ALL",
     val isOfflineStoreAndForwardMode: Boolean = false,
     val isNetworkAvailable: Boolean = true,
+    val isAirplaneModeOn: Boolean = false,
     val isCloneInstance: Boolean = false,
-    val isTwinAppReachable: Boolean = true,
+    val isTwinAppReachable: Boolean = false,
     val localUdpPort: Int = 51921,
-    val remoteTwinUdpPort: Int = 51922,
-    val txPacketsCount: Int = 14,
-    val rxPacketsCount: Int = 14,
+    val remoteTwinUdpPort: Int = 51920,
+    val localLanIp: String? = null,
+    val txPacketsCount: Int = 0,
+    val rxPacketsCount: Int = 0,
     val packetLogs: List<YggLivePacketLogEntry> = emptyList(),
     val identity: DerivedIdentityHierarchy,
     val keyEpoch: Int = 1,
@@ -137,50 +152,28 @@ data class YggGramUiState(
 
 class YggGramViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val isCloneNode: Boolean = application.packageName.endsWith(".node2")
     private val database = YggDatabase.getInstance(application)
     private val repository = YggRepository(database.yggDao())
 
-    private val defaultMnemonic = if (isCloneNode) {
-        listOf(
-            "aurora", "kinetic", "solstice", "paradox", "zenith", "nomad",
-            "lattice", "horizon", "prism", "beacon", "cobalt", "vortex"
-        )
-    } else {
-        listOf(
-            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
-            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
-        )
-    }
+    private val defaultMnemonic = listOf(
+        "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+        "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+    )
 
     private val initialIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(defaultMnemonic, epoch = 1)
 
     private val _uiState = MutableStateFlow(
         YggGramUiState(
-            isCloneInstance = isCloneNode,
-            localUdpPort = if (isCloneNode) 51922 else 51921,
-            remoteTwinUdpPort = if (isCloneNode) 51921 else 51922,
-            identity = initialIdentity,
-            userProfile = if (isCloneNode) {
-                DecentralizedUserProfile(
-                    displayName = "Узел #2 (YggGram Клон)",
-                    handle = "@node2_clone.ygg",
-                    bio = "Второй локальный экземпляр YggGram для проверки P2P-связи и доставки сообщений",
-                    statusText = "Слушает UDP 127.0.0.1:51922 -> 51921"
-                )
-            } else {
-                DecentralizedUserProfile()
-            }
+            identity = initialIdentity
         )
     )
     val uiState: StateFlow<YggGramUiState> = _uiState.asStateFlow()
 
-    private val twinBridge = YggTwinP2PBridge(
-        isCloneInstance = isCloneNode,
-        scope = viewModelScope,
+    private val networkEngine = YggTwinP2PBridge(
+        context = application.applicationContext,
         onPacketReceived = { packet ->
             viewModelScope.launch {
-                repository.recordIncomingTwinMessage(
+                val chatId = repository.recordIncomingTwinMessage(
                     packet = packet,
                     activeChatId = _uiState.value.selectedChatId
                 )
@@ -188,7 +181,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     it.copy(
                         isTwinAppReachable = true,
                         rxPacketsCount = it.rxPacketsCount + 1,
-                        statusBannerMessage = "Принято по Yggdrasil (${packet.rttMs} мс): ${packet.plainText.take(54)}"
+                        selectedChatId = it.selectedChatId ?: chatId,
+                        statusBannerMessage = "Получен пакет Yggdrasil от «${packet.senderNodeLabel}» (${packet.rttMs} мс)"
                     )
                 }
             }
@@ -198,16 +192,37 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 repository.markMessageDelivered(messageId)
             }
         },
+        onTwinReachableChanged = { reachable ->
+            _uiState.update { it.copy(isTwinAppReachable = reachable) }
+        },
         onPacketLogAdded = { entry ->
             _uiState.update { state ->
-                val updatedLogs = (listOf(entry) + state.packetLogs).take(25)
+                val updatedLogs = (listOf(entry) + state.packetLogs).take(40)
                 state.copy(packetLogs = updatedLogs)
             }
         },
-        onTwinReachableChanged = { reachable ->
-            _uiState.update { it.copy(isTwinAppReachable = reachable) }
+        onLanNodeDiscovered = { lanNode ->
+            viewModelScope.launch {
+                val chatId = repository.createNewConversation(
+                    title = lanNode.displayName,
+                    yggIpv6Input = lanNode.yggIpv6,
+                    isMlsGroup = false,
+                    sealedSender = true,
+                    disappearingSeconds = 0,
+                    directEndpointHint = "${lanNode.hostIp}:${lanNode.tcpPort}",
+                    localIdentity = _uiState.value.identity
+                )
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "В локальной сети найден узел «${lanNode.displayName}» (${lanNode.hostIp}:${lanNode.tcpPort})",
+                        selectedChatId = it.selectedChatId ?: chatId
+                    )
+                }
+            }
         }
     )
+
+    private var airplaneReceiver: BroadcastReceiver? = null
 
     val conversations: StateFlow<List<ConversationEntity>> = repository.conversations
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -236,40 +251,166 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         viewModelScope.launch {
-            repository.ensureSeeded(initialIdentity, isCloneNode = isCloneNode)
-            twinBridge.startBridgeListener()
-            startNetworkConnectivityObserver()
+            repository.ensureInitialized(initialIdentity)
+            networkEngine.start()
+            startNetworkAndAirplaneObserver()
+            refreshRealPeerConnectivity()
         }
     }
 
-    private fun startNetworkConnectivityObserver() {
-        val connectivityManager = getApplication<Application>().getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-        if (connectivityManager != null) {
-            val request = android.net.NetworkRequest.Builder()
-                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    private fun startNetworkAndAirplaneObserver() {
+        val app = getApplication<Application>()
+        updateConnectivitySnapshot()
+
+        val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        if (cm != null) {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .build()
 
-            val initialHasInternet = connectivityManager.activeNetwork != null
-            _uiState.update { it.copy(isNetworkAvailable = initialHasInternet) }
+            try {
+                cm.registerNetworkCallback(
+                    request,
+                    object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) {
+                            updateConnectivitySnapshot()
+                            viewModelScope.launch { refreshRealPeerConnectivity() }
+                        }
 
-            connectivityManager.registerNetworkCallback(
-                request,
-                object : android.net.ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: android.net.Network) {
-                        _uiState.update { it.copy(isNetworkAvailable = true) }
+                        override fun onLost(network: Network) {
+                            updateConnectivitySnapshot()
+                            viewModelScope.launch {
+                                if (!networkEngine.isRealNetworkAvailable()) {
+                                    repository.markAllPeersDisconnected()
+                                }
+                            }
+                        }
+
+                        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                            updateConnectivitySnapshot()
+                        }
                     }
+                )
+            } catch (_: Exception) {
+            }
+        }
 
-                    override fun onLost(network: android.net.Network) {
-                        _uiState.update { it.copy(isNetworkAvailable = false) }
+        try {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    updateConnectivitySnapshot()
+                    viewModelScope.launch {
+                        if (!networkEngine.isRealNetworkAvailable()) {
+                            repository.markAllPeersDisconnected()
+                            _uiState.update { state ->
+                                state.copy(
+                                    antiDpiConfig = state.antiDpiConfig.copy(
+                                        lastProbeReport = "Авиарежим активен / Сеть отключена: все внешние соединения Yggdrasil разорваны"
+                                    ),
+                                    statusBannerMessage = "Включен Авиарежим: сеть недоступна, пиры переведены в офлайн"
+                                )
+                            }
+                        } else {
+                            refreshRealPeerConnectivity()
+                        }
                     }
                 }
+            }
+            app.registerReceiver(receiver, IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED))
+            airplaneReceiver = receiver
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun updateConnectivitySnapshot() {
+        val netOk = networkEngine.isRealNetworkAvailable()
+        val airplane = networkEngine.isAirplaneModeActive()
+        val lanIp = networkEngine.getLocalLanIpv4Address()
+        _uiState.update {
+            it.copy(
+                isNetworkAvailable = netOk,
+                isAirplaneModeOn = airplane,
+                localLanIp = lanIp,
+                localUdpPort = networkEngine.localTcpPort
             )
+        }
+    }
+
+    /**
+     * Probes all configured peers in the routing table using real TCP/TLS sockets.
+     * In Airplane Mode or when offline, immediately marks all peers disconnected (-1 ms).
+     */
+    fun refreshRealPeerConnectivity() {
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                repository.markAllPeersDisconnected()
+                val reason = if (_uiState.value.isAirplaneModeOn) "Активен Авиарежим" else "Отсутствует подключение к сети"
+                _uiState.update { state ->
+                    state.copy(
+                        antiDpiConfig = state.antiDpiConfig.copy(
+                            isProbingRoutes = false,
+                            lastProbeReport = "Сеть недоступна ($reason) — подключенных пиров: 0"
+                        )
+                    )
+                }
+                return@launch
+            }
+
+            val currentPeers = repository.getAllPeersNow()
+            if (currentPeers.isEmpty()) return@launch
+
+            val results = withContext(Dispatchers.IO) {
+                currentPeers.map { peer ->
+                    async {
+                        val probe = networkEngine.probeRealYggdrasilPeer(
+                            endpointUri = peer.endpointUri,
+                            sniOverride = peer.sniDomain,
+                            timeoutMs = 3000
+                        )
+                        repository.updatePeerProbeStatus(
+                            peerId = peer.peerId,
+                            reachable = probe.reachable,
+                            latencyMs = probe.rttMs,
+                            rxDelta = probe.rxBytes,
+                            txDelta = probe.txBytes
+                        )
+                        peer to probe
+                    }
+                }.awaitAll()
+            }
+
+            val aliveCount = results.count { it.second.reachable }
+            val bestRtt = results.filter { it.second.reachable }.minOfOrNull { it.second.rttMs }
+            _uiState.update { state ->
+                val report = if (aliveCount > 0) {
+                    "Соединение с сетью Yggdrasil активно: живых пиров $aliveCount из ${results.size} (лучший пинг: ${bestRtt ?: "-"} мс)"
+                } else {
+                    "Ни один из ${results.size} пиров не ответил на TCP/TLS рукопожатие (проверьте сеть или выберите живой пир в Сканере)"
+                }
+                state.copy(
+                    rxPacketsCount = state.rxPacketsCount + aliveCount,
+                    txPacketsCount = state.txPacketsCount + results.size,
+                    antiDpiConfig = state.antiDpiConfig.copy(
+                        isProbingRoutes = false,
+                        lastProbeReport = report
+                    )
+                )
+            }
         }
     }
 
     override fun onCleared() {
         super.onCleared()
-        twinBridge.stop()
+        try {
+            airplaneReceiver?.let { getApplication<Application>().unregisterReceiver(it) }
+        } catch (_: Exception) {
+        }
+        networkEngine.stop()
+    }
+
+    fun clearPacketLogs() {
+        _uiState.update { it.copy(packetLogs = emptyList()) }
     }
 
     fun selectTab(tab: YggNavTab) {
@@ -281,6 +422,28 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (chatId != null) {
             viewModelScope.launch {
                 repository.markConversationRead(chatId)
+            }
+        }
+    }
+
+    /**
+     * Opens the dedicated "Избранное • Мой узел Yggdrasil" self-chat and optionally
+     * sends an immediate test message routed strictly through external public Yggdrasil peers.
+     */
+    fun openSelfYggdrasilTestChat(sendInitialTestMessage: Boolean = false) {
+        viewModelScope.launch {
+            val selfChatId = repository.ensureSelfYggdrasilConversation(_uiState.value.identity)
+            _uiState.update {
+                it.copy(
+                    activeTab = YggNavTab.CHATS,
+                    selectedChatId = selfChatId
+                )
+            }
+            if (sendInitialTestMessage) {
+                sendMessage(
+                    chatId = selfChatId,
+                    plainText = "Тест связи Yggdrasil: проверка маршрута через внешний публичный пир до моего узла ${_uiState.value.identity.yggIpv6Address}"
+                )
             }
         }
     }
@@ -314,24 +477,118 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             it.copy(
                 isOfflineStoreAndForwardMode = nextOffline,
                 statusBannerMessage = if (nextOffline) {
-                    "Включен Офлайн-режим: пакеты шифруются Sealed Sender + Hashcash PoW и ставятся в очередь S&F"
+                    "Включен Офлайн-режим: пакеты сохраняются в локальной очереди S&F без отправки в сокет"
                 } else {
-                    "Восстановлена прямая связь с оверлеем Yggdrasil: отправка накопленной очереди S&F..."
+                    "Офлайн-режим отключен: попытка отправки очереди S&F через сеть Yggdrasil..."
                 }
             )
         }
         if (!nextOffline) {
-            viewModelScope.launch {
-                val flushed = repository.flushOfflineStoreAndForwardQueue()
-                if (flushed > 0) {
-                    _uiState.update {
-                        it.copy(
-                            statusBannerMessage = "Очередь Store-and-Forward успешно доставлена в сеть Yggdrasil ($flushed сообщений)"
+            flushQueuedMessagesOverRealNetwork()
+        }
+    }
+
+    private fun isConversationSelfNode(conv: ConversationEntity?, identity: DerivedIdentityHierarchy): Boolean {
+        if (conv == null) return false
+        return conv.chatId == YggRepository.SELF_NODE_CHAT_ID ||
+            conv.yggIpv6Address.equals(identity.yggIpv6Address, ignoreCase = true) ||
+            conv.publicKeyHex.equals(identity.yggNodePublicKeyHex, ignoreCase = true)
+    }
+
+    private suspend fun buildCandidateExternalPeersList(): List<Triple<String, String, String>> {
+        val allPeers = repository.getAllPeersNow()
+        val connectedFirst = allPeers
+            .sortedWith(
+                compareBy<YggPeerEntity> { if (it.isConnected) 0 else 1 }
+                    .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+            )
+        return connectedFirst.map { Triple(it.endpointUri, it.sniDomain, it.regionLabel) }
+    }
+
+    private fun flushQueuedMessagesOverRealNetwork() {
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Очередь S&F ожидает подключения к сети (сейчас устройство офлайн)")
+                }
+                return@launch
+            }
+            val queued = repository.getQueuedMessages()
+            var deliveredCount = 0
+            val currentIdentity = _uiState.value.identity
+            val candidateExternalPeers = buildCandidateExternalPeersList()
+
+            for (msg in queued) {
+                val conv = repository.getConversation(msg.chatId) ?: continue
+                if (isConversationSelfNode(conv, currentIdentity)) {
+                    val selfRelay = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
+                        chatId = conv.chatId,
+                        messageId = msg.messageId,
+                        senderNodeLabel = _uiState.value.userProfile.displayName,
+                        senderIpv6 = currentIdentity.yggIpv6Address,
+                        senderPubKeyHex = currentIdentity.yggNodePublicKeyHex,
+                        plainText = msg.plainText,
+                        cipherPayloadHex = msg.cipherPayloadHex,
+                        hashcashToken = msg.hashcashPowToken,
+                        attachmentName = msg.attachmentName,
+                        attachmentSizeBytes = msg.attachmentSizeBytes,
+                        candidatePeers = candidateExternalPeers
+                    )
+                    if (selfRelay.delivered) {
+                        deliveredCount++
+                        repository.updatePeerTrafficByEndpoint(
+                            endpointUri = selfRelay.relayEndpointUri,
+                            rttMs = selfRelay.rttMs.toInt(),
+                            txDelta = selfRelay.txBytes,
+                            rxDelta = selfRelay.rxBytes
                         )
+                    }
+                } else {
+                    val directHint = extractDirectEndpointHint(conv)
+                    val delivered = networkEngine.dispatchOutgoingMessageThroughYggdrasil(
+                        chatId = conv.chatId,
+                        messageId = msg.messageId,
+                        peerTitle = conv.title,
+                        peerIpv6 = conv.yggIpv6Address,
+                        directEndpointHint = directHint,
+                        senderNodeLabel = _uiState.value.userProfile.displayName,
+                        senderIpv6 = currentIdentity.yggIpv6Address,
+                        senderPubKeyHex = currentIdentity.yggNodePublicKeyHex,
+                        plainText = msg.plainText,
+                        cipherPayloadHex = msg.cipherPayloadHex,
+                        hashcashToken = msg.hashcashPowToken,
+                        attachmentName = msg.attachmentName,
+                        attachmentSizeBytes = msg.attachmentSizeBytes
+                    )
+                    if (delivered) {
+                        deliveredCount++
                     }
                 }
             }
+            if (queued.isNotEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = if (deliveredCount > 0) {
+                            "Доставлено $deliveredCount из ${queued.size} сообщений очереди S&F через сеть Yggdrasil"
+                        } else {
+                            "Сообщения (${queued.size} шт.) остаются в очереди S&F: узлы Yggdrasil не ответили"
+                        }
+                    )
+                }
+            }
         }
+    }
+
+    private fun extractDirectEndpointHint(conv: ConversationEntity?): String {
+        if (conv == null) return ""
+        val bio = conv.bioStatus.trim()
+        if (bio.contains(":") && !bio.contains(" ")) return bio
+        val route = conv.routeTransportSummary
+        if (route.startsWith("Direct P2P (") && route.endsWith(")")) {
+            return route.removePrefix("Direct P2P (").removeSuffix(")")
+        }
+        return ""
     }
 
     fun sendMessage(
@@ -341,71 +598,325 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         attachmentSizeBytes: Long = 0L
     ) {
         if (plainText.isBlank() && attachmentName == null) return
+        updateConnectivitySnapshot()
         val currentState = _uiState.value
         val effectiveText = plainText.ifBlank { "Передача P2P файла: $attachmentName" }
-        val targetConv = conversations.value.find { it.chatId == chatId }
+
         viewModelScope.launch {
+            val targetConv = repository.getConversation(chatId) ?: conversations.value.find { it.chatId == chatId }
             val savedMsg = repository.sendEncryptedMessage(
                 chatId = chatId,
                 plainText = effectiveText,
                 senderIpv6 = currentState.identity.yggIpv6Address,
-                isOfflineMode = currentState.isOfflineStoreAndForwardMode,
+                isOfflineMode = currentState.isOfflineStoreAndForwardMode || !currentState.isNetworkAvailable,
                 sealedSenderGlobal = currentState.privacyMatrix.sealedSenderGlobal,
                 powDifficultyBits = currentState.privacyMatrix.hashcashDifficultyBits,
                 attachmentName = attachmentName,
                 attachmentSizeBytes = attachmentSizeBytes
-            )
+            ) ?: return@launch
+
+            if (currentState.isOfflineStoreAndForwardMode || !currentState.isNetworkAvailable) {
+                val reason = if (currentState.isAirplaneModeOn) "Авиарежим" else "Офлайн"
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Сеть недоступна ($reason): сообщение сохранено в очереди S&F"
+                    )
+                }
+                return@launch
+            }
+
             _uiState.update { it.copy(txPacketsCount = it.txPacketsCount + 1) }
 
-            if (!currentState.isOfflineStoreAndForwardMode && savedMsg != null) {
-                val nodeLabel = if (isCloneNode) "Узел #2 (YggGram Клон)" else "Узел #1 (YggGram Основной)"
-                twinBridge.dispatchOutgoingMessageThroughYggdrasil(
+            // Check if sending to self ("Избранное • Мой узел Yggdrasil" or own IPv6/PubKey)
+            if (isConversationSelfNode(targetConv, currentState.identity)) {
+                val candidatePeers = buildCandidateExternalPeersList()
+                val selfRelayResult = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
                     chatId = chatId,
                     messageId = savedMsg.messageId,
-                    peerTitle = targetConv?.title ?: "Узел Yggdrasil",
-                    peerIpv6 = targetConv?.yggIpv6Address ?: "0201:7c91:44e0::2",
-                    senderNodeLabel = nodeLabel,
+                    senderNodeLabel = currentState.userProfile.displayName,
                     senderIpv6 = currentState.identity.yggIpv6Address,
+                    senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
                     plainText = effectiveText,
                     cipherPayloadHex = savedMsg.cipherPayloadHex,
                     hashcashToken = savedMsg.hashcashPowToken,
                     attachmentName = attachmentName,
-                    attachmentSizeBytes = attachmentSizeBytes
+                    attachmentSizeBytes = attachmentSizeBytes,
+                    candidatePeers = candidatePeers
                 )
+
+                if (selfRelayResult.delivered) {
+                    repository.updatePeerTrafficByEndpoint(
+                        endpointUri = selfRelayResult.relayEndpointUri,
+                        rttMs = selfRelayResult.rttMs.toInt(),
+                        txDelta = selfRelayResult.txBytes,
+                        rxDelta = selfRelayResult.rxBytes
+                    )
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = true,
+                        routeSummary = "Yggdrasil • ${selfRelayResult.relayRegionLabel} (${selfRelayResult.rttMs} мс)"
+                    )
+                    _uiState.update {
+                        it.copy(
+                            rxPacketsCount = it.rxPacketsCount + 1,
+                            statusBannerMessage = "Проверено через Yggdrasil (${selfRelayResult.relayEndpointUri}): RTT ${selfRelayResult.rttMs} мс"
+                        )
+                    }
+                } else {
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = false,
+                        routeSummary = "Нет активных пиров Yggdrasil (${selfRelayResult.errorDetail ?: "офлайн"})"
+                    )
+                    _uiState.update {
+                        it.copy(
+                            statusBannerMessage = "Не удалось отправить через Yggdrasil (${selfRelayResult.errorDetail ?: "нет живых пиров"}) — сообщение в очереди S&F"
+                        )
+                    }
+                }
+                return@launch
+            }
+
+            val directHint = extractDirectEndpointHint(targetConv)
+            val delivered = networkEngine.dispatchOutgoingMessageThroughYggdrasil(
+                chatId = chatId,
+                messageId = savedMsg.messageId,
+                peerTitle = targetConv?.title ?: "Узел Yggdrasil",
+                peerIpv6 = targetConv?.yggIpv6Address ?: "",
+                directEndpointHint = directHint,
+                senderNodeLabel = currentState.userProfile.displayName,
+                senderIpv6 = currentState.identity.yggIpv6Address,
+                senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
+                plainText = effectiveText,
+                cipherPayloadHex = savedMsg.cipherPayloadHex,
+                hashcashToken = savedMsg.hashcashPowToken,
+                attachmentName = attachmentName,
+                attachmentSizeBytes = attachmentSizeBytes
+            )
+
+            if (!delivered) {
+                val hasActiveMeshRelay = peers.value.any { it.isConnected }
+                if (hasActiveMeshRelay) {
+                    repository.markMessageSentP2P(savedMsg.messageId)
+                    _uiState.update {
+                        it.copy(
+                            statusBannerMessage = "Пакет передан в оверлей Yggdrasil (ожидание ACK от удаленного адресата)"
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            statusBannerMessage = "Адресат недоступен и нет живых пиров Yggdrasil — сообщение в очереди S&F"
+                        )
+                    }
+                }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        rxPacketsCount = it.rxPacketsCount + 1,
+                        statusBannerMessage = "Сообщение доставлено по P2P и подтверждено крипто-ACK"
+                    )
+                }
             }
         }
     }
 
     /**
-     * One-tap live verification of Yggdrasil network + bidirectional message sending and receiving.
+     * Retries sending an offline/queued message over the real Yggdrasil network when tapped in chat.
      */
-    fun runLiveMessageSendReceiveTest(targetChatId: String? = null) {
-        val chatId = targetChatId ?: _uiState.value.selectedChatId ?: "chat_twin_node"
-        val probeNum = _uiState.value.txPacketsCount + 1
-        val testPayload = "Тест сети Yggdrasil #$probeNum: проверка сквозного шифрования Double Ratchet и доставки пакета 0200::/7"
-        sendMessage(
-            chatId = chatId,
-            plainText = testPayload
-        )
+    fun retrySendMessage(message: MessageEntity) {
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                val reason = if (_uiState.value.isAirplaneModeOn) "Включен Авиарежим" else "Нет подключения к сети"
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Повторная отправка невозможна: $reason")
+                }
+                return@launch
+            }
+            val currentState = _uiState.value
+            val conv = repository.getConversation(message.chatId) ?: return@launch
+            if (isConversationSelfNode(conv, currentState.identity)) {
+                val candidatePeers = buildCandidateExternalPeersList()
+                val res = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
+                    chatId = conv.chatId,
+                    messageId = message.messageId,
+                    senderNodeLabel = currentState.userProfile.displayName,
+                    senderIpv6 = currentState.identity.yggIpv6Address,
+                    senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
+                    plainText = message.plainText,
+                    cipherPayloadHex = message.cipherPayloadHex,
+                    hashcashToken = message.hashcashPowToken,
+                    attachmentName = message.attachmentName,
+                    attachmentSizeBytes = message.attachmentSizeBytes,
+                    candidatePeers = candidatePeers
+                )
+                if (res.delivered) {
+                    repository.updatePeerTrafficByEndpoint(
+                        endpointUri = res.relayEndpointUri,
+                        rttMs = res.rttMs.toInt(),
+                        txDelta = res.txBytes,
+                        rxDelta = res.rxBytes
+                    )
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Сообщение доставлено через внешний пир ${res.relayEndpointUri} (${res.rttMs} мс)")
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Повтор не удался: ${res.errorDetail ?: "нет живых пиров Yggdrasil"}")
+                    }
+                }
+            } else {
+                val directHint = extractDirectEndpointHint(conv)
+                val ok = networkEngine.dispatchOutgoingMessageThroughYggdrasil(
+                    chatId = conv.chatId,
+                    messageId = message.messageId,
+                    peerTitle = conv.title,
+                    peerIpv6 = conv.yggIpv6Address,
+                    directEndpointHint = directHint,
+                    senderNodeLabel = currentState.userProfile.displayName,
+                    senderIpv6 = currentState.identity.yggIpv6Address,
+                    senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
+                    plainText = message.plainText,
+                    cipherPayloadHex = message.cipherPayloadHex,
+                    hashcashToken = message.hashcashPowToken,
+                    attachmentName = message.attachmentName,
+                    attachmentSizeBytes = message.attachmentSizeBytes
+                )
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = if (ok) {
+                            "Сообщение успешно доставлено узлу «${conv.title}»"
+                        } else {
+                            "Узел «${conv.title}» пока не отвечает по прямому сокету"
+                        }
+                    )
+                }
+            }
+        }
     }
 
-    fun pingTwinNodeNow() {
+    /**
+     * Pings a conversation's route through Yggdrasil or direct P2P and updates its status.
+     */
+    fun pingConversationRoute(chatId: String) {
         viewModelScope.launch {
-            val sent = twinBridge.sendPingToTwin()
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                val reason = if (_uiState.value.isAirplaneModeOn) "Включен Авиарежим" else "Нет подключения к сети"
+                repository.updateConversationRouteStatus(chatId, false, "Офлайн ($reason)")
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Пинг невозможен: $reason")
+                }
+                return@launch
+            }
+            val conv = repository.getConversation(chatId) ?: return@launch
+            if (isConversationSelfNode(conv, _uiState.value.identity)) {
+                val candidatePeers = buildCandidateExternalPeersList()
+                if (candidatePeers.isEmpty()) {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Нет пиров Yggdrasil в таблице маршрутизации — добавьте пир во вкладке «Сеть и DPI»")
+                    }
+                    return@launch
+                }
+                val (uri, sni, region) = candidatePeers.first()
+                val probe = networkEngine.probeRealYggdrasilPeer(uri, sni, timeoutMs = 3200)
+                if (probe.reachable) {
+                    repository.updatePeerTrafficByEndpoint(uri, probe.rttMs, probe.txBytes, probe.rxBytes)
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = true,
+                        routeSummary = "Yggdrasil • $region (${probe.rttMs} мс)"
+                    )
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Маршрут Yggdrasil до вашего узла через $uri активен (RTT: ${probe.rttMs} мс)")
+                    }
+                } else {
+                    refreshRealPeerConnectivity()
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Пир $uri не ответил (${probe.errorDetail ?: "timeout"}), выполняется перевыбор...")
+                    }
+                }
+            } else {
+                val directHint = extractDirectEndpointHint(conv)
+                val targetUri = if (directHint.isNotBlank()) "tcp://$directHint" else "tcp://[${conv.yggIpv6Address}]:51921"
+                val probe = networkEngine.probeRealYggdrasilPeer(targetUri, null, timeoutMs = 3000)
+                if (probe.reachable) {
+                    repository.updateConversationRouteStatus(chatId, true, "Direct P2P (${probe.rttMs} мс)")
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Узел «${conv.title}» на связи: RTT ${probe.rttMs} мс")
+                    }
+                } else {
+                    val connectedPeers = peers.value.filter { it.isConnected }
+                    val bestRelay = connectedPeers.minByOrNull { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                    if (bestRelay != null) {
+                        repository.updateConversationRouteStatus(
+                            chatId = chatId,
+                            isOnline = false,
+                            routeSummary = "Через оверлей ${bestRelay.regionLabel} (${bestRelay.latencyMs} мс)"
+                        )
+                        _uiState.update {
+                            it.copy(
+                                statusBannerMessage = "Прямой сокет «${conv.title}» закрыт; оверлей Yggdrasil активен (${bestRelay.endpointUri}, ${bestRelay.latencyMs} мс)"
+                            )
+                        }
+                    } else {
+                        repository.updateConversationRouteStatus(chatId, false, "Узел недоступен • Офлайн S&F")
+                        _uiState.update {
+                            it.copy(statusBannerMessage = "Узел «${conv.title}» сейчас недоступен")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Broadcasts a real LAN discovery beacon on UDP 51920 and probes connected peers,
+     * or if a chat is specified, runs a real Yggdrasil self-test / route check.
+     */
+    fun runLiveMessageSendReceiveTest(targetChatId: String? = null) {
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                val reason = if (_uiState.value.isAirplaneModeOn) "Включен Авиарежим" else "Нет подключения к сети"
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Ошибка проверки сети: $reason. Отключите авиарежим и подключитесь к Wi-Fi/сети."
+                    )
+                }
+                return@launch
+            }
+
+            if (targetChatId != null) {
+                pingConversationRoute(targetChatId)
+                return@launch
+            }
+
+            val state = _uiState.value
+            val beaconSent = networkEngine.broadcastLanDiscoveryBeacon(
+                displayName = state.userProfile.displayName,
+                yggIpv6 = state.identity.yggIpv6Address,
+                pubKeyHex = state.identity.yggNodePublicKeyHex
+            )
+            refreshRealPeerConnectivity()
             _uiState.update {
                 it.copy(
-                    txPacketsCount = it.txPacketsCount + 1,
-                    statusBannerMessage = if (sent) {
-                        "Отправлен UDP P2P-пинг в сокет Yggdrasil (порт :${it.remoteTwinUdpPort}) — связь подтверждена"
+                    statusBannerMessage = if (beaconSent) {
+                        "Отправлен LAN-маяк (UDP :51920) и запущена реальная проверка пиров Yggdrasil"
                     } else {
-                        "Ожидание ответа от сокета :${it.remoteTwinUdpPort}"
+                        "Запущена реальная проверка пиров Yggdrasil"
                     }
                 )
             }
         }
     }
 
-    // --- Yggdrasil Peer Scanner by Country ---
+    fun pingTwinNodeNow() {
+        runLiveMessageSendReceiveTest(null)
+    }
+
+    // --- Real Yggdrasil Public Peer Scanner by Country, Search, Sort & Bulk Import ---
 
     fun selectScanCountry(countryCode: String) {
         _uiState.update { state ->
@@ -417,8 +928,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             state.copy(
                 peerScanner = state.peerScanner.copy(
                     selectedCountryCode = countryCode,
-                    lastScanSummary = "Выборка «${countryObj?.nameRu ?: countryCode}»: найдено $filteredCount пиров Yggdrasil"
+                    lastScanSummary = "Выборка «${countryObj?.nameRu ?: countryCode}»: $filteredCount публичных пиров в списке"
                 )
+            )
+        }
+    }
+
+    fun updateScannerSearchQuery(query: String) {
+        _uiState.update { state ->
+            state.copy(
+                peerScanner = state.peerScanner.copy(searchQuery = query)
+            )
+        }
+    }
+
+    fun updateScannerSortMode(sortMode: String) {
+        _uiState.update { state ->
+            state.copy(
+                peerScanner = state.peerScanner.copy(sortMode = sortMode)
             )
         }
     }
@@ -434,38 +961,168 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Bulk-imports peer URIs (`tls://`, `tcp://`, `wss://`, `quic://`) from clipboard/text,
+     * adds them to the scanner catalog and routing table, and immediately probes their real RTT.
+     */
+    fun importCustomPeersFromText(rawText: String) {
+        val cfg = _uiState.value.antiDpiConfig
+        val parsed = YggPeerScannerCatalog.parseCustomPeerUrisFromText(
+            rawText = rawText,
+            defaultSni = cfg.whitelistSniDomain,
+            defaultUtls = cfg.utlsProfile
+        )
+        if (parsed.isEmpty()) {
+            _uiState.update {
+                it.copy(statusBannerMessage = "В тексте не найдено URI пиров (ожидаются tls://, tcp://, wss:// или quic://)")
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            val netAvailable = networkEngine.isRealNetworkAvailable()
+            var aliveImported = 0
+
+            val probedPeers = withContext(Dispatchers.IO) {
+                parsed.map { peer ->
+                    async {
+                        val probe = if (netAvailable) {
+                            networkEngine.probeRealYggdrasilPeer(peer.endpointUri, peer.sniDomain, timeoutMs = 3000)
+                        } else null
+                        val reachable = probe?.reachable == true
+                        val rtt = if (reachable) probe?.rttMs ?: -1 else -1
+                        repository.addOrUpdatePeer(
+                            peerId = "peer_${peer.id}",
+                            endpointUri = peer.endpointUri,
+                            transportType = peer.transportType,
+                            sniDomain = peer.sniDomain,
+                            utlsFingerprint = peer.utlsFingerprint,
+                            regionLabel = "${peer.countryFlag} Импорт • ${peer.cityRu}",
+                            latencyMs = rtt,
+                            isConnected = reachable,
+                            whitelistCompatible = peer.whitelistCompatible
+                        )
+                        peer.copy(latencyMs = rtt)
+                    }
+                }.awaitAll()
+            }
+
+            aliveImported = probedPeers.count { it.latencyMs > 0 }
+            _uiState.update { state ->
+                val merged = (probedPeers + state.peerScanner.discoveredPeers).distinctBy { it.endpointUri }
+                state.copy(
+                    peerScanner = state.peerScanner.copy(
+                        discoveredPeers = merged,
+                        lastScanSummary = "Импортировано ${probedPeers.size} пиров (ответили по сети: $aliveImported)"
+                    ),
+                    statusBannerMessage = "Импортировано ${probedPeers.size} пиров Yggdrasil • Активных: $aliveImported"
+                )
+            }
+        }
+    }
+
+    /**
+     * Fetches the live public peer list from `publicpeers.neilalexander.dev/publicnodes.json` (merging
+     * with the 46 built-in real peers) and performs REAL TCP/TLS socket handshakes to measure genuine RTT.
+     */
     fun scanYggdrasilPeersByCountry() {
         if (_uiState.value.peerScanner.isScanning) return
         viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                val reason = if (_uiState.value.isAirplaneModeOn) "Активен Авиарежим" else "Отсутствует подключение к Интернету"
+                _uiState.update { state ->
+                    val resetPeers = state.peerScanner.discoveredPeers.map { it.copy(latencyMs = -1) }
+                    state.copy(
+                        peerScanner = state.peerScanner.copy(
+                            isScanning = false,
+                            discoveredPeers = resetPeers,
+                            lastScanSummary = "Сканирование невозможно: $reason"
+                        ),
+                        statusBannerMessage = "Ошибка сканирования пиров: $reason"
+                    )
+                }
+                return@launch
+            }
+
             val selectedCountry = _uiState.value.peerScanner.selectedCountryCode
             _uiState.update { state ->
                 state.copy(
                     peerScanner = state.peerScanner.copy(
                         isScanning = true,
-                        lastScanSummary = "Активное сканирование RTT и проверка подписей Ed25519 (страна: $selectedCountry)..."
+                        lastScanSummary = "Загрузка каталога publicnodes.json и реальный TCP/TLS замер пинга..."
                     )
                 )
             }
-            delay(400)
-            val refreshedList = _uiState.value.peerScanner.discoveredPeers.map { peer ->
-                val jitter = (-3..4).random()
-                peer.copy(latencyMs = (peer.latencyMs + jitter).coerceAtLeast(8))
-            }.sortedBy { it.latencyMs }
 
-            val matching = refreshedList.filter {
+            val candidateCatalog = withContext(Dispatchers.IO) {
+                val liveFetched = try {
+                    YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                if (liveFetched.isNotEmpty()) {
+                    ( _uiState.value.peerScanner.discoveredPeers + liveFetched ).distinctBy { it.endpointUri }
+                } else {
+                    _uiState.value.peerScanner.discoveredPeers
+                }
+            }
+
+            val toProbe = candidateCatalog.filter {
                 (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
                     (!_uiState.value.peerScanner.onlyWhitelistCompatible || it.whitelistCompatible)
             }
-            val bestLatency = matching.minOfOrNull { it.latencyMs } ?: 18
+
+            val probedMap = withContext(Dispatchers.IO) {
+                toProbe.chunked(16).flatMap { batch ->
+                    batch.map { peer ->
+                        async {
+                            val res = networkEngine.probeRealYggdrasilPeer(
+                                endpointUri = peer.endpointUri,
+                                sniOverride = peer.sniDomain,
+                                timeoutMs = 2600
+                            )
+                            peer.endpointUri to res
+                        }
+                    }.awaitAll()
+                }.toMap()
+            }
+
+            val updatedCatalog = candidateCatalog.map { peer ->
+                val probe = probedMap[peer.endpointUri]
+                if (probe != null) {
+                    peer.copy(latencyMs = if (probe.reachable) probe.rttMs else -1)
+                } else {
+                    peer
+                }
+            }.sortedWith(
+                compareBy<DiscoveredYggPeer> { if (it.latencyMs > 0) 0 else 1 }
+                    .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+            )
+
+            val reachableInSelection = updatedCatalog.filter {
+                (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
+                    (!_uiState.value.peerScanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
+                    it.latencyMs > 0
+            }
+            val bestRtt = reachableInSelection.minOfOrNull { it.latencyMs }
 
             _uiState.update { state ->
+                val summary = if (reachableInSelection.isNotEmpty()) {
+                    "Живой замер завершен: ответили ${reachableInSelection.size} из ${toProbe.size} узлов • Лучший пинг: $bestRtt мс"
+                } else {
+                    "Проверено ${toProbe.size} узлов: ни один не ответил на прямое TCP/TLS соединение"
+                }
                 state.copy(
+                    txPacketsCount = state.txPacketsCount + toProbe.size,
+                    rxPacketsCount = state.rxPacketsCount + reachableInSelection.size,
                     peerScanner = state.peerScanner.copy(
                         isScanning = false,
-                        discoveredPeers = refreshedList,
-                        lastScanSummary = "Сканирование завершено: доступно ${matching.size} узлов • Лучший пинг: $bestLatency мс"
+                        discoveredPeers = updatedCatalog,
+                        lastScanSummary = summary
                     ),
-                    statusBannerMessage = "Сканер пиров Yggdrasil обновил метрики (${matching.size} узлов, от $bestLatency мс)"
+                    statusBannerMessage = summary
                 )
             }
         }
@@ -473,6 +1130,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun connectScannedPeer(scanned: DiscoveredYggPeer) {
         viewModelScope.launch {
+            updateConnectivitySnapshot()
+            if (!networkEngine.isRealNetworkAvailable()) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Невозможно подключить пир: устройство в авиарежиме или без сети")
+                }
+                return@launch
+            }
+            val probe = networkEngine.probeRealYggdrasilPeer(
+                endpointUri = scanned.endpointUri,
+                sniOverride = scanned.sniDomain,
+                timeoutMs = 3200
+            )
             repository.addOrUpdatePeer(
                 peerId = "peer_${scanned.id}",
                 endpointUri = scanned.endpointUri,
@@ -480,12 +1149,23 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 sniDomain = scanned.sniDomain,
                 utlsFingerprint = scanned.utlsFingerprint,
                 regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
-                latencyMs = scanned.latencyMs,
+                latencyMs = if (probe.reachable) probe.rttMs else -1,
+                isConnected = probe.reachable,
                 whitelistCompatible = scanned.whitelistCompatible
             )
-            _uiState.update {
-                it.copy(
-                    statusBannerMessage = "Узел ${scanned.countryFlag} ${scanned.cityRu} (${scanned.latencyMs} мс) добавлен в таблицу маршрутизации"
+            _uiState.update { state ->
+                val updatedDiscovered = state.peerScanner.discoveredPeers.map {
+                    if (it.endpointUri == scanned.endpointUri) {
+                        it.copy(latencyMs = if (probe.reachable) probe.rttMs else -1)
+                    } else it
+                }
+                state.copy(
+                    peerScanner = state.peerScanner.copy(discoveredPeers = updatedDiscovered),
+                    statusBannerMessage = if (probe.reachable) {
+                        "Узел ${scanned.countryFlag} ${scanned.cityRu} подключен (реальный RTT: ${probe.rttMs} мс)"
+                    } else {
+                        "Узел ${scanned.cityRu} добавлен в маршруты, но сейчас не отвечает (${probe.errorDetail ?: "Timeout"})"
+                    }
                 )
             }
         }
@@ -496,12 +1176,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val matching = scanner.discoveredPeers
             .filter {
                 (scanner.selectedCountryCode == "ALL" || it.countryCode == scanner.selectedCountryCode) &&
-                    (!scanner.onlyWhitelistCompatible || it.whitelistCompatible)
+                    (!scanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
+                    it.latencyMs > 0
             }
             .sortedBy { it.latencyMs }
             .take(3)
 
-        if (matching.isEmpty()) return
+        if (matching.isEmpty()) {
+            _uiState.update {
+                it.copy(statusBannerMessage = "Сначала нажмите «Сканировать пинг», чтобы найти реально доступные узлы")
+            }
+            return
+        }
         viewModelScope.launch {
             matching.forEach { scanned ->
                 repository.addOrUpdatePeer(
@@ -512,12 +1198,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     utlsFingerprint = scanned.utlsFingerprint,
                     regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
                     latencyMs = scanned.latencyMs,
+                    isConnected = true,
                     whitelistCompatible = scanned.whitelistCompatible
                 )
             }
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = "Подключены ${matching.size} самых быстрых пира (${matching.first().cityRu}: ${matching.first().latencyMs} мс)"
+                    statusBannerMessage = "Подключены ${matching.size} быстрых пира (лучший: ${matching.first().cityRu}, ${matching.first().latencyMs} мс)"
                 )
             }
         }
@@ -530,22 +1217,36 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         sealedSender: Boolean,
         disappearingSeconds: Int
     ) {
-        if (title.isBlank()) return
+        if (title.isBlank() && yggIpv6Input.isBlank()) return
         viewModelScope.launch {
+            val parts = yggIpv6Input.split("|", ",", " ").map { it.trim() }.filter { it.isNotEmpty() }
+            val primaryAddr = parts.firstOrNull() ?: yggIpv6Input.trim()
+            val directHint = parts.drop(1).firstOrNull { it.contains(":") && it.contains(".") }
+                ?: if (primaryAddr.contains(".") && primaryAddr.contains(":")) primaryAddr else ""
+
+            val effectiveTitle = title.trim().ifBlank { "Узел Yggdrasil" }
             val newChatId = repository.createNewConversation(
-                title = title,
-                yggIpv6Input = yggIpv6Input,
+                title = effectiveTitle,
+                yggIpv6Input = primaryAddr,
                 isMlsGroup = isMlsGroup,
                 sealedSender = sealedSender,
-                disappearingSeconds = disappearingSeconds
+                disappearingSeconds = disappearingSeconds,
+                directEndpointHint = directHint,
+                localIdentity = _uiState.value.identity
             )
+            if (directHint.isNotBlank() && newChatId != YggRepository.SELF_NODE_CHAT_ID) {
+                val conv = repository.getConversation(newChatId)
+                if (conv != null) {
+                    networkEngine.registerDirectEndpointForPeer(conv.yggIpv6Address, directHint)
+                }
+            }
             _uiState.update {
                 it.copy(
                     selectedChatId = newChatId,
-                    statusBannerMessage = if (isMlsGroup) {
-                        "Создана группа MLS RFC 9420 «$title»"
+                    statusBannerMessage = if (newChatId == YggRepository.SELF_NODE_CHAT_ID) {
+                        "Открыт чат «Избранное • Мой узел Yggdrasil» (маршрутизация через внешние пиры)"
                     } else {
-                        "Установлена сессия X3DH + Double Ratchet с «$title»"
+                        "Добавлен контакт «$effectiveTitle»"
                     }
                 )
             }
@@ -568,7 +1269,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 shadowTlsV3Enabled = false,
                 quicPaddingEnabled = true,
                 utlsProfile = "HelloChrome_128_Auto",
-                lastProbeReport = "Активен режим обхода Белых списков: трафик упакован в WSS CDN (SNI: ${current.whitelistSniDomain})"
+                lastProbeReport = "Выбран профиль обхода Белых списков (SNI: ${current.whitelistSniDomain})"
             )
             CensorshipPreset.TSPU_VLESS_SHADOWTLS -> current.copy(
                 activePreset = preset,
@@ -577,34 +1278,35 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 shadowTlsV3Enabled = true,
                 quicPaddingEnabled = true,
                 utlsProfile = "HelloIOS_18_Auto",
-                lastProbeReport = "Активен контур против ТСПУ: VLESS Reality + ShadowTLS v3 с отпечатком uTLS iOS 18"
+                lastProbeReport = "Выбран профиль VLESS Reality + ShadowTLS v3 (uTLS iOS 18)"
             )
             CensorshipPreset.QUIC_UDP_OBFUSCATION -> current.copy(
                 activePreset = preset,
                 quicPaddingEnabled = true,
                 quicPaddingMTU = 1400,
                 utlsProfile = "QUIC_v1_Padded_Jitter",
-                lastProbeReport = "Активна обфускация QUIC UDP: выравнивание пакетов до 1400 байт + шумовой префикс"
+                lastProbeReport = "Выбрана обфускация QUIC UDP (выравнивание пакетов до 1400 байт)"
             )
             CensorshipPreset.AUTONOMOUS_DHT_DOH -> current.copy(
                 activePreset = preset,
                 dhtBep44BootstrapEnabled = true,
                 whitelistCdnWssEnabled = true,
-                lastProbeReport = "Запущен автономный поиск входных узлов через BitTorrent Mainline DHT BEP-44 и DoH"
+                lastProbeReport = "Выбран автономный поиск входных узлов через DHT BEP-44 и DoH"
             )
         }
         _uiState.update {
             it.copy(
                 antiDpiConfig = updatedConfig,
-                statusBannerMessage = "Применен профиль обхода: ${preset.title}"
+                statusBannerMessage = "Применен профиль: ${preset.title}"
             )
         }
         viewModelScope.launch {
-            repository.refreshPeersTelemetryForPreset(
+            repository.updatePeersTransportProfile(
                 whitelistMode = updatedConfig.whitelistCdnWssEnabled,
                 preferredSni = updatedConfig.whitelistSniDomain,
                 utlsProfile = updatedConfig.utlsProfile
             )
+            refreshRealPeerConnectivity()
         }
     }
 
@@ -613,13 +1315,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             state.copy(
                 antiDpiConfig = state.antiDpiConfig.copy(
                     whitelistSniDomain = domain,
-                    lastProbeReport = "Обновлен SNI-домен белого списка: $domain (туннель WSS CDN перестроен)"
+                    lastProbeReport = "Установлен SNI-домен: $domain"
                 )
             )
         }
         viewModelScope.launch {
             val cfg = _uiState.value.antiDpiConfig
-            repository.refreshPeersTelemetryForPreset(
+            repository.updatePeersTransportProfile(
                 whitelistMode = cfg.whitelistCdnWssEnabled,
                 preferredSni = domain,
                 utlsProfile = cfg.utlsProfile
@@ -632,13 +1334,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             state.copy(
                 antiDpiConfig = state.antiDpiConfig.copy(
                     utlsProfile = fingerprint,
-                    lastProbeReport = "Установлен TLS ClientHello профиль uTLS: $fingerprint"
+                    lastProbeReport = "Установлен профиль uTLS: $fingerprint"
                 )
             )
         }
         viewModelScope.launch {
             val cfg = _uiState.value.antiDpiConfig
-            repository.refreshPeersTelemetryForPreset(
+            repository.updatePeersTransportProfile(
                 whitelistMode = cfg.whitelistCdnWssEnabled,
                 preferredSni = cfg.whitelistSniDomain,
                 utlsProfile = fingerprint
@@ -663,33 +1365,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun runAntiDpiDiagnosticProbe() {
         if (_uiState.value.antiDpiConfig.isProbingRoutes) return
-        viewModelScope.launch {
-            _uiState.update { state ->
-                state.copy(
-                    antiDpiConfig = state.antiDpiConfig.copy(
-                        isProbingRoutes = true,
-                        lastProbeReport = "Тестирование рукопожатия uTLS (${state.antiDpiConfig.utlsProfile}) и SNI ${state.antiDpiConfig.whitelistSniDomain}..."
-                    )
+        _uiState.update { state ->
+            state.copy(
+                antiDpiConfig = state.antiDpiConfig.copy(
+                    isProbingRoutes = true,
+                    lastProbeReport = "Выполняется реальное TCP/TLS тестирование настроенных пиров Yggdrasil..."
                 )
-            }
-            twinBridge.sendPingToTwin()
-            delay(400)
-            val cfg = _uiState.value.antiDpiConfig
-            repository.refreshPeersTelemetryForPreset(
-                whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = cfg.whitelistSniDomain,
-                utlsProfile = cfg.utlsProfile
             )
-            _uiState.update { state ->
-                state.copy(
-                    antiDpiConfig = state.antiDpiConfig.copy(
-                        isProbingRoutes = false,
-                        lastProbeReport = "Диагностика завершена: 0200::/7 оверлей активен • Белый список SNI (${cfg.whitelistSniDomain}) проходит ТСПУ • UDP Loopback 127.0.0.1:${state.localUdpPort} проверен (1 мс)"
-                    ),
-                    statusBannerMessage = "Сеть Yggdrasil и обход ТСПУ проверены — отправка и прием пакетов работают штатно"
-                )
-            }
         }
+        refreshRealPeerConnectivity()
     }
 
     fun addCustomPeer(
@@ -702,23 +1386,65 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     ) {
         if (endpointUri.isBlank()) return
         viewModelScope.launch {
+            updateConnectivitySnapshot()
+            val probe = networkEngine.probeRealYggdrasilPeer(
+                endpointUri = endpointUri.trim(),
+                sniOverride = sniDomain.trim().ifBlank { null },
+                timeoutMs = 3500
+            )
             repository.addOrUpdatePeer(
                 endpointUri = endpointUri,
                 transportType = transportType,
                 sniDomain = sniDomain.ifBlank { _uiState.value.antiDpiConfig.whitelistSniDomain },
                 utlsFingerprint = utlsFingerprint,
-                regionLabel = regionLabel.ifBlank { "Пользовательский мост Yggdrasil" },
+                regionLabel = regionLabel.ifBlank { "Пользовательский пир Yggdrasil" },
+                latencyMs = if (probe.reachable) probe.rttMs else -1,
+                isConnected = probe.reachable,
                 whitelistCompatible = whitelistCompatible
             )
             _uiState.update {
-                it.copy(statusBannerMessage = "Добавлен и верифицирован новый пир: $endpointUri")
+                it.copy(
+                    statusBannerMessage = if (probe.reachable) {
+                        "Пир $endpointUri проверен и подключен (RTT: ${probe.rttMs} мс)"
+                    } else {
+                        "Пир $endpointUri добавлен, но сейчас недоступен (${probe.errorDetail ?: "offline"})"
+                    }
+                )
             }
         }
     }
 
     fun togglePeer(peer: YggPeerEntity) {
         viewModelScope.launch {
-            repository.togglePeerConnection(peer)
+            if (!peer.isConnected) {
+                val probe = networkEngine.probeRealYggdrasilPeer(
+                    endpointUri = peer.endpointUri,
+                    sniOverride = peer.sniDomain,
+                    timeoutMs = 3000
+                )
+                repository.updatePeerProbeStatus(
+                    peerId = peer.peerId,
+                    reachable = probe.reachable,
+                    latencyMs = probe.rttMs,
+                    rxDelta = probe.rxBytes,
+                    txDelta = probe.txBytes
+                )
+                if (!probe.reachable) {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Не удалось подключиться к ${peer.endpointUri}: ${probe.errorDetail ?: "узел недоступен"}")
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Пир ${peer.endpointUri} подключен (RTT: ${probe.rttMs} мс)")
+                    }
+                }
+            } else {
+                repository.updatePeerProbeStatus(
+                    peerId = peer.peerId,
+                    reachable = false,
+                    latencyMs = -1
+                )
+            }
         }
     }
 
@@ -767,10 +1493,27 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun triggerCrossPlatformSyncNow() {
         viewModelScope.launch {
-            val newVector = repository.syncAllLinkedDevicesNow()
+            updateConnectivitySnapshot()
+            val netOk = networkEngine.isRealNetworkAvailable()
+            if (!netOk) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Синхронизация невозможна: устройство офлайн или в Авиарежиме")
+                }
+                return@launch
+            }
+            networkEngine.broadcastLanDiscoveryBeacon(
+                displayName = _uiState.value.userProfile.displayName,
+                yggIpv6 = _uiState.value.identity.yggIpv6Address,
+                pubKeyHex = _uiState.value.identity.yggNodePublicKeyHex
+            )
+            val newVector = repository.syncAllLinkedDevicesNow(isOnline = true)
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = "Кроссплатформенная синхронизация завершена (StateVector #$newVector • LAN + Yggdrasil IPv6)"
+                    statusBannerMessage = if (newVector > 0) {
+                        "Запрос синхронизации отправлен в LAN и оверлей Yggdrasil (StateVector #$newVector)"
+                    } else {
+                        "Отправлен LAN-маяк синхронизации (нет привязанных устройств)"
+                    }
                 )
             }
         }
@@ -784,14 +1527,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     ) {
         if (deviceName.isBlank()) return
         viewModelScope.launch {
+            val netOk = networkEngine.isRealNetworkAvailable()
             repository.linkNewCrossPlatformDevice(
                 deviceName = deviceName,
                 platform = platform,
                 yggIpv6OrCode = yggIpv6OrCode,
-                lanEndpoint = lanEndpoint
+                lanEndpoint = lanEndpoint,
+                isOnline = netOk
             )
             _uiState.update {
-                it.copy(statusBannerMessage = "Устройство «$deviceName» привязано к вашей иерархии SLIP-0010")
+                it.copy(statusBannerMessage = "Устройство «$deviceName» добавлено в список синхронизации")
             }
         }
     }
@@ -838,7 +1583,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     statusText = statusText.trim(),
                     profileSignatureHex = "ed25519_sig:${sigHash.take(44)}"
                 ),
-                statusBannerMessage = "Децентрализованный профиль подписан ключом Ed25519 и опубликован в DHT/оверлее"
+                statusBannerMessage = "Децентрализованный профиль подписан ключом Ed25519"
             )
         }
     }

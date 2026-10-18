@@ -1,3 +1,4 @@
+// File: app/build.gradle.kts
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.io.File
 import org.gradle.api.DefaultTask
@@ -21,8 +22,12 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0-ygg05"
+    versionCode = 2
+    versionName = "1.1.0-arm64-v8a"
+
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -83,49 +88,43 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-abstract class SyncRootApksTask : DefaultTask() {
+abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
   @get:Internal
   abstract val debugApkPath: Property<String>
 
   @get:Internal
   abstract val rootDirPath: Property<String>
 
-  @get:Internal
-  abstract val cloneMode: Property<Boolean>
-
   @TaskAction
-  fun syncApks() {
-    val debugApk = File(debugApkPath.get())
-    if (!debugApk.exists()) return
+  fun exportReleaseApk() {
     val root = File(rootDirPath.get())
-    val targetMain = File(root, "YggGram-main.apk")
-    val targetClone = File(root, "YggGram-clone-node2.apk")
+    // Remove all extra/legacy APKs from repository root and apk-releases
+    listOf(
+      File(root, "YggGram-main.apk"),
+      File(root, "YggGram-clone-node2.apk")
+    ).forEach { if (it.exists()) it.delete() }
+
     val releaseDir = File(root, "apk-releases").apply { mkdirs() }
-    if (cloneMode.get()) {
-      debugApk.copyTo(targetClone, overwrite = true)
-      debugApk.copyTo(File(releaseDir, "YggGram-clone-node2.apk"), overwrite = true)
-    } else {
-      debugApk.copyTo(targetMain, overwrite = true)
-      debugApk.copyTo(File(releaseDir, "YggGram-main.apk"), overwrite = true)
-      if (!targetClone.exists()) {
-        debugApk.copyTo(targetClone, overwrite = true)
+    releaseDir.listFiles()?.forEach { file ->
+      if (file.name != "YggGram-arm64-v8a.apk") {
+        file.delete()
       }
-      val releaseClone = File(releaseDir, "YggGram-clone-node2.apk")
-      if (!releaseClone.exists() && targetClone.exists()) {
-        targetClone.copyTo(releaseClone, overwrite = true)
-      }
+    }
+
+    val debugApk = File(debugApkPath.get())
+    if (debugApk.exists()) {
+      debugApk.copyTo(File(releaseDir, "YggGram-arm64-v8a.apk"), overwrite = true)
     }
   }
 }
 
-val syncRootApks = tasks.register<SyncRootApksTask>("syncRootApks") {
+val exportSingleArm64ReleaseApk = tasks.register<ExportSingleArm64ReleaseApkTask>("exportSingleArm64ReleaseApk") {
   debugApkPath.set(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").map { it.asFile.absolutePath })
   rootDirPath.set(rootDir.absolutePath)
-  cloneMode.set(android.defaultConfig.applicationId?.endsWith(".node2") == true)
 }
 
 tasks.matching { it.name == "assembleDebug" }.configureEach {
-  finalizedBy(syncRootApks)
+  finalizedBy(exportSingleArm64ReleaseApk)
 }
 
 dependencies {

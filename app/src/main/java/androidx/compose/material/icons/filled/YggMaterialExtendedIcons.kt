@@ -759,3 +759,120 @@ val Icons.Filled.Code: ImageVector by lazy {
         }
     }
 }
+
+val Icons.Filled.ContentCopy: ImageVector by lazy {
+    yggVector("ContentCopy") {
+        solidPath {
+            moveTo(16f, 1f)
+            horizontalLineTo(4f)
+            curveTo(2.9f, 1f, 2f, 1.9f, 2f, 3f)
+            verticalLineTo(17f)
+            horizontalLineTo(4f)
+            verticalLineTo(3f)
+            horizontalLineTo(16f)
+            verticalLineTo(1f)
+            close()
+            moveTo(19f, 5f)
+            horizontalLineTo(8f)
+            curveTo(6.9f, 5f, 6f, 5.9f, 6f, 7f)
+            verticalLineTo(21f)
+            curveTo(6f, 22.1f, 6.9f, 23f, 8f, 23f)
+            horizontalLineTo(19f)
+            curveTo(20.1f, 23f, 21f, 22.1f, 21f, 21f)
+            verticalLineTo(7f)
+            curveTo(21f, 5.9f, 20.1f, 5f, 19f, 5f)
+            close()
+            moveTo(19f, 21f)
+            horizontalLineTo(8f)
+            verticalLineTo(7f)
+            horizontalLineTo(19f)
+            verticalLineTo(21f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.ContentPaste: ImageVector by lazy {
+    yggVector("ContentPaste") {
+        solidPath {
+            moveTo(19f, 2f)
+            horizontalLineTo(14.82f)
+            curveTo(14.4f, 0.84f, 13.3f, 0f, 12f, 0f)
+            curveTo(10.7f, 0f, 9.6f, 0.84f, 9.18f, 2f)
+            horizontalLineTo(5f)
+            curveTo(3.9f, 2f, 3f, 2.9f, 3f, 4f)
+            verticalLineTo(20f)
+            curveTo(3f, 21.1f, 3.9f, 22f, 5f, 22f)
+            horizontalLineTo(19f)
+            curveTo(20.1f, 22f, 21f, 21.1f, 21f, 20f)
+            verticalLineTo(4f)
+            curveTo(21f, 2.9f, 20.1f, 2f, 19f, 2f)
+            close()
+            moveTo(12f, 2f)
+            curveTo(12.55f, 2f, 13f, 2.45f, 13f, 3f)
+            curveTo(13f, 3.55f, 12.55f, 4f, 12f, 4f)
+            curveTo(11.45f, 4f, 11f, 3.55f, 11f, 3f)
+            curveTo(11f, 2.45f, 11.45f, 2f, 12f, 2f)
+            close()
+            moveTo(19f, 20f)
+            horizontalLineTo(5f)
+            verticalLineTo(4f)
+            horizontalLineTo(7f)
+            verticalLineTo(7f)
+            horizontalLineTo(17f)
+            verticalLineTo(4f)
+            horizontalLineTo(19f)
+            verticalLineTo(20f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Bookmark: ImageVector by lazy {
+    yggVector("Bookmark") {
+        solidPath {
+            moveTo(17f, 3f)
+            horizontalLineTo(7f)
+            curveTo(5.9f, 3f, 5.01f, 3.9f, 5.01f, 5f)
+            lineTo(5f, 21f)
+            lineTo(12f, 18f)
+            lineTo(19f, 21f)
+            verticalLineTo(5f)
+            curveTo(19f, 3.9f, 18.1f, 3f, 17f, 3f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.ExpandLess: ImageVector by lazy {
+    yggVector("ExpandLess") {
+        solidPath {
+            moveTo(12f, 8f)
+            lineTo(6f, 14f)
+            lineTo(7.41f, 15.41f)
+            lineTo(12f, 10.83f)
+            lineTo(16.59f, 15.41f)
+            lineTo(18f, 14f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.ExpandMore: ImageVector by lazy {
+    yggVector("ExpandMore") {
+        solidPath {
+            moveTo(16.59f, 8.59f)
+            lineTo(12f, 13.17f)
+            lineTo(7.41f, 8.59f)
+            lineTo(6f, 10f)
+            lineTo(12f, 16f)
+            lineTo(18f, 10f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Speed: ImageVector by lazy {
+    Icons.Filled.NetworkCheck
+}
+
