@@ -40,8 +40,14 @@ interface YggDao {
     @Update
     suspend fun updateMessage(message: MessageEntity)
 
+    @Query("SELECT * FROM messages WHERE messageId = :messageId LIMIT 1")
+    suspend fun getMessageById(messageId: String): MessageEntity?
+
     @Query("UPDATE messages SET deliveryState = :newState WHERE messageId = :messageId")
     suspend fun updateMessageDeliveryState(messageId: String, newState: String)
+
+    @Query("UPDATE messages SET reactionsJson = :reactionsJson WHERE messageId = :messageId")
+    suspend fun updateMessageReactions(messageId: String, reactionsJson: String)
 
     @Query("DELETE FROM messages WHERE chatId = :chatId")
     suspend fun clearMessagesInChat(chatId: String)

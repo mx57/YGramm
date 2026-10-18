@@ -59,7 +59,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import com.example.ui.components.NetworkStatusIndicator
+import com.example.ui.components.QrContactModal
 import com.example.ui.components.YggNetworkStatus
 import com.example.ui.screens.ChatsScreen
 import com.example.ui.screens.NetworkDpiScreen
@@ -99,6 +104,8 @@ fun YggGramRootApp(
     val cryptoKeys by viewModel.cryptoKeys.collectAsStateWithLifecycle()
     val queuedOfflineCount by viewModel.queuedOfflineMessagesCount.collectAsStateWithLifecycle()
 
+    var showGlobalQrModal by rememberSaveable { mutableStateOf(false) }
+
     if (uiState.activeTab != YggNavTab.CHATS) {
         BackHandler {
             viewModel.selectTab(YggNavTab.CHATS)
@@ -132,12 +139,14 @@ fun YggGramRootApp(
                                 )
                             }
                             Spacer(modifier = Modifier.width(10.dp))
-                            Column {
+                            Column(modifier = Modifier.weight(1f, fill = false)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
                                         text = stringResource(R.string.app_name),
                                         style = MaterialTheme.typography.titleLarge,
-                                        fontWeight = FontWeight.Bold
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Surface(
@@ -160,6 +169,7 @@ fun YggGramRootApp(
                                             } else {
                                                 EmeraldPrimary
                                             },
+                                            maxLines = 1,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                         )
                                     }
@@ -185,6 +195,18 @@ fun YggGramRootApp(
                                     )
                                 }
                             }
+                        }
+                    },
+                    actions = {
+                        IconButton(
+                            onClick = { showGlobalQrModal = true },
+                            modifier = Modifier.testTag("top_bar_qr_button")
+                        ) {
+                            Icon(
+                                Icons.Default.QrCodeScanner,
+                                contentDescription = "Добавить контакт по QR-коду",
+                                tint = EmeraldPrimary
+                            )
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
@@ -352,6 +374,14 @@ fun YggGramRootApp(
                                 onFilterChange = viewModel::updateChatFilter,
                                 onToggleOfflineMode = viewModel::toggleOfflineStoreAndForwardMode,
                                 onSendMessage = viewModel::sendMessage,
+                                onSendVoiceMessage = viewModel::sendVoiceMessage,
+                                onSendMediaOrFile = viewModel::sendMediaOrDocumentAttachment,
+                                onToggleReaction = viewModel::toggleMessageReaction,
+                                onStartVoiceCall = viewModel::startVoiceCall,
+                                onToggleCallMute = viewModel::toggleCallMute,
+                                onToggleCallSpeaker = viewModel::toggleCallSpeakerphone,
+                                onEndVoiceCall = viewModel::endVoiceCall,
+                                onAddContactFromQr = viewModel::addContactFromQrPayload,
                                 onCreateNewChat = viewModel::createNewChatOrGroup,
                                 onDeleteChat = viewModel::deleteChat,
                                 onToggleTransferState = viewModel::toggleFileTransferState,
@@ -403,12 +433,29 @@ fun YggGramRootApp(
                             YggNavTab.PROFILE_PRIVACY -> ProfilePrivacyScreen(
                                 uiState = uiState,
                                 onUpdateProfile = viewModel::updateDecentralizedProfile,
-                                onUpdatePrivacy = viewModel::updatePrivacySetting
+                                onUpdatePrivacy = viewModel::updatePrivacySetting,
+                                onAddContactFromQr = { payload ->
+                                    viewModel.addContactFromQrPayload(payload)
+                                    viewModel.selectTab(YggNavTab.CHATS)
+                                }
                             )
                         }
                     }
                 }
             }
+        }
+
+        if (showGlobalQrModal) {
+            QrContactModal(
+                uiState = uiState,
+                initialTab = 0,
+                onDismiss = { showGlobalQrModal = false },
+                onContactScanned = { payload ->
+                    showGlobalQrModal = false
+                    viewModel.addContactFromQrPayload(payload)
+                    viewModel.selectTab(YggNavTab.CHATS)
+                }
+            )
         }
     }
 }

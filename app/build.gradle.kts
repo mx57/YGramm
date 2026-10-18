@@ -22,8 +22,8 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 2
-    versionName = "1.1.0-arm64-v8a"
+    versionCode = 3
+    versionName = "1.2.0-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
@@ -111,9 +111,17 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
       }
     }
 
-    val debugApk = File(debugApkPath.get())
-    if (debugApk.exists()) {
-      debugApk.copyTo(File(releaseDir, "YggGram-arm64-v8a.apk"), overwrite = true)
+    val candidates = listOf(
+      File(debugApkPath.get()),
+      File(root, "app/build/outputs/apk/debug/app-debug.apk"),
+      File(root, ".build-outputs/app-debug.apk")
+    ).filter { it.exists() && it.length() > 0L }
+
+    val newestApk = candidates.maxByOrNull { it.lastModified() }
+    if (newestApk != null) {
+      val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
+      newestApk.copyTo(targetFile, overwrite = true)
+      println("Exported latest APK (${newestApk.length()} bytes) -> ${targetFile.absolutePath}")
     }
   }
 }
@@ -123,7 +131,7 @@ val exportSingleArm64ReleaseApk = tasks.register<ExportSingleArm64ReleaseApkTask
   rootDirPath.set(rootDir.absolutePath)
 }
 
-tasks.matching { it.name == "assembleDebug" }.configureEach {
+tasks.matching { it.name == "assembleDebug" || it.name == "packageDebug" }.configureEach {
   finalizedBy(exportSingleArm64ReleaseApk)
 }
 
@@ -132,10 +140,10 @@ dependencies {
   // implementation(platform(libs.firebase.bom))
   // implementation(libs.accompanist.permissions)
   implementation(libs.androidx.activity.compose)
-  // implementation(libs.androidx.camera.camera2)
-  // implementation(libs.androidx.camera.core)
-  // implementation(libs.androidx.camera.lifecycle)
-  // implementation(libs.androidx.camera.view)
+  implementation(libs.androidx.camera.camera2)
+  implementation(libs.androidx.camera.core)
+  implementation(libs.androidx.camera.lifecycle)
+  implementation(libs.androidx.camera.view)
   implementation(libs.androidx.compose.material.icons.core)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)
@@ -150,7 +158,7 @@ dependencies {
   // implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
-  // implementation(libs.coil.compose)
+  implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)
   // implementation(libs.firebase.firestore)

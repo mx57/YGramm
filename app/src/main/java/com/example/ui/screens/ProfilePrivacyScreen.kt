@@ -63,6 +63,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.engine.ParsedYggContactQr
+import com.example.ui.components.QrContactModal
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
@@ -81,7 +83,8 @@ fun ProfilePrivacyScreen(
         defaultDisappearingSeconds: Int?,
         hashcashDifficultyBits: Int?,
         webDavEndpointUrl: String?
-    ) -> Unit
+    ) -> Unit,
+    onAddContactFromQr: (ParsedYggContactQr) -> Unit = {}
 ) {
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showQrIdentityDialog by rememberSaveable { mutableStateOf(false) }
@@ -407,9 +410,14 @@ fun ProfilePrivacyScreen(
     }
 
     if (showQrIdentityDialog) {
-        DecentralizedIdentityUriModal(
+        QrContactModal(
             uiState = uiState,
-            onDismiss = { showQrIdentityDialog = false }
+            initialTab = 0,
+            onDismiss = { showQrIdentityDialog = false },
+            onContactScanned = { payload ->
+                showQrIdentityDialog = false
+                onAddContactFromQr(payload)
+            }
         )
     }
 }

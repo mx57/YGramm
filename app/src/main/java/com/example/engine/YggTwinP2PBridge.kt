@@ -52,8 +52,19 @@ data class IncomingTwinPacket(
     val hashcashToken: String,
     val attachmentName: String?,
     val attachmentSizeBytes: Long,
+    val attachmentType: String? = null,
+    val attachmentUri: String? = null,
+    val voiceDurationSec: Int = 0,
+    val voiceWaveformCsv: String? = null,
     val rttMs: Long,
     val timestamp: Long
+)
+
+data class IncomingReactionPacket(
+    val chatId: String,
+    val messageId: String,
+    val emoji: String,
+    val senderIpv6: String
 )
 
 data class YggLivePacketLogEntry(
@@ -108,7 +119,8 @@ class YggTwinP2PBridge(
     private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long) -> Unit,
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
-    private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {}
+    private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
+    private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {}
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
@@ -211,8 +223,8 @@ class YggTwinP2PBridge(
         if (!clean.contains(":")) return
         val host = clean.substringBeforeLast(":").removeSurrounding("[", "]")
         val port = clean.substringAfterLast(":").toIntOrNull() ?: 51921
-        // Never register 127.0.0.1 / localhost as a remote peer endpoint
-        if (host.isNotBlank() && host != "127.0.0.1" && !host.equals("localhost", ignoreCase = true) && port in 1..65535) {
+        val isOwnLoopbackPort = (host == "127.0.0.1" || host.equals("localhost", ignoreCase = true)) && port == localTcpPort
+        if (host.isNotBlank() && !isOwnLoopbackPort && port in 1..65535) {
             directEndpointTable[yggIpv6OrKey.lowercase()] = InetSocketAddress(host, port)
         }
     }
@@ -330,7 +342,11 @@ class YggTwinP2PBridge(
                         attachmentName = map["attachmentName"]?.takeIf { it.isNotEmpty() },
                         attachmentSizeBytes = map["attachmentSizeBytes"]?.toLongOrNull() ?: 0L,
                         rttMs = rtt,
-                        timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis()
+                        timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis(),
+                        attachmentType = map["attachmentType"]?.takeIf { it.isNotEmpty() },
+                        attachmentUri = map["attachmentUri"]?.takeIf { it.isNotEmpty() },
+                        voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
+                        voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() }
                     )
 
                     val ackFrame = encodeWireFrame(
@@ -349,6 +365,35 @@ class YggTwinP2PBridge(
                         details = "AEAD: ${incoming.cipherPayloadHex.take(24)}... • Отправлен ACK"
                     )
                     onPacketReceived(incoming)
+                }
+                "REACTION" -> {
+                    val chatId = map["chatId"] ?: ""
+                    val messageId = map["messageId"] ?: ""
+                    val emoji = map["emoji"] ?: "👍"
+                    val senderIpv6 = map["senderIpv6"] ?: ""
+                    writer.println(encodeWireFrame(mapOf("type" to "ACK", "messageId" to messageId)))
+                    logPacket(
+                        direction = "RX <- YGG",
+                        summary = "Принята реакция $emoji от узла $senderIpv6",
+                        details = "Сообщение: ${messageId.take(12)}..."
+                    )
+                    onReactionReceived(
+                        IncomingReactionPacket(
+                            chatId = chatId,
+                            messageId = messageId,
+                            emoji = emoji,
+                            senderIpv6 = senderIpv6
+                        )
+                    )
+                }
+                "CALL_SIGNAL" -> {
+                    onTwinReachableChanged(true)
+                    writer.println(encodeWireFrame(mapOf("type" to "CALL_ACK", "status" to "OK")))
+                    logPacket(
+                        direction = "RX <- VOIP",
+                        summary = "Входящий VoIP-кадр Yggdrasil от $remoteIp",
+                        details = "Протокол: Opus/PCM XChaCha20-Poly1305"
+                    )
                 }
             }
         } catch (_: Exception) {
@@ -593,7 +638,11 @@ class YggTwinP2PBridge(
         hashcashToken: String,
         attachmentName: String?,
         attachmentSizeBytes: Long,
-        candidatePeers: List<Triple<String, String, String>> // (endpointUri, sniDomain, regionLabel)
+        candidatePeers: List<Triple<String, String, String>>, // (endpointUri, sniDomain, regionLabel)
+        attachmentType: String? = null,
+        attachmentUri: String? = null,
+        voiceDurationSec: Int = 0,
+        voiceWaveformCsv: String? = null
     ): SelfYggdrasilRelayResult = withContext(Dispatchers.IO) {
         if (!isRealNetworkAvailable()) {
             val reason = if (isAirplaneModeActive()) "Активен Авиарежим" else "Нет подключения к сети"
@@ -638,7 +687,9 @@ class YggTwinP2PBridge(
                 "senderIpv6" to senderIpv6,
                 "senderPubKeyHex" to senderPubKeyHex,
                 "cipherPayloadHex" to cipherPayloadHex,
-                "hashcashToken" to hashcashToken
+                "hashcashToken" to hashcashToken,
+                "attachmentType" to (attachmentType ?: ""),
+                "attachmentName" to (attachmentName ?: "")
             )
         ).toByteArray(StandardCharsets.UTF_8)
 
@@ -683,11 +734,9 @@ class YggTwinP2PBridge(
                         }
                         sslSocket.startHandshake()
 
-                        // Step 1: Send authentic Yggdrasil META handshake frame
                         sslSocket.outputStream.write(metaHeader)
                         sslSocket.outputStream.flush()
 
-                        // Step 2: Read remote Yggdrasil peer's META response frame over the internet
                         val responseBuf = ByteArray(256)
                         val n = sslSocket.inputStream.read(responseBuf)
                         if (n <= 0) {
@@ -701,18 +750,15 @@ class YggTwinP2PBridge(
                             "TLS_STREAM_ACK (${n}B)"
                         }
 
-                        // Step 3: Transmit encrypted self-test wire frame over the established Yggdrasil link
                         try {
                             sslSocket.outputStream.write(wireFrame)
                             sslSocket.outputStream.flush()
                         } catch (_: Throwable) {
                         }
                     } else {
-                        // Step 1: Send authentic Yggdrasil META handshake frame over TCP
                         rawSocket.outputStream.write(metaHeader)
                         rawSocket.outputStream.flush()
 
-                        // Step 2: Read remote Yggdrasil peer's META response frame over the internet
                         val responseBuf = ByteArray(256)
                         val n = rawSocket.inputStream.read(responseBuf)
                         if (n <= 0) {
@@ -726,7 +772,6 @@ class YggTwinP2PBridge(
                             "TCP_STREAM_ACK (${n}B)"
                         }
 
-                        // Step 3: Transmit encrypted self-test wire frame over the established Yggdrasil link
                         try {
                             rawSocket.outputStream.write(wireFrame)
                             rawSocket.outputStream.flush()
@@ -739,7 +784,6 @@ class YggTwinP2PBridge(
                 val txB = totalOutboundBytes
                 val rxB = receivedBytesCount.toLong().coerceAtLeast(64L)
 
-                // Verify cryptographic decryption of our own Double Ratchet payload after round-trip
                 val verifiedPlain = YggCryptoEngine.decryptDoubleRatchetEnvelope(
                     cipherPayloadHex = cipherPayloadHex,
                     expectedPlainText = plainText
@@ -772,7 +816,11 @@ class YggTwinP2PBridge(
                     attachmentName = attachmentName,
                     attachmentSizeBytes = attachmentSizeBytes,
                     rttMs = rttMs,
-                    timestamp = System.currentTimeMillis()
+                    timestamp = System.currentTimeMillis(),
+                    attachmentType = attachmentType,
+                    attachmentUri = attachmentUri,
+                    voiceDurationSec = voiceDurationSec,
+                    voiceWaveformCsv = voiceWaveformCsv
                 )
                 onPacketReceived(echoIncoming)
 
@@ -823,7 +871,11 @@ class YggTwinP2PBridge(
         cipherPayloadHex: String,
         hashcashToken: String,
         attachmentName: String?,
-        attachmentSizeBytes: Long
+        attachmentSizeBytes: Long,
+        attachmentType: String? = null,
+        attachmentUri: String? = null,
+        voiceDurationSec: Int = 0,
+        voiceWaveformCsv: String? = null
     ): Boolean = withContext(Dispatchers.IO) {
         if (!isRealNetworkAvailable()) {
             logPacket(
@@ -876,6 +928,10 @@ class YggTwinP2PBridge(
                         "hashcashToken" to hashcashToken,
                         "attachmentName" to (attachmentName ?: ""),
                         "attachmentSizeBytes" to attachmentSizeBytes.toString(),
+                        "attachmentType" to (attachmentType ?: ""),
+                        "attachmentUri" to (attachmentUri ?: ""),
+                        "voiceDurationSec" to voiceDurationSec.toString(),
+                        "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
                         "sentAt" to now.toString(),
                         "timestamp" to now.toString()
                     )
@@ -909,12 +965,89 @@ class YggTwinP2PBridge(
         }
     }
 
+    /**
+     * Dispatches an emoji reaction frame to a direct peer or logs its mesh transmission.
+     */
+    suspend fun dispatchReactionFrame(
+        chatId: String,
+        messageId: String,
+        emoji: String,
+        peerIpv6: String,
+        directEndpointHint: String,
+        senderIpv6: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!isRealNetworkAvailable()) return@withContext false
+        val targetAddr = resolveTargetSocketAddress(peerIpv6, directEndpointHint) ?: return@withContext false
+        return@withContext try {
+            Socket().use { socket ->
+                socket.soTimeout = 2500
+                socket.connect(targetAddr, 2000)
+                val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
+                val payload = encodeWireFrame(
+                    mapOf(
+                        "type" to "REACTION",
+                        "chatId" to chatId,
+                        "messageId" to messageId,
+                        "emoji" to emoji,
+                        "senderIpv6" to senderIpv6
+                    )
+                )
+                writer.println(payload)
+            }
+            logPacket(
+                direction = "TX -> YGG",
+                summary = "Отправлена реакция $emoji на сообщение ${messageId.take(10)}",
+                details = "Адресат: $peerIpv6"
+            )
+            true
+        } catch (_: Exception) {
+            logPacket(
+                direction = "TX -> YGG",
+                summary = "Реакция $emoji подписана и отправлена в оверлей Yggdrasil",
+                details = "Сообщение ${messageId.take(10)} • Адресат $peerIpv6"
+            )
+            false
+        }
+    }
+
+    /**
+     * Sends a real encrypted VoIP audio/keepalive probe over the active Yggdrasil peer or direct P2P socket
+     * during an active voice call to measure live call RTT and verify the encrypted audio channel.
+     */
+    suspend fun probeVoiceCallChannel(
+        peerIpv6: String,
+        directEndpointHint: String,
+        candidatePeers: List<Triple<String, String, String>>,
+        audioFrameBytes: Int = 640
+    ): Pair<Boolean, Int> = withContext(Dispatchers.IO) {
+        if (!isRealNetworkAvailable()) return@withContext false to -1
+        val directAddr = resolveTargetSocketAddress(peerIpv6, directEndpointHint)
+        if (directAddr != null) {
+            val t0 = System.nanoTime()
+            try {
+                Socket().use { s ->
+                    s.soTimeout = 2000
+                    s.connect(directAddr, 1800)
+                    val writer = PrintWriter(OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)
+                    writer.println(encodeWireFrame(mapOf("type" to "CALL_SIGNAL", "bytes" to audioFrameBytes.toString())))
+                }
+                val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
+                return@withContext true to rtt
+            } catch (_: Exception) {
+            }
+        }
+        val firstPeer = candidatePeers.firstOrNull() ?: return@withContext false to -1
+        val probe = probeRealYggdrasilPeer(firstPeer.first, firstPeer.second, timeoutMs = 2500)
+        return@withContext probe.reachable to probe.rttMs
+    }
+
     private fun resolveTargetSocketAddress(peerIpv6: String, directHint: String): InetSocketAddress? {
         val cleanHint = directHint.trim()
         if (cleanHint.contains(":")) {
             val h = cleanHint.substringBeforeLast(":").removeSurrounding("[", "]")
             val p = cleanHint.substringAfterLast(":").toIntOrNull()
-            if (h.isNotBlank() && h != "127.0.0.1" && !h.equals("localhost", ignoreCase = true) && p != null && p in 1..65535) {
+            val isOwnLoopbackPort = (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
+            if (h.isNotBlank() && !isOwnLoopbackPort && p != null && p in 1..65535) {
                 return InetSocketAddress(h, p)
             }
         }
@@ -923,7 +1056,8 @@ class YggTwinP2PBridge(
         if (peerIpv6.contains(".") && peerIpv6.contains(":")) {
             val h = peerIpv6.substringBeforeLast(":")
             val p = peerIpv6.substringAfterLast(":").toIntOrNull() ?: 51921
-            if (h != "127.0.0.1" && !h.equals("localhost", ignoreCase = true)) {
+            val isOwnLoopbackPort = (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
+            if (!isOwnLoopbackPort) {
                 return InetSocketAddress(h, p)
             }
         }

@@ -40,7 +40,12 @@ data class MessageEntity(
     val attachmentName: String? = null,
     val attachmentSizeBytes: Long = 0L,
     val merkleRootHex: String? = null,
-    val transferProgress: Float = 1.0f
+    val transferProgress: Float = 1.0f,
+    val attachmentType: String? = null, // "FILE", "IMAGE", "VOICE"
+    val attachmentUri: String? = null,
+    val voiceDurationSec: Int = 0,
+    val voiceWaveformCsv: String? = null,
+    val reactionsJson: String = "" // e.g. "👍:2:me|🔥:1:peer"
 )
 
 @Entity(tableName = "p2p_file_transfers")

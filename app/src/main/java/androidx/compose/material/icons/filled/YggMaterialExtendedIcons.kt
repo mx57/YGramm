@@ -876,3 +876,417 @@ val Icons.Filled.Speed: ImageVector by lazy {
     Icons.Filled.NetworkCheck
 }
 
+val Icons.Filled.Call: ImageVector by lazy {
+    yggVector("Call") {
+        solidPath {
+            moveTo(20.01f, 15.38f)
+            curveTo(18.78f, 15.38f, 17.59f, 15.18f, 16.48f, 14.82f)
+            curveTo(16.13f, 14.7f, 15.74f, 14.79f, 15.47f, 15.06f)
+            lineTo(13.9f, 17.03f)
+            curveTo(11.07f, 15.68f, 8.42f, 13.13f, 7.01f, 10.2f)
+            lineTo(8.96f, 8.54f)
+            curveTo(9.23f, 8.26f, 9.31f, 7.87f, 9.2f, 7.52f)
+            curveTo(8.83f, 6.41f, 8.64f, 5.22f, 8.64f, 3.99f)
+            curveTo(8.64f, 3.45f, 8.19f, 3f, 7.65f, 3f)
+            horizontalLineTo(4.19f)
+            curveTo(3.65f, 3f, 3f, 3.24f, 3f, 3.99f)
+            curveTo(3f, 13.28f, 10.73f, 21f, 20.01f, 21f)
+            curveTo(20.72f, 21f, 21f, 20.37f, 21f, 19.82f)
+            verticalLineTo(16.37f)
+            curveTo(21f, 15.83f, 20.55f, 15.38f, 20.01f, 15.38f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.CallEnd: ImageVector by lazy {
+    yggVector("CallEnd") {
+        solidPath {
+            moveTo(12f, 9f)
+            curveTo(10.4f, 9f, 8.85f, 9.25f, 7.4f, 9.72f)
+            verticalLineTo(12.82f)
+            curveTo(7.4f, 13.21f, 7.17f, 13.56f, 6.84f, 13.72f)
+            curveTo(5.86f, 14.21f, 4.97f, 14.84f, 4.17f, 15.57f)
+            curveTo(3.99f, 15.75f, 3.75f, 15.85f, 3.47f, 15.85f)
+            curveTo(3.19f, 15.85f, 2.94f, 15.74f, 2.76f, 15.56f)
+            lineTo(0.28f, 13.08f)
+            curveTo(0.1f, 12.9f, 0f, 12.65f, 0f, 12.37f)
+            curveTo(0f, 12.09f, 0.1f, 11.84f, 0.29f, 11.66f)
+            curveTo(3.34f, 8.78f, 7.46f, 7f, 12f, 7f)
+            curveTo(16.54f, 7f, 20.66f, 8.78f, 23.71f, 11.67f)
+            curveTo(23.89f, 11.85f, 24f, 12.1f, 24f, 12.38f)
+            curveTo(24f, 12.66f, 23.9f, 12.91f, 23.71f, 13.09f)
+            lineTo(21.23f, 15.57f)
+            curveTo(21.05f, 15.75f, 20.8f, 15.86f, 20.52f, 15.86f)
+            curveTo(20.24f, 15.86f, 20f, 15.75f, 19.82f, 15.57f)
+            curveTo(19.03f, 14.83f, 18.13f, 14.2f, 17.15f, 13.71f)
+            curveTo(16.82f, 13.55f, 16.59f, 13.2f, 16.59f, 12.81f)
+            verticalLineTo(9.71f)
+            curveTo(15.15f, 9.25f, 13.6f, 9f, 12f, 9f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Mic: ImageVector by lazy {
+    yggVector("Mic") {
+        solidPath {
+            moveTo(12f, 14f)
+            curveTo(13.66f, 14f, 14.99f, 12.66f, 14.99f, 11f)
+            lineTo(15f, 5f)
+            curveTo(15f, 3.34f, 13.66f, 2f, 12f, 2f)
+            curveTo(10.34f, 2f, 9f, 3.34f, 9f, 5f)
+            verticalLineTo(11f)
+            curveTo(9f, 12.66f, 10.34f, 14f, 12f, 14f)
+            close()
+            moveTo(17.3f, 11f)
+            curveTo(17.3f, 14f, 14.76f, 16.1f, 12f, 16.1f)
+            curveTo(9.24f, 16.1f, 6.7f, 14f, 6.7f, 11f)
+            horizontalLineTo(5f)
+            curveTo(5f, 14.41f, 7.72f, 17.23f, 11f, 17.72f)
+            verticalLineTo(21f)
+            horizontalLineTo(13f)
+            verticalLineTo(17.72f)
+            curveTo(16.28f, 17.23f, 19f, 14.41f, 19f, 11f)
+            horizontalLineTo(17.3f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.MicOff: ImageVector by lazy {
+    yggVector("MicOff") {
+        solidPath {
+            moveTo(19f, 11f)
+            horizontalLineTo(17.3f)
+            curveTo(17.3f, 11.74f, 17.14f, 12.43f, 16.87f, 13.05f)
+            lineTo(18.1f, 14.28f)
+            curveTo(18.66f, 13.3f, 19f, 12.19f, 19f, 11f)
+            close()
+            moveTo(14.98f, 11.17f)
+            curveTo(14.98f, 11.11f, 15f, 11.06f, 15f, 11f)
+            verticalLineTo(5f)
+            curveTo(15f, 3.34f, 13.66f, 2f, 12f, 2f)
+            curveTo(10.34f, 2f, 9f, 3.34f, 9f, 5f)
+            verticalLineTo(5.18f)
+            lineTo(14.98f, 11.17f)
+            close()
+            moveTo(4.27f, 3f)
+            lineTo(3f, 4.27f)
+            lineTo(9.01f, 10.28f)
+            verticalLineTo(11f)
+            curveTo(9.01f, 12.66f, 10.34f, 14f, 12f, 14f)
+            curveTo(12.22f, 14f, 12.44f, 13.97f, 12.65f, 13.92f)
+            lineTo(14.31f, 15.58f)
+            curveTo(13.6f, 15.91f, 12.81f, 16.1f, 12f, 16.1f)
+            curveTo(9.24f, 16.1f, 6.7f, 14f, 6.7f, 11f)
+            horizontalLineTo(5f)
+            curveTo(5f, 14.41f, 7.72f, 17.23f, 11f, 17.72f)
+            verticalLineTo(21f)
+            horizontalLineTo(13f)
+            verticalLineTo(17.72f)
+            curveTo(13.91f, 17.59f, 14.77f, 17.27f, 15.54f, 16.82f)
+            lineTo(19.73f, 21f)
+            lineTo(21f, 19.73f)
+            lineTo(4.27f, 3f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.VolumeUp: ImageVector by lazy {
+    yggVector("VolumeUp") {
+        solidPath {
+            moveTo(3f, 9f)
+            verticalLineTo(15f)
+            horizontalLineTo(7f)
+            lineTo(12f, 20f)
+            verticalLineTo(4f)
+            lineTo(7f, 9f)
+            horizontalLineTo(3f)
+            close()
+            moveTo(16.5f, 12f)
+            curveTo(16.5f, 10.23f, 15.48f, 8.71f, 14f, 7.97f)
+            verticalLineTo(16.02f)
+            curveTo(15.48f, 15.29f, 16.5f, 13.77f, 16.5f, 12f)
+            close()
+            moveTo(14f, 3.23f)
+            verticalLineTo(5.29f)
+            curveTo(16.89f, 6.15f, 19f, 8.83f, 19f, 12f)
+            curveTo(19f, 15.17f, 16.89f, 17.85f, 14f, 18.71f)
+            verticalLineTo(20.77f)
+            curveTo(18.01f, 19.86f, 21f, 16.28f, 21f, 12f)
+            curveTo(21f, 7.72f, 18.01f, 4.14f, 14f, 3.23f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Image: ImageVector by lazy {
+    yggVector("Image") {
+        solidPath {
+            moveTo(21f, 19f)
+            verticalLineTo(5f)
+            curveTo(21f, 3.9f, 20.1f, 3f, 19f, 3f)
+            horizontalLineTo(5f)
+            curveTo(3.9f, 3f, 3f, 3.9f, 3f, 5f)
+            verticalLineTo(19f)
+            curveTo(3f, 20.1f, 3.9f, 21f, 5f, 21f)
+            horizontalLineTo(19f)
+            curveTo(20.1f, 21f, 21f, 20.1f, 21f, 19f)
+            close()
+            moveTo(8.5f, 13.5f)
+            lineTo(11f, 16.51f)
+            lineTo(14.5f, 12f)
+            lineTo(19f, 18f)
+            horizontalLineTo(5f)
+            lineTo(8.5f, 13.5f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.CameraAlt: ImageVector by lazy {
+    yggVector("CameraAlt") {
+        solidPath {
+            moveTo(12f, 10f)
+            curveTo(10.34f, 10f, 9f, 11.34f, 9f, 13f)
+            curveTo(9f, 14.66f, 10.34f, 16f, 12f, 16f)
+            curveTo(13.66f, 16f, 15f, 14.66f, 15f, 13f)
+            curveTo(15f, 11.34f, 13.66f, 10f, 12f, 10f)
+            close()
+            moveTo(20f, 4f)
+            horizontalLineTo(16.83f)
+            lineTo(15f, 2f)
+            horizontalLineTo(9f)
+            lineTo(7.17f, 4f)
+            horizontalLineTo(4f)
+            curveTo(2.9f, 4f, 2f, 4.9f, 2f, 6f)
+            verticalLineTo(18f)
+            curveTo(2f, 19.1f, 2.9f, 20f, 4f, 20f)
+            horizontalLineTo(20f)
+            curveTo(21.1f, 20f, 22f, 19.1f, 22f, 18f)
+            verticalLineTo(6f)
+            curveTo(22f, 4.9f, 21.1f, 4f, 20f, 4f)
+            close()
+            moveTo(12f, 18f)
+            curveTo(9.24f, 18f, 7f, 15.76f, 7f, 13f)
+            curveTo(7f, 10.24f, 9.24f, 8f, 12f, 8f)
+            curveTo(14.76f, 8f, 17f, 10.24f, 17f, 13f)
+            curveTo(17f, 15.76f, 14.76f, 18f, 12f, 18f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.QrCodeScanner: ImageVector by lazy {
+    yggVector("QrCodeScanner") {
+        solidPath {
+            moveTo(9.5f, 6.5f)
+            verticalLineTo(9.5f)
+            horizontalLineTo(6.5f)
+            verticalLineTo(6.5f)
+            horizontalLineTo(9.5f)
+            moveTo(11f, 5f)
+            horizontalLineTo(5f)
+            verticalLineTo(11f)
+            horizontalLineTo(11f)
+            verticalLineTo(5f)
+            close()
+            moveTo(17.5f, 6.5f)
+            verticalLineTo(9.5f)
+            horizontalLineTo(14.5f)
+            verticalLineTo(6.5f)
+            horizontalLineTo(17.5f)
+            moveTo(19f, 5f)
+            horizontalLineTo(13f)
+            verticalLineTo(11f)
+            horizontalLineTo(19f)
+            verticalLineTo(5f)
+            close()
+            moveTo(9.5f, 14.5f)
+            verticalLineTo(17.5f)
+            horizontalLineTo(6.5f)
+            verticalLineTo(14.5f)
+            horizontalLineTo(9.5f)
+            moveTo(11f, 13f)
+            horizontalLineTo(5f)
+            verticalLineTo(19f)
+            horizontalLineTo(11f)
+            verticalLineTo(13f)
+            close()
+            moveTo(15f, 13f)
+            horizontalLineTo(13f)
+            verticalLineTo(15f)
+            horizontalLineTo(15f)
+            verticalLineTo(13f)
+            close()
+            moveTo(17f, 15f)
+            horizontalLineTo(15f)
+            verticalLineTo(17f)
+            horizontalLineTo(17f)
+            verticalLineTo(15f)
+            close()
+            moveTo(19f, 17f)
+            horizontalLineTo(17f)
+            verticalLineTo(19f)
+            horizontalLineTo(19f)
+            verticalLineTo(17f)
+            close()
+            moveTo(4f, 2f)
+            horizontalLineTo(2f)
+            verticalLineTo(7f)
+            horizontalLineTo(4f)
+            verticalLineTo(4f)
+            horizontalLineTo(7f)
+            verticalLineTo(2f)
+            close()
+            moveTo(20f, 2f)
+            horizontalLineTo(17f)
+            verticalLineTo(4f)
+            horizontalLineTo(20f)
+            verticalLineTo(7f)
+            horizontalLineTo(22f)
+            verticalLineTo(2f)
+            close()
+            moveTo(4f, 17f)
+            horizontalLineTo(2f)
+            verticalLineTo(22f)
+            horizontalLineTo(7f)
+            verticalLineTo(20f)
+            horizontalLineTo(4f)
+            verticalLineTo(17f)
+            close()
+            moveTo(20f, 20f)
+            horizontalLineTo(17f)
+            verticalLineTo(22f)
+            horizontalLineTo(22f)
+            verticalLineTo(17f)
+            horizontalLineTo(20f)
+            verticalLineTo(20f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.AddReaction: ImageVector by lazy {
+    yggVector("AddReaction") {
+        solidPath {
+            moveTo(12f, 2f)
+            curveTo(6.48f, 2f, 2f, 6.48f, 2f, 12f)
+            curveTo(2f, 17.52f, 6.48f, 22f, 12f, 22f)
+            curveTo(17.52f, 22f, 22f, 17.52f, 22f, 12f)
+            curveTo(22f, 6.48f, 17.52f, 2f, 12f, 2f)
+            close()
+            moveTo(12f, 20f)
+            curveTo(7.59f, 20f, 4f, 16.41f, 4f, 12f)
+            curveTo(4f, 7.59f, 7.59f, 4f, 12f, 4f)
+            curveTo(16.41f, 4f, 20f, 7.59f, 20f, 12f)
+            curveTo(20f, 16.41f, 16.41f, 20f, 12f, 20f)
+            close()
+            moveTo(15.5f, 11f)
+            curveTo(16.33f, 11f, 17f, 10.33f, 17f, 9.5f)
+            curveTo(17f, 8.67f, 16.33f, 8f, 15.5f, 8f)
+            curveTo(14.67f, 8f, 14f, 8.67f, 14f, 9.5f)
+            curveTo(14f, 10.33f, 14.67f, 11f, 15.5f, 11f)
+            close()
+            moveTo(8.5f, 11f)
+            curveTo(9.33f, 11f, 10f, 10.33f, 10f, 9.5f)
+            curveTo(10f, 8.67f, 9.33f, 8f, 8.5f, 8f)
+            curveTo(7.67f, 8f, 7f, 8.67f, 7f, 9.5f)
+            curveTo(7f, 10.33f, 7.67f, 11f, 8.5f, 11f)
+            close()
+            moveTo(12f, 17.5f)
+            curveTo(14.33f, 17.5f, 16.31f, 16.04f, 17.11f, 14f)
+            horizontalLineTo(6.89f)
+            curveTo(7.69f, 16.04f, 9.67f, 17.5f, 12f, 17.5f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.GraphicEq: ImageVector by lazy {
+    yggVector("GraphicEq") {
+        solidPath {
+            moveTo(7f, 18f)
+            horizontalLineTo(9f)
+            verticalLineTo(6f)
+            horizontalLineTo(7f)
+            verticalLineTo(18f)
+            close()
+            moveTo(11f, 22f)
+            horizontalLineTo(13f)
+            verticalLineTo(2f)
+            horizontalLineTo(11f)
+            verticalLineTo(22f)
+            close()
+            moveTo(3f, 14f)
+            horizontalLineTo(5f)
+            verticalLineTo(10f)
+            horizontalLineTo(3f)
+            verticalLineTo(14f)
+            close()
+            moveTo(15f, 18f)
+            horizontalLineTo(17f)
+            verticalLineTo(6f)
+            horizontalLineTo(15f)
+            verticalLineTo(18f)
+            close()
+            moveTo(19f, 10f)
+            verticalLineTo(14f)
+            horizontalLineTo(21f)
+            verticalLineTo(10f)
+            horizontalLineTo(19f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Description: ImageVector by lazy {
+    yggVector("Description") {
+        solidPath {
+            moveTo(14f, 2f)
+            horizontalLineTo(6f)
+            curveTo(4.9f, 2f, 4.01f, 2.9f, 4.01f, 4f)
+            lineTo(4f, 20f)
+            curveTo(4f, 21.1f, 4.89f, 22f, 5.99f, 22f)
+            horizontalLineTo(18f)
+            curveTo(19.1f, 22f, 20f, 21.1f, 20f, 20f)
+            verticalLineTo(8f)
+            lineTo(14f, 2f)
+            close()
+            moveTo(16f, 18f)
+            horizontalLineTo(8f)
+            verticalLineTo(16f)
+            horizontalLineTo(16f)
+            verticalLineTo(18f)
+            close()
+            moveTo(16f, 14f)
+            horizontalLineTo(8f)
+            verticalLineTo(12f)
+            horizontalLineTo(16f)
+            verticalLineTo(14f)
+            close()
+            moveTo(13f, 9f)
+            verticalLineTo(3.5f)
+            lineTo(18.5f, 9f)
+            horizontalLineTo(13f)
+            close()
+        }
+    }
+}
+
+val Icons.Filled.Stop: ImageVector by lazy {
+    yggVector("Stop") {
+        solidPath {
+            moveTo(6f, 6f)
+            horizontalLineTo(18f)
+            verticalLineTo(18f)
+            horizontalLineTo(6f)
+            verticalLineTo(6f)
+            close()
+        }
+    }
+}
+
+

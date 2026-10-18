@@ -1,15 +1,22 @@
 // File: app/src/main/java/com/example/ui/screens/ChatsScreen.kt
 package com.example.ui.screens
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -34,20 +42,27 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddReaction
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
@@ -70,12 +85,14 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -91,10 +108,21 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.example.data.ConversationEntity
 import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
 import com.example.data.YggRepository
+import com.example.engine.ParsedYggContactQr
+import com.example.ui.components.ImageMessagePreviewCard
+import com.example.ui.components.MessageReactionsRow
+import com.example.ui.components.QrContactModal
+import com.example.ui.components.ReactionQuickPickerBar
+import com.example.ui.components.RichAttachmentSheetDialog
+import com.example.ui.components.VoiceCallOverlaySheet
+import com.example.ui.components.VoiceMessagePlayerCard
+import com.example.ui.components.VoiceRecordingComposerBar
+import com.example.ui.components.resolveUriFileMetadata
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
@@ -115,6 +143,16 @@ fun ChatsScreen(
     onFilterChange: (String) -> Unit,
     onToggleOfflineMode: () -> Unit,
     onSendMessage: (String, String, String?, Long) -> Unit,
+    onSendVoiceMessage: (String, Int, String) -> Unit = { _, _, _ -> },
+    onSendMediaOrFile: (String, String, Long, String, String?, String) -> Unit = { chatId, name, size, _, _, caption ->
+        onSendMessage(chatId, caption, name, size)
+    },
+    onToggleReaction: (String, String) -> Unit = { _, _ -> },
+    onStartVoiceCall: (String) -> Unit = {},
+    onToggleCallMute: () -> Unit = {},
+    onToggleCallSpeaker: () -> Unit = {},
+    onEndVoiceCall: () -> Unit = {},
+    onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
     onCreateNewChat: (String, String, Boolean, Boolean, Int) -> Unit,
     onDeleteChat: (String) -> Unit = {},
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
@@ -123,8 +161,11 @@ fun ChatsScreen(
     onRetryMessage: (MessageEntity) -> Unit = {},
     onPingChatRoute: (String) -> Unit = {}
 ) {
+    val context = LocalContext.current
     var showNewChatDialog by rememberSaveable { mutableStateOf(false) }
     var showP2PAttachDialog by rememberSaveable { mutableStateOf(false) }
+    var showQrModal by rememberSaveable { mutableStateOf(false) }
+    var qrModalInitialTab by rememberSaveable { mutableIntStateOf(1) }
 
     val filteredConversations = remember(conversations, uiState.searchQuery, uiState.selectedChatFilter) {
         conversations.filter { conv ->
@@ -155,6 +196,51 @@ fun ChatsScreen(
         fileTransfers.filter { it.chatId == uiState.selectedChatId }
     }
 
+    // System Photo Picker for sending Images directly in chat
+    val chatPhotoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        val chat = activeConversation ?: return@rememberLauncherForActivityResult
+        if (uri != null) {
+            val (name, size) = resolveUriFileMetadata(context, uri, "photo")
+            val finalName = if (name.contains(".")) name else "$name.jpg"
+            onSendMediaOrFile(
+                chat.chatId,
+                finalName,
+                size,
+                "IMAGE",
+                uri.toString(),
+                "Фотография ($finalName)"
+            )
+            showP2PAttachDialog = false
+        }
+    }
+
+    // System Document / File Picker for sending any file
+    val chatFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        val chat = activeConversation ?: return@rememberLauncherForActivityResult
+        if (uri != null) {
+            val (name, size) = resolveUriFileMetadata(context, uri, "file")
+            val mime = context.contentResolver.getType(uri).orEmpty()
+            val isImg = mime.startsWith("image/") ||
+                name.endsWith(".jpg", true) ||
+                name.endsWith(".jpeg", true) ||
+                name.endsWith(".png", true) ||
+                name.endsWith(".webp", true)
+            onSendMediaOrFile(
+                chat.chatId,
+                name,
+                size,
+                if (isImg) "IMAGE" else "FILE",
+                uri.toString(),
+                if (isImg) "Фотография ($name)" else "Файл P2P ($name)"
+            )
+            showP2PAttachDialog = false
+        }
+    }
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isExpandedSplitView = maxWidth >= 700.dp
 
@@ -178,6 +264,10 @@ fun ChatsScreen(
                         onDeleteChat = onDeleteChat,
                         onToggleTransferState = onToggleTransferState,
                         onOpenNewChatDialog = { showNewChatDialog = true },
+                        onOpenQrModal = { tab ->
+                            qrModalInitialTab = tab
+                            showQrModal = true
+                        },
                         onRunSendReceiveTest = { onRunSendReceiveTest(uiState.selectedChatId) },
                         onOpenSelfYggdrasilChat = onOpenSelfYggdrasilChat
                     )
@@ -198,7 +288,17 @@ fun ChatsScreen(
                             onSendMessage = { text ->
                                 onSendMessage(activeConversation.chatId, text, null, 0L)
                             },
+                            onSendVoiceMessage = { dur, wave ->
+                                onSendVoiceMessage(activeConversation.chatId, dur, wave)
+                            },
+                            onQuickPickGalleryPhoto = {
+                                chatPhotoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
                             onOpenP2PAttach = { showP2PAttachDialog = true },
+                            onToggleReaction = onToggleReaction,
+                            onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                             onDeleteChat = { onDeleteChat(activeConversation.chatId) },
                             onToggleTransferState = onToggleTransferState,
                             onPingRoute = { onPingChatRoute(activeConversation.chatId) },
@@ -214,7 +314,11 @@ fun ChatsScreen(
                         )
                     } else {
                         EmptyChatSelectionPlaceholder(
-                            onOpenSelfChat = { onOpenSelfYggdrasilChat(false) }
+                            onOpenSelfChat = { onOpenSelfYggdrasilChat(false) },
+                            onOpenQrScanner = {
+                                qrModalInitialTab = 1
+                                showQrModal = true
+                            }
                         )
                     }
                 }
@@ -232,7 +336,17 @@ fun ChatsScreen(
                     onSendMessage = { text ->
                         onSendMessage(activeConversation.chatId, text, null, 0L)
                     },
+                    onSendVoiceMessage = { dur, wave ->
+                        onSendVoiceMessage(activeConversation.chatId, dur, wave)
+                    },
+                    onQuickPickGalleryPhoto = {
+                        chatPhotoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
                     onOpenP2PAttach = { showP2PAttachDialog = true },
+                    onToggleReaction = onToggleReaction,
+                    onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                     onDeleteChat = { onDeleteChat(activeConversation.chatId) },
                     onToggleTransferState = onToggleTransferState,
                     onPingRoute = { onPingChatRoute(activeConversation.chatId) },
@@ -259,6 +373,10 @@ fun ChatsScreen(
                     onDeleteChat = onDeleteChat,
                     onToggleTransferState = onToggleTransferState,
                     onOpenNewChatDialog = { showNewChatDialog = true },
+                    onOpenQrModal = { tab ->
+                        qrModalInitialTab = tab
+                        showQrModal = true
+                    },
                     onRunSendReceiveTest = { onRunSendReceiveTest(null) },
                     onOpenSelfYggdrasilChat = onOpenSelfYggdrasilChat
                 )
@@ -270,6 +388,11 @@ fun ChatsScreen(
         NewChatOrMlsGroupDialog(
             myIpv6Address = uiState.identity.yggIpv6Address,
             onDismiss = { showNewChatDialog = false },
+            onOpenQrScanner = {
+                showNewChatDialog = false
+                qrModalInitialTab = 1
+                showQrModal = true
+            },
             onConfirm = { title, ipv6, isMls, sealed, ttl ->
                 onCreateNewChat(title, ipv6, isMls, sealed, ttl)
                 showNewChatDialog = false
@@ -278,13 +401,49 @@ fun ChatsScreen(
     }
 
     if (showP2PAttachDialog && activeConversation != null) {
-        P2PFileAttachDialog(
+        RichAttachmentSheetDialog(
             peerTitle = activeConversation.title,
             onDismiss = { showP2PAttachDialog = false },
-            onAttachSend = { fileName, fileSizeBytes, caption ->
-                onSendMessage(activeConversation.chatId, caption, fileName, fileSizeBytes)
+            onPickPhotoFromGallery = {
+                chatPhotoPickerLauncher.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                )
+            },
+            onPickDocumentFile = {
+                chatFilePickerLauncher.launch("*/*")
+            },
+            onSendCustomFile = { fileName, fileSizeBytes, attachType, caption ->
+                onSendMediaOrFile(
+                    activeConversation.chatId,
+                    fileName,
+                    fileSizeBytes,
+                    attachType,
+                    null,
+                    caption
+                )
                 showP2PAttachDialog = false
             }
+        )
+    }
+
+    if (showQrModal) {
+        QrContactModal(
+            uiState = uiState,
+            initialTab = qrModalInitialTab,
+            onDismiss = { showQrModal = false },
+            onContactScanned = { parsed ->
+                showQrModal = false
+                onAddContactFromQr(parsed)
+            }
+        )
+    }
+
+    uiState.activeVoiceCall?.let { callState ->
+        VoiceCallOverlaySheet(
+            callState = callState,
+            onToggleMute = onToggleCallMute,
+            onToggleSpeaker = onToggleCallSpeaker,
+            onEndCall = onEndVoiceCall
         )
     }
 }
@@ -302,13 +461,14 @@ private fun ChatListPane(
     onDeleteChat: (String) -> Unit,
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onOpenNewChatDialog: () -> Unit,
+    onOpenQrModal: (Int) -> Unit,
     onRunSendReceiveTest: () -> Unit,
     onOpenSelfYggdrasilChat: (Boolean) -> Unit
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(bottom = 88.dp)
+            contentPadding = PaddingValues(bottom = 104.dp)
         ) {
             item {
                 MeshStatusTopCard(
@@ -316,30 +476,54 @@ private fun ChatListPane(
                     queuedOfflineCount = queuedOfflineCount,
                     onToggleOfflineMode = onToggleOfflineMode,
                     onRunSendReceiveTest = onRunSendReceiveTest,
-                    onOpenSelfYggdrasilChat = { onOpenSelfYggdrasilChat(false) }
+                    onOpenSelfYggdrasilChat = { onOpenSelfYggdrasilChat(false) },
+                    onOpenQrModal = { onOpenQrModal(0) }
                 )
             }
 
             item {
                 Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                    OutlinedTextField(
-                        value = uiState.searchQuery,
-                        onValueChange = onSearchQueryChange,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("search_chats_input"),
-                        placeholder = {
-                            Text(
-                                "Поиск по имени, 200:... IPv6 или ключу",
-                                style = MaterialTheme.typography.bodyMedium
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = uiState.searchQuery,
+                            onValueChange = onSearchQueryChange,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("search_chats_input"),
+                            placeholder = {
+                                Text(
+                                    "Поиск по имени, 200:... или ключу",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(Icons.Default.Search, contentDescription = "Поиск")
+                            },
+                            singleLine = true,
+                            shape = RoundedCornerShape(14.dp)
+                        )
+
+                        IconButton(
+                            onClick = { onOpenQrModal(1) },
+                            modifier = Modifier
+                                .size(50.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(MaterialTheme.colorScheme.primaryContainer)
+                                .testTag("open_qr_scanner_top_button")
+                        ) {
+                            Icon(
+                                Icons.Default.QrCodeScanner,
+                                contentDescription = "Сканировать QR-код контакта",
+                                tint = EmeraldPrimary
                             )
-                        },
-                        leadingIcon = {
-                            Icon(Icons.Default.Search, contentDescription = "Поиск")
-                        },
-                        singleLine = true,
-                        shape = RoundedCornerShape(14.dp)
-                    )
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -383,6 +567,7 @@ private fun ChatListPane(
                     CleanStartZeroStateCard(
                         uiState = uiState,
                         onOpenNewChatDialog = onOpenNewChatDialog,
+                        onOpenQrModal = onOpenQrModal,
                         onScanLanNodes = onRunSendReceiveTest,
                         onOpenSelfYggdrasilChat = onOpenSelfYggdrasilChat
                     )
@@ -399,16 +584,31 @@ private fun ChatListPane(
             }
         }
 
-        FloatingActionButton(
-            onClick = onOpenNewChatDialog,
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
+        // Dual Action FABs: QR Scanner + New Contact
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(16.dp)
-                .testTag("new_chat_fab")
+                .padding(16.dp),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Icon(Icons.Default.Add, contentDescription = "Новый P2P чат или группа MLS")
+            SmallFloatingActionButton(
+                onClick = { onOpenQrModal(1) },
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.testTag("qr_scan_fab")
+            ) {
+                Icon(Icons.Default.QrCodeScanner, contentDescription = "Добавить по QR-коду")
+            }
+
+            FloatingActionButton(
+                onClick = onOpenNewChatDialog,
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.testTag("new_chat_fab")
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "Новый P2P чат или группа MLS")
+            }
         }
     }
 }
@@ -417,6 +617,7 @@ private fun ChatListPane(
 private fun CleanStartZeroStateCard(
     uiState: YggGramUiState,
     onOpenNewChatDialog: () -> Unit,
+    onOpenQrModal: (Int) -> Unit,
     onScanLanNodes: () -> Unit,
     onOpenSelfYggdrasilChat: (Boolean) -> Unit
 ) {
@@ -454,7 +655,7 @@ private fun CleanStartZeroStateCard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Проверьте работу сети отправкой сообщения самому себе через внешние публичные пиры Yggdrasil или добавьте собеседника.",
+                        text = "Добавьте собеседника по QR-коду, проверьте связь отправкой сообщения себе через Yggdrasil или найдите узлы в локальной сети.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -477,18 +678,29 @@ private fun CleanStartZeroStateCard(
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        TextButton(
-                            onClick = {
-                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                clipboard.setPrimaryClip(ClipData.newPlainText("YggGram URI", contactUri))
-                                Toast.makeText(context, "Ваша визитка ygggram:// скопирована", Toast.LENGTH_SHORT).show()
-                            },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                            modifier = Modifier.testTag("copy_my_uri_button")
-                        ) {
-                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Скопировать URI", style = MaterialTheme.typography.labelSmall)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(
+                                onClick = { onOpenQrModal(0) },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("empty_state_my_qr_button")
+                            ) {
+                                Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Мой QR", style = MaterialTheme.typography.labelSmall)
+                            }
+                            TextButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("YggGram URI", contactUri))
+                                    Toast.makeText(context, "Ваша визитка ygggram:// скопирована", Toast.LENGTH_SHORT).show()
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                modifier = Modifier.testTag("copy_my_uri_button")
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Копировать", style = MaterialTheme.typography.labelSmall)
+                            }
                         }
                     }
                     Text(
@@ -527,6 +739,17 @@ private fun CleanStartZeroStateCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
+                    onClick = { onOpenQrModal(1) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("empty_state_scan_qr_button")
+                ) {
+                    Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Сканировать QR")
+                }
+
+                OutlinedButton(
                     onClick = onOpenNewChatDialog,
                     modifier = Modifier
                         .weight(1f)
@@ -534,19 +757,19 @@ private fun CleanStartZeroStateCard(
                 ) {
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Добавить контакт")
+                    Text("Ввести адрес")
                 }
+            }
 
-                OutlinedButton(
-                    onClick = onScanLanNodes,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("scan_lan_peers_button")
-                ) {
-                    Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Поиск в LAN")
-                }
+            OutlinedButton(
+                onClick = onScanLanNodes,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("scan_lan_peers_button")
+            ) {
+                Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Поиск узлов YggGram в локальной Wi-Fi сети (LAN)")
             }
         }
     }
@@ -558,7 +781,8 @@ private fun MeshStatusTopCard(
     queuedOfflineCount: Int,
     onToggleOfflineMode: () -> Unit,
     onRunSendReceiveTest: () -> Unit,
-    onOpenSelfYggdrasilChat: () -> Unit
+    onOpenSelfYggdrasilChat: () -> Unit,
+    onOpenQrModal: () -> Unit
 ) {
     val isOfflineOrAirplane = uiState.isOfflineStoreAndForwardMode || !uiState.isNetworkAvailable || uiState.isAirplaneModeOn
     Card(
@@ -612,7 +836,9 @@ private fun MeshStatusTopCard(
                             },
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Text(
                             text = "IPv6: ${uiState.identity.yggIpv6Address} • TX:${uiState.txPacketsCount} / RX:${uiState.rxPacketsCount}",
@@ -657,19 +883,19 @@ private fun MeshStatusTopCard(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 OutlinedButton(
                     onClick = onOpenSelfYggdrasilChat,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
                     modifier = Modifier
                         .weight(1f)
                         .testTag("top_card_self_chat_button")
                 ) {
-                    Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp), tint = EmeraldPrimary)
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(15.dp), tint = EmeraldPrimary)
+                    Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "Избранное (Тест себе)",
+                        text = "Избранное",
                         style = MaterialTheme.typography.labelMedium,
                         color = EmeraldPrimary,
                         maxLines = 1,
@@ -678,14 +904,28 @@ private fun MeshStatusTopCard(
                 }
 
                 OutlinedButton(
-                    onClick = onRunSendReceiveTest,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    modifier = Modifier.testTag("test_send_receive_loopback_button")
+                    onClick = onOpenQrModal,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("top_card_my_qr_button")
                 ) {
-                    Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(16.dp), tint = CyberTealSecondary)
+                    Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(15.dp), tint = EmeraldPrimary)
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "Пинг пиров",
+                        text = "Мой QR",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = EmeraldPrimary
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onRunSendReceiveTest,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                    modifier = Modifier.testTag("test_send_receive_loopback_button")
+                ) {
+                    Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(15.dp), tint = CyberTealSecondary)
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Пинг",
                         style = MaterialTheme.typography.labelMedium,
                         color = CyberTealSecondary
                     )
@@ -751,7 +991,9 @@ private fun P2PFileTransfersStrip(
                                 Text(
                                     text = "${tx.protocol} • ${tx.completedChunks}/${tx.chunkCount} чанков • Merkle: ${tx.merkleRootSha256.take(10)}...",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                         }
@@ -981,7 +1223,11 @@ private fun ChatDetailPane(
     showBackButton: Boolean,
     onBack: () -> Unit,
     onSendMessage: (String) -> Unit,
+    onSendVoiceMessage: (Int, String) -> Unit,
+    onQuickPickGalleryPhoto: () -> Unit,
     onOpenP2PAttach: () -> Unit,
+    onToggleReaction: (String, String) -> Unit,
+    onStartVoiceCall: () -> Unit,
     onDeleteChat: () -> Unit = {},
     onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onPingRoute: () -> Unit = {},
@@ -992,10 +1238,22 @@ private fun ChatDetailPane(
     var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
     var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
+    var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     val isSelfChat = conversation.chatId == YggRepository.SELF_NODE_CHAT_ID
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Header with full IPv6, Route Status, and quick Ping / Echo actions
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        // Proceed with voice recording whether granted or in cloud emulator fallback mode
+        isRecordingVoice = true
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+    ) {
+        // Header with full IPv6, Route Status, Voice Call, and Ping / Echo actions
         Surface(
             color = MaterialTheme.colorScheme.surfaceContainer,
             tonalElevation = 2.dp,
@@ -1024,7 +1282,8 @@ private fun ChatDetailPane(
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
@@ -1042,6 +1301,25 @@ private fun ChatDetailPane(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+
+                    // Voice Call Button
+                    IconButton(
+                        onClick = onStartVoiceCall,
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primaryContainer)
+                            .testTag("start_voice_call_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Call,
+                            contentDescription = "Голосовой звонок через Yggdrasil",
+                            tint = EmeraldPrimary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(4.dp))
 
                     IconButton(
                         onClick = {
@@ -1076,7 +1354,7 @@ private fun ChatDetailPane(
 
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // Action Bar inside Chat Header (No overlapping buttons)
+                // Action Bar inside Chat Header
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1092,7 +1370,12 @@ private fun ChatDetailPane(
                     ) {
                         Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(15.dp))
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Пинг через Yggdrasil", style = MaterialTheme.typography.labelSmall)
+                        Text(
+                            text = "Пинг Yggdrasil",
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
 
                     if (isSelfChat) {
@@ -1106,7 +1389,12 @@ private fun ChatDetailPane(
                         ) {
                             Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Эхо-тест сети", style = MaterialTheme.typography.labelSmall)
+                            Text(
+                                text = "Эхо-тест сети",
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
                     }
 
@@ -1200,9 +1488,9 @@ private fun ChatDetailPane(
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = if (isSelfChat) {
-                                    "Каждое отправленное сюда сообщение проходит через внешний публичный пир сети Yggdrasil (без локального 127.0.0.1 loopback). Если внешние пиры отключены или активен Авиарежим, доставка не произойдет."
+                                    "Отправляйте текст, голосовые сообщения, фото или файлы через внешний пир Yggdrasil. Нажмите на любое сообщение для добавления эмодзи-реакций."
                                 } else {
-                                    "Отправьте сообщение ниже. Статус «Доставлено (ACK)» выставляется только после реального сетевого подтверждения от узла."
+                                    "Отправьте сообщение, голосовую запись, картинку или файл ниже. Удерживайте или нажмите на сообщение для быстрой реакции."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1216,6 +1504,7 @@ private fun ChatDetailPane(
                 EncryptedMessageBubble(
                     message = msg,
                     showCipherHex = showCipherInspector,
+                    onToggleReaction = { emoji -> onToggleReaction(msg.messageId, emoji) },
                     onRetry = { onRetryMessage(msg) }
                 )
             }
@@ -1245,79 +1534,140 @@ private fun ChatDetailPane(
             )
         }
 
-        // Message Composer
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceContainer,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = onOpenP2PAttach,
-                    modifier = Modifier.testTag("attach_p2p_file_button")
-                ) {
-                    Icon(
-                        Icons.Default.AttachFile,
-                        contentDescription = "Передать файл по P2P",
-                        tint = CyberTealSecondary
-                    )
+        // Message Composer Bar or Live Voice Recording Bar
+        if (isRecordingVoice) {
+            VoiceRecordingComposerBar(
+                onCancelRecording = { isRecordingVoice = false },
+                onFinishAndSendVoice = { durationSec, waveformCsv ->
+                    isRecordingVoice = false
+                    onSendVoiceMessage(durationSec, waveformCsv)
                 }
-
-                OutlinedTextField(
-                    value = messageInput,
-                    onValueChange = { messageInput = it },
+            )
+        } else {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                tonalElevation = 3.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
                     modifier = Modifier
-                        .weight(1f)
-                        .testTag("chat_message_input"),
-                    placeholder = {
-                        Text(
-                            when {
-                                isOfflineMode -> "Офлайн S&F: сообщение в очередь..."
-                                isSelfChat -> "Сообщение себе через сеть Yggdrasil..."
-                                else -> "Зашифрованное сообщение (Double Ratchet)..."
-                            },
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    },
-                    maxLines = 4,
-                    shape = RoundedCornerShape(16.dp)
-                )
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                IconButton(
-                    onClick = {
-                        if (messageInput.isNotBlank()) {
-                            onSendMessage(messageInput)
-                            messageInput = ""
-                        }
-                    },
-                    modifier = Modifier
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primary)
-                        .testTag("send_message_button")
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Отправить зашифрованное сообщение",
-                        tint = MaterialTheme.colorScheme.onPrimary
+                    IconButton(
+                        onClick = onOpenP2PAttach,
+                        modifier = Modifier
+                            .size(42.dp)
+                            .testTag("attach_p2p_file_button")
+                    ) {
+                        Icon(
+                            Icons.Default.AttachFile,
+                            contentDescription = "Прикрепить файл или фото",
+                            tint = CyberTealSecondary
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onQuickPickGalleryPhoto,
+                        modifier = Modifier
+                            .size(42.dp)
+                            .testTag("quick_attach_image_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Image,
+                            contentDescription = "Отправить картинку из галереи",
+                            tint = EmeraldPrimary
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(4.dp))
+
+                    OutlinedTextField(
+                        value = messageInput,
+                        onValueChange = { messageInput = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("chat_message_input"),
+                        placeholder = {
+                            Text(
+                                when {
+                                    isOfflineMode -> "Офлайн S&F: в очередь..."
+                                    isSelfChat -> "Сообщение себе через Yggdrasil..."
+                                    else -> "Сообщение..."
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        maxLines = 4,
+                        shape = RoundedCornerShape(18.dp)
                     )
+
+                    Spacer(modifier = Modifier.width(6.dp))
+
+                    if (messageInput.isBlank()) {
+                        IconButton(
+                            onClick = {
+                                val hasMicPerm = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (hasMicPerm) {
+                                    isRecordingVoice = true
+                                } else {
+                                    audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            },
+                            modifier = Modifier
+                                .size(46.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.secondaryContainer)
+                                .testTag("record_voice_message_button")
+                        ) {
+                            Icon(
+                                Icons.Default.Mic,
+                                contentDescription = "Записать голосовое сообщение",
+                                tint = EmeraldPrimary
+                            )
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                if (messageInput.isNotBlank()) {
+                                    onSendMessage(messageInput)
+                                    messageInput = ""
+                                }
+                            },
+                            modifier = Modifier
+                                .size(46.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primary)
+                                .testTag("send_message_button")
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Отправить зашифрованное сообщение",
+                                tint = MaterialTheme.colorScheme.onPrimary
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun EncryptedMessageBubble(
     message: MessageEntity,
     showCipherHex: Boolean,
+    onToggleReaction: (String) -> Unit,
     onRetry: () -> Unit
 ) {
+    var showReactionPicker by rememberSaveable(message.messageId) { mutableStateOf(false) }
     val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     val alignment = if (message.isOutgoing) Alignment.End else Alignment.Start
     val bubbleColor = if (message.isOutgoing) {
@@ -1331,6 +1681,14 @@ private fun EncryptedMessageBubble(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = alignment
     ) {
+        AnimatedVisibility(visible = showReactionPicker) {
+            ReactionQuickPickerBar(
+                messageId = message.messageId,
+                onSelectEmoji = onToggleReaction,
+                onDismiss = { showReactionPicker = false }
+            )
+        }
+
         Surface(
             color = bubbleColor,
             shape = RoundedCornerShape(
@@ -1341,13 +1699,19 @@ private fun EncryptedMessageBubble(
             ),
             modifier = Modifier
                 .fillMaxWidth(0.88f)
-                .then(
-                    if (isQueued) {
-                        Modifier.clickable { onRetry() }
-                    } else {
-                        Modifier
+                .combinedClickable(
+                    onClick = {
+                        if (isQueued) {
+                            onRetry()
+                        } else {
+                            showReactionPicker = !showReactionPicker
+                        }
+                    },
+                    onLongClick = {
+                        showReactionPicker = !showReactionPicker
                     }
                 )
+                .testTag("message_bubble_${message.messageId}")
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Row(
@@ -1370,47 +1734,97 @@ private fun EncryptedMessageBubble(
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    IconButton(
+                        onClick = { showReactionPicker = !showReactionPicker },
+                        modifier = Modifier
+                            .size(22.dp)
+                            .testTag("open_reactions_button_${message.messageId}")
+                    ) {
+                        Icon(
+                            Icons.Default.AddReaction,
+                            contentDescription = "Поставить реакцию",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
                 }
 
-                if (message.attachmentName != null) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                Icons.Default.FolderZip,
-                                contentDescription = null,
-                                tint = CyberTealSecondary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = message.attachmentName,
-                                    style = MaterialTheme.typography.labelLarge
-                                )
-                                Text(
-                                    text = "${message.attachmentSizeBytes / 1024} КБ • Merkle: ${message.merkleRootHex?.take(12) ?: "verified"}...",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                // Render Voice Message, Image Preview, or File Attachment Card
+                when (message.attachmentType) {
+                    "VOICE" -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        VoiceMessagePlayerCard(
+                            messageId = message.messageId,
+                            durationSec = message.voiceDurationSec.coerceAtLeast(1),
+                            waveformCsv = message.voiceWaveformCsv,
+                            attachmentSizeBytes = message.attachmentSizeBytes
+                        )
+                    }
+                    "IMAGE" -> {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        ImageMessagePreviewCard(
+                            messageId = message.messageId,
+                            imageName = message.attachmentName ?: "image.jpg",
+                            imageUri = message.attachmentUri,
+                            sizeBytes = message.attachmentSizeBytes,
+                            merkleRootHex = message.merkleRootHex
+                        )
+                    }
+                    else -> {
+                        if (message.attachmentName != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        Icons.Default.Description,
+                                        contentDescription = null,
+                                        tint = CyberTealSecondary,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = message.attachmentName,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "${(message.attachmentSizeBytes / 1024).coerceAtLeast(1)} КБ • Merkle: ${message.merkleRootHex?.take(12) ?: "verified"}...",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
+                if (message.plainText.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = message.plainText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
 
-                Text(
-                    text = message.plainText,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface
+                // Telegram/WhatsApp-style Reaction Pills Row
+                MessageReactionsRow(
+                    messageId = message.messageId,
+                    reactionsJson = message.reactionsJson,
+                    onToggleReaction = onToggleReaction
                 )
 
                 if (showCipherHex) {
@@ -1474,7 +1888,8 @@ private fun EncryptedMessageBubble(
 
 @Composable
 private fun EmptyChatSelectionPlaceholder(
-    onOpenSelfChat: () -> Unit
+    onOpenSelfChat: () -> Unit,
+    onOpenQrScanner: () -> Unit
 ) {
     Box(
         modifier = Modifier.fillMaxSize(),
@@ -1497,15 +1912,22 @@ private fun EmptyChatSelectionPlaceholder(
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "Вы можете проверить реальную работу сети, отправив сообщение самому себе через внешние публичные пиры Yggdrasil.",
+                text = "Вы можете проверить реальную работу сети, отправив сообщение самому себе через внешние публичные пиры Yggdrasil, или отсканировать QR-код контакта.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(modifier = Modifier.height(14.dp))
-            Button(onClick = onOpenSelfChat) {
-                Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Открыть Избранное (Мой узел Yggdrasil)")
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onOpenSelfChat) {
+                    Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Избранное (Мой узел)")
+                }
+                OutlinedButton(onClick = onOpenQrScanner) {
+                    Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Сканировать QR")
+                }
             }
         }
     }
@@ -1515,6 +1937,7 @@ private fun EmptyChatSelectionPlaceholder(
 private fun NewChatOrMlsGroupDialog(
     myIpv6Address: String,
     onDismiss: () -> Unit,
+    onOpenQrScanner: () -> Unit,
     onConfirm: (String, String, Boolean, Boolean, Int) -> Unit
 ) {
     var title by rememberSaveable { mutableStateOf("") }
@@ -1533,16 +1956,34 @@ private fun NewChatOrMlsGroupDialog(
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton(
-                    onClick = {
-                        title = "Избранное • Мой узел Yggdrasil"
-                        ipv6Input = myIpv6Address
-                    },
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Подставить мой адрес Yggdrasil (Тест через сеть)")
+                    OutlinedButton(
+                        onClick = onOpenQrScanner,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("dialog_scan_qr_button")
+                    ) {
+                        Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("По QR-коду", style = MaterialTheme.typography.labelMedium)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            title = "Избранное • Мой узел Yggdrasil"
+                            ipv6Input = myIpv6Address
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Тест себе", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
 
                 OutlinedTextField(
@@ -1607,64 +2048,6 @@ private fun NewChatOrMlsGroupDialog(
                 modifier = Modifier.testTag("confirm_new_chat_button")
             ) {
                 Text("Открыть чат")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Отмена")
-            }
-        }
-    )
-}
-
-@Composable
-private fun P2PFileAttachDialog(
-    peerTitle: String,
-    onDismiss: () -> Unit,
-    onAttachSend: (String, Long, String) -> Unit
-) {
-    var customFileName by rememberSaveable { mutableStateOf("") }
-    var customCaption by rememberSaveable { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text("P2P-передача файла для «$peerTitle»", style = MaterialTheme.typography.titleLarge)
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "Файл разбивается на криптографические чанки FastCDC по 64 КБ и верифицируется корнем дерева Merkle SHA-256 при передаче между узлами.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                OutlinedTextField(
-                    value = customFileName,
-                    onValueChange = { customFileName = it },
-                    label = { Text("Имя файла") },
-                    placeholder = { Text("document.pdf") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = customCaption,
-                    onValueChange = { customCaption = it },
-                    label = { Text("Комментарий к передаче") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    val effectiveName = customFileName.trim().ifBlank { "file_transfer.bin" }
-                    onAttachSend(effectiveName, 262_144L, customCaption.trim())
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                modifier = Modifier.testTag("confirm_p2p_send_button")
-            ) {
-                Text("Отправить по P2P")
             }
         },
         dismissButton = {

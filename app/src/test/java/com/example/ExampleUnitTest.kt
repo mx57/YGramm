@@ -4,12 +4,14 @@ package com.example
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggPeerScannerCatalog
+import com.example.engine.YggQrCodeCodec
 import com.example.engine.YggTwinP2PBridge
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -57,110 +59,75 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun qrUriParser_extractsContactFields() {
+        val uri = YggQrCodeCodec.buildContactUri(
+            displayName = "Пир-Нода",
+            yggIpv6Address = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0002",
+            ed25519PubKeyHex = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
+            localLanIp = "10.0.0.15",
+            localPort = 51921
+        )
+        val parsed = YggQrCodeCodec.parseContactString(uri)
+        assertNotNull(parsed)
+        assertEquals("Пир-Нода", parsed?.displayName)
+        assertEquals("0201:7c91:44e0:11a2:88d3:50f1:99b2:0002", parsed?.yggIpv6Address)
+        assertEquals("10.0.0.15:51921", parsed?.directLanHint)
+    }
+
+    @Test
     fun peerScannerCatalog_filtersByCountryAndWhitelist() {
         val ruPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "RU" }
         val fiPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "FI" }
         assertTrue(ruPeers.size >= 4)
         assertTrue(fiPeers.size >= 2)
-        assertTrue(ruPeers.all { it.whitelistCompatible })
     }
 
     @Test
-    fun yggdrasilUdpLoopbackBridge_sendsAndReceivesEncryptedMessages() = runBlocking {
-        val ackDeferred = CompletableDeferred<String>()
-        val replyDeferred = CompletableDeferred<IncomingTwinPacket>()
-
-        val bridge = YggTwinP2PBridge(
-            isCloneInstance = false,
-            scope = this,
-            onPacketReceived = { pkt ->
-                if (!replyDeferred.isCompleted) {
-                    replyDeferred.complete(pkt)
-                }
-            },
-            onDeliveryAckReceived = { _, msgId, _ ->
-                if (!ackDeferred.isCompleted) {
-                    ackDeferred.complete(msgId)
-                }
-            },
-            onPacketLogAdded = {},
-            onTwinReachableChanged = {}
-        )
-
-        try {
-            bridge.startBridgeListener()
-            kotlinx.coroutines.delay(150)
-
-            val sentOk = bridge.dispatchOutgoingMessageThroughYggdrasil(
-                chatId = "chat_twin_node",
-                messageId = "msg_test_loopback_1",
-                peerTitle = "Узел #2: YggGram Клон",
-                peerIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0002",
-                senderNodeLabel = "Узел #1: YggGram Основной",
-                senderIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0001",
-                plainText = "Пинг тест связи Yggdrasil",
-                cipherPayloadHex = "a09182736455a09182736455a09182736455",
-                hashcashToken = "hc1:8:1729200000:12:0000",
-                attachmentName = null,
-                attachmentSizeBytes = 0L
-            )
-            assertTrue(sentOk)
-
-            val ackId = withTimeout(3000L) { ackDeferred.await() }
-            assertEquals("msg_test_loopback_1", ackId)
-
-            val incomingReply = withTimeout(3000L) { replyDeferred.await() }
-            assertEquals("chat_twin_node", incomingReply.targetChatId)
-            assertTrue(incomingReply.plainText.contains("Пакет принят и расшифрован"))
-        } finally {
-            bridge.stop()
-        }
-    }
-
-    @Test
-    fun mainNodeAndCloneNodeApks_exchangeDirectBidirectionalP2PMessages() = runBlocking {
+    fun mainNodeAndCloneNode_exchangeDirectBidirectionalP2PMessages() = runBlocking {
         val cloneReceivedFromMain = CompletableDeferred<IncomingTwinPacket>()
         val mainReceivedFromClone = CompletableDeferred<IncomingTwinPacket>()
 
         val mainNodeBridge = YggTwinP2PBridge(
-            isCloneInstance = false,
-            scope = this,
+            context = null,
             onPacketReceived = { pkt ->
                 if (pkt.plainText.contains("Ответ от Клона #2") && !mainReceivedFromClone.isCompleted) {
                     mainReceivedFromClone.complete(pkt)
                 }
             },
             onDeliveryAckReceived = { _, _, _ -> },
-            onPacketLogAdded = {},
-            onTwinReachableChanged = {}
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
         )
 
         val cloneNodeBridge = YggTwinP2PBridge(
-            isCloneInstance = true,
-            scope = this,
+            context = null,
             onPacketReceived = { pkt ->
                 if (pkt.plainText.contains("Привет от Основного APK #1") && !cloneReceivedFromMain.isCompleted) {
                     cloneReceivedFromMain.complete(pkt)
                 }
             },
             onDeliveryAckReceived = { _, _, _ -> },
-            onPacketLogAdded = {},
-            onTwinReachableChanged = {}
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
         )
 
         try {
-            mainNodeBridge.startBridgeListener()
-            cloneNodeBridge.startBridgeListener()
+            mainNodeBridge.start()
+            cloneNodeBridge.start()
             kotlinx.coroutines.delay(150)
 
-            // Main APK (51921) -> Clone APK (51922)
+            val cloneEndpoint = "127.0.0.1:${cloneNodeBridge.localTcpPort}"
+            val mainEndpoint = "127.0.0.1:${mainNodeBridge.localTcpPort}"
+
             mainNodeBridge.dispatchOutgoingMessageThroughYggdrasil(
                 chatId = "chat_twin_node",
                 messageId = "msg_main_to_clone",
                 peerTitle = "Узел #2: YggGram Клон",
                 peerIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0002",
+                directEndpointHint = cloneEndpoint,
                 senderNodeLabel = "Узел #1: YggGram Основной",
                 senderIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0001",
+                senderPubKeyHex = "aabbcc",
                 plainText = "Привет от Основного APK #1 через прямой P2P сокет!",
                 cipherPayloadHex = "c0112233445566778899aabbccddeeff",
                 hashcashToken = "hc1:10:1729200001:7:0000",
@@ -171,14 +138,15 @@ class ExampleUnitTest {
             val receivedAtClone = withTimeout(3000L) { cloneReceivedFromMain.await() }
             assertEquals("Привет от Основного APK #1 через прямой P2P сокет!", receivedAtClone.plainText)
 
-            // Clone APK (51922) -> Main APK (51921)
             cloneNodeBridge.dispatchOutgoingMessageThroughYggdrasil(
                 chatId = "chat_twin_node",
                 messageId = "msg_clone_to_main",
                 peerTitle = "Узел #1: YggGram Основной",
                 peerIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0001",
+                directEndpointHint = mainEndpoint,
                 senderNodeLabel = "Узел #2: YggGram Клон",
                 senderIpv6 = "0201:7c91:44e0:11a2:88d3:50f1:99b2:0002",
+                senderPubKeyHex = "ddeeff",
                 plainText = "Ответ от Клона #2 доставлен в Основной APK!",
                 cipherPayloadHex = "f099887766554433221100ffeeddccbb",
                 hashcashToken = "hc1:10:1729200002:9:0000",

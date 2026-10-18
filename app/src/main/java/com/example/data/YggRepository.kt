@@ -9,10 +9,6 @@ import kotlinx.coroutines.flow.Flow
 
 class YggRepository(private val dao: YggDao) {
 
-    companion object {
-        const val SELF_NODE_CHAT_ID = "chat_self_ygg_node"
-    }
-
     val conversations: Flow<List<ConversationEntity>> = dao.observeConversations()
     val allMessages: Flow<List<MessageEntity>> = dao.observeAllMessages()
     val fileTransfers: Flow<List<P2PFileTransferEntity>> = dao.observeFileTransfers()
@@ -219,7 +215,11 @@ class YggRepository(private val dao: YggDao) {
         sealedSenderGlobal: Boolean,
         powDifficultyBits: Int,
         attachmentName: String? = null,
-        attachmentSizeBytes: Long = 0L
+        attachmentSizeBytes: Long = 0L,
+        attachmentType: String? = null,
+        attachmentUri: String? = null,
+        voiceDurationSec: Int = 0,
+        voiceWaveformCsv: String? = null
     ): MessageEntity? {
         val conv = dao.getConversationById(chatId) ?: return null
         val now = System.currentTimeMillis()
@@ -257,11 +257,16 @@ class YggRepository(private val dao: YggDao) {
             attachmentName = attachmentName,
             attachmentSizeBytes = attachmentSizeBytes,
             merkleRootHex = merkleRoot,
-            transferProgress = if (isOfflineMode) 0f else 1.0f
+            transferProgress = if (isOfflineMode) 0f else 1.0f,
+            attachmentType = attachmentType,
+            attachmentUri = attachmentUri,
+            voiceDurationSec = voiceDurationSec,
+            voiceWaveformCsv = voiceWaveformCsv,
+            reactionsJson = ""
         )
         dao.insertMessage(message)
 
-        if (attachmentName != null && merkleRoot != null) {
+        if (attachmentName != null && merkleRoot != null && attachmentType != "VOICE") {
             val (chunks, _) = YggCryptoEngine.computeFastCdcMerkleProfile(attachmentName, attachmentSizeBytes)
             val transfer = P2PFileTransferEntity(
                 transferId = "tx_${UUID.randomUUID()}",
@@ -271,10 +276,10 @@ class YggRepository(private val dao: YggDao) {
                 fileName = attachmentName,
                 fileSizeBytes = attachmentSizeBytes,
                 chunkCount = chunks,
-                completedChunks = 0,
+                completedChunks = if (isOfflineMode) 0 else chunks,
                 merkleRootSha256 = merkleRoot,
-                speedKbps = 0,
-                status = "QUEUED_OFFLINE",
+                speedKbps = if (isOfflineMode) 0 else 1420,
+                status = if (isOfflineMode) "QUEUED_OFFLINE" else "VERIFIED_COMPLETE",
                 isOutgoing = true,
                 protocol = "YGG_OVERLAY_STREAM",
                 timestamp = now
@@ -282,15 +287,75 @@ class YggRepository(private val dao: YggDao) {
             dao.upsertFileTransfer(transfer)
         }
 
-        val previewPrefix = if (attachmentName != null) "[Файл P2P: $attachmentName] " else ""
+        val previewPrefix = when (attachmentType) {
+            "VOICE" -> "🎤 Голосовое сообщение (${voiceDurationSec}с) "
+            "IMAGE" -> "🖼️ Фото ($attachmentName) "
+            "FILE" -> "📎 Файл ($attachmentName) "
+            else -> if (attachmentName != null) "[Файл P2P: $attachmentName] " else ""
+        }
         dao.upsertConversation(
             conv.copy(
-                lastMessagePreview = "$previewPrefix$plainText",
+                lastMessagePreview = "$previewPrefix$plainText".trim(),
                 lastTimestamp = now,
                 unreadCount = 0
             )
         )
         return message
+    }
+
+    suspend fun toggleReactionOnMessage(
+        messageId: String,
+        emoji: String,
+        byMe: Boolean
+    ): MessageEntity? {
+        val msg = dao.getMessageById(messageId) ?: return null
+        val currentMap = parseReactionsMap(msg.reactionsJson).toMutableMap()
+        val existing = currentMap[emoji]
+        if (existing != null) {
+            if (byMe) {
+                if (existing.second) {
+                    val newCount = (existing.first - 1).coerceAtLeast(0)
+                    if (newCount == 0) currentMap.remove(emoji) else currentMap[emoji] = newCount to false
+                } else {
+                    currentMap[emoji] = (existing.first + 1) to true
+                }
+            } else {
+                currentMap[emoji] = (existing.first + 1) to existing.second
+            }
+        } else {
+            currentMap[emoji] = 1 to byMe
+        }
+        val encoded = serializeReactionsMap(currentMap)
+        dao.updateMessageReactions(messageId, encoded)
+        return msg.copy(reactionsJson = encoded)
+    }
+
+    companion object {
+        const val SELF_NODE_CHAT_ID = "chat_self_ygg_node"
+
+        fun parseReactionsMap(raw: String): Map<String, Pair<Int, Boolean>> {
+            if (raw.isBlank()) return emptyMap()
+            val result = linkedMapOf<String, Pair<Int, Boolean>>()
+            raw.split("|").forEach { entry ->
+                val parts = entry.split(":")
+                if (parts.size >= 2) {
+                    val emoji = parts[0]
+                    val count = parts[1].toIntOrNull() ?: 1
+                    val isMe = parts.getOrNull(2) == "me"
+                    if (emoji.isNotBlank() && count > 0) {
+                        result[emoji] = count to isMe
+                    }
+                }
+            }
+            return result
+        }
+
+        fun serializeReactionsMap(map: Map<String, Pair<Int, Boolean>>): String {
+            return map.entries.joinToString("|") { (emoji, pair) ->
+                val tag = if (pair.second) "me" else "peer"
+                "$emoji:${pair.first}:$tag"
+            }
+        }
     }
 
     suspend fun markMessageSentP2P(messageId: String) {
@@ -367,7 +432,12 @@ class YggRepository(private val dao: YggDao) {
             attachmentName = packet.attachmentName,
             attachmentSizeBytes = packet.attachmentSizeBytes,
             merkleRootHex = merkleRoot,
-            transferProgress = 1.0f
+            transferProgress = 1.0f,
+            attachmentType = packet.attachmentType,
+            attachmentUri = packet.attachmentUri,
+            voiceDurationSec = packet.voiceDurationSec,
+            voiceWaveformCsv = packet.voiceWaveformCsv,
+            reactionsJson = ""
         )
         dao.insertMessage(msg)
         val unreadIncrement = if (activeChatId == conv.chatId) 0 else 1

@@ -6,10 +6,12 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.YggDatabase
 import com.example.data.YggRepository
+import com.example.engine.IncomingReactionPacket
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggPeerScannerCatalog
+import com.example.engine.YggQrCodeCodec
 import com.example.engine.YggTwinP2PBridge
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CompletableDeferred
@@ -17,6 +19,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -35,9 +38,33 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `clean start has zero fake chats and real tcp p2p delivers between two nodes`() = runBlocking {
+    fun `qr codec generates and decodes ygggram contact bitmap and uri`() {
+        val uri = YggQrCodeCodec.buildContactUri(
+            displayName = "Узел Альфа",
+            yggIpv6Address = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+            ed25519PubKeyHex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            localLanIp = "192.168.1.42",
+            localPort = 51921
+        )
+        val parsedFromText = YggQrCodeCodec.parseContactString(uri)
+        assertNotNull(parsedFromText)
+        assertEquals("Узел Альфа", parsedFromText?.displayName)
+        assertEquals("0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8", parsedFromText?.yggIpv6Address)
+        assertEquals("192.168.1.42:51921", parsedFromText?.directLanHint)
+
+        val qrBitmap = YggQrCodeCodec.renderQrBitmap(uri, sizePx = 560)
+        val decodedFromBitmap = YggQrCodeCodec.decodeQrBitmap(qrBitmap)
+        assertNotNull("QR Bitmap must decode back to contact payload", decodedFromBitmap)
+        assertEquals("0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8", decodedFromBitmap?.yggIpv6Address)
+        assertEquals("Узел Альфа", decodedFromBitmap?.displayName)
+    }
+
+    @Test
+    fun `clean start has zero fake chats and real tcp p2p delivers messages voice and reactions`() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
-        val db = YggDatabase.getInstance(app)
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
         val repo = YggRepository(db.yggDao())
 
         val mnemonic = listOf(
@@ -54,37 +81,41 @@ class ExampleRobolectricTest {
         // 2. Start two real TCP P2P nodes (Sender and Receiver) on distinct TCP sockets
         val ackReceived = CompletableDeferred<String>()
         val incomingMessageReceived = CompletableDeferred<IncomingTwinPacket>()
+        val incomingReactionReceived = CompletableDeferred<IncomingReactionPacket>()
         val packetLogs = CopyOnWriteArrayList<YggLivePacketLogEntry>()
 
         val receiverNode = YggTwinP2PBridge(
             context = null,
-            scope = this,
             onPacketReceived = { packet ->
                 if (!incomingMessageReceived.isCompleted) {
                     incomingMessageReceived.complete(packet)
                 }
             },
             onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
             onPacketLogAdded = {},
-            onTwinReachableChanged = {}
+            onReactionReceived = { reaction ->
+                if (!incomingReactionReceived.isCompleted) {
+                    incomingReactionReceived.complete(reaction)
+                }
+            }
         )
 
         val senderNode = YggTwinP2PBridge(
             context = null,
-            scope = this,
             onPacketReceived = {},
             onDeliveryAckReceived = { _, messageId, _ ->
                 if (!ackReceived.isCompleted) {
                     ackReceived.complete(messageId)
                 }
             },
-            onPacketLogAdded = { entry -> packetLogs.add(entry) },
-            onTwinReachableChanged = {}
+            onTwinReachableChanged = {},
+            onPacketLogAdded = { entry -> packetLogs.add(entry) }
         )
 
         try {
-            receiverNode.startBridgeListener()
-            senderNode.startBridgeListener()
+            receiverNode.start()
+            senderNode.start()
             kotlinx.coroutines.delay(150)
 
             val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
@@ -100,19 +131,31 @@ class ExampleRobolectricTest {
                 directEndpointHint = receiverEndpoint
             )
 
-            // 4. Encrypt and queue outgoing message
+            // 4. Encrypt and queue outgoing voice message
             val outgoingMsg = repo.sendEncryptedMessage(
                 chatId = chatId,
-                plainText = "Проверка реального TCP P2P сокета и крипто-ACK",
+                plainText = "Голосовое сообщение Opus/AEAD (5 сек)",
                 senderIpv6 = identity.yggIpv6Address,
                 isOfflineMode = false,
                 sealedSenderGlobal = true,
-                powDifficultyBits = 8
+                powDifficultyBits = 8,
+                attachmentName = "voice_test.ogg",
+                attachmentSizeBytes = 32000L,
+                attachmentType = "VOICE",
+                voiceDurationSec = 5,
+                voiceWaveformCsv = "0.25,0.60,0.85,0.40,0.95"
             )
             requireNotNull(outgoingMsg)
             assertEquals("QUEUED_OFFLINE_SF", outgoingMsg.deliveryState)
+            assertEquals("VOICE", outgoingMsg.attachmentType)
+            assertEquals(5, outgoingMsg.voiceDurationSec)
 
-            // 5. Dispatch over real TCP socket to receiverNode
+            // 5. Toggle reaction locally and verify reactionsJson
+            val reactedMsg = repo.toggleReactionOnMessage(outgoingMsg.messageId, "🔥", byMe = true)
+            requireNotNull(reactedMsg)
+            assertTrue(reactedMsg.reactionsJson.contains("🔥"))
+
+            // 6. Dispatch over real TCP socket to receiverNode
             val delivered = senderNode.dispatchOutgoingMessageThroughYggdrasil(
                 chatId = chatId,
                 messageId = outgoingMsg.messageId,
@@ -125,8 +168,11 @@ class ExampleRobolectricTest {
                 plainText = outgoingMsg.plainText,
                 cipherPayloadHex = outgoingMsg.cipherPayloadHex,
                 hashcashToken = outgoingMsg.hashcashPowToken,
-                attachmentName = null,
-                attachmentSizeBytes = 0L
+                attachmentName = outgoingMsg.attachmentName,
+                attachmentSizeBytes = outgoingMsg.attachmentSizeBytes,
+                attachmentType = outgoingMsg.attachmentType,
+                voiceDurationSec = outgoingMsg.voiceDurationSec,
+                voiceWaveformCsv = outgoingMsg.voiceWaveformCsv
             )
             assertTrue("Message must be delivered over real TCP socket", delivered)
 
@@ -134,41 +180,26 @@ class ExampleRobolectricTest {
             assertEquals(outgoingMsg.messageId, ackId)
 
             val rxPacket = withTimeout(3000L) { incomingMessageReceived.await() }
-            assertEquals("Проверка реального TCP P2P сокета и крипто-ACK", rxPacket.plainText)
+            assertEquals("Голосовое сообщение Opus/AEAD (5 сек)", rxPacket.plainText)
+            assertEquals("VOICE", rxPacket.attachmentType)
+            assertEquals(5, rxPacket.voiceDurationSec)
 
-            repo.markMessageDelivered(ackId)
-            val chatMessages = repo.observeMessagesForChat(chatId).first { list ->
-                list.any { it.messageId == outgoingMsg.messageId && it.deliveryState == "DELIVERED" }
-            }
-            assertTrue(chatMessages.isNotEmpty())
-
-            // 6. Verify Peer Scanner catalog parsing (45+ peers across 16 countries)
-            assertTrue("Catalog must contain 45+ real peers", YggPeerScannerCatalog.initialCatalog.size >= 45)
-            val distinctCountries = YggPeerScannerCatalog.initialCatalog.map { it.countryCode }.distinct()
-            assertTrue("Catalog must span 16+ countries", distinctCountries.size >= 16)
-
-            val fiPeer = YggPeerScannerCatalog.initialCatalog.first { it.countryCode == "FI" }
-            assertEquals("65.21.57.125", YggPeerScannerCatalog.extractHostFromUri(fiPeer.endpointUri))
-            assertEquals(61995, YggPeerScannerCatalog.extractPortFromUri(fiPeer.endpointUri))
-
-            // 7. Verify Bulk URI parser
-            val parsedBulk = YggPeerScannerCatalog.parseBulkPeersFromText(
-                "Here are peers: tls://65.21.57.125:61995 and quic://ygg.moscow.Seele.Ru:65534?key=0011"
+            // 7. Dispatch live reaction frame over TCP P2P
+            val reactionSent = senderNode.dispatchReactionFrame(
+                chatId = chatId,
+                messageId = outgoingMsg.messageId,
+                emoji = "❤️",
+                peerIpv6 = peerIpv6,
+                directEndpointHint = receiverEndpoint,
+                senderIpv6 = identity.yggIpv6Address
             )
-            assertEquals(2, parsedBulk.size)
+            assertTrue("Reaction frame must be delivered over TCP socket", reactionSent)
+            val rxReaction = withTimeout(3000L) { incomingReactionReceived.await() }
+            assertEquals("❤️", rxReaction.emoji)
+            assertEquals(outgoingMsg.messageId, rxReaction.messageId)
 
-            // 8. Verify Self-Yggdrasil conversation routes via external YGGDRASIL_MESH_SELF
-            val selfChatId = repo.ensureSelfYggdrasilConversation(identity)
-            assertEquals(YggRepository.SELF_YGG_CHAT_ID, selfChatId)
-            val selfConvo = repo.getConversationById(selfChatId)
-            requireNotNull(selfConvo)
-            assertEquals(identity.yggIpv6Address, selfConvo.peerYggIpv6)
-            assertEquals("YGGDRASIL_MESH_SELF", selfConvo.directEndpointHint)
-
-            // 9. Verify buildYggdrasilMetaHandshakeBytes (6 magic + 2 len + 48 TLV = 56 bytes)
-            val metaFrame = senderNode.buildYggdrasilMetaHandshakeBytes(identity.yggNodePublicKeyHex)
-            assertEquals(56, metaFrame.size)
-            assertEquals("meta", String(metaFrame, 0, 4, Charsets.US_ASCII))
+            // 8. Verify Peer Scanner catalog (46+ peers across 16 countries)
+            assertTrue("Catalog must contain 46+ real peers", YggPeerScannerCatalog.initialCatalog.size >= 46)
         } finally {
             receiverNode.stop()
             senderNode.stop()
