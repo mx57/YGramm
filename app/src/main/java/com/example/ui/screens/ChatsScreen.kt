@@ -114,6 +114,7 @@ import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
 import com.example.data.YggRepository
 import com.example.engine.ParsedYggContactQr
+import com.example.ui.components.FileAttachmentBubbleCard
 import com.example.ui.components.ImageMessagePreviewCard
 import com.example.ui.components.MessageReactionsRow
 import com.example.ui.components.QrContactModal
@@ -143,7 +144,7 @@ fun ChatsScreen(
     onFilterChange: (String) -> Unit,
     onToggleOfflineMode: () -> Unit,
     onSendMessage: (String, String, String?, Long) -> Unit,
-    onSendVoiceMessage: (String, Int, String) -> Unit = { _, _, _ -> },
+    onSendVoiceMessage: (String, Int, String, String?, Long) -> Unit = { _, _, _, _, _ -> },
     onSendMediaOrFile: (String, String, Long, String, String?, String) -> Unit = { chatId, name, size, _, _, caption ->
         onSendMessage(chatId, caption, name, size)
     },
@@ -151,6 +152,7 @@ fun ChatsScreen(
     onStartVoiceCall: (String) -> Unit = {},
     onToggleCallMute: () -> Unit = {},
     onToggleCallSpeaker: () -> Unit = {},
+    onTriggerCallTestAudioTone: () -> Unit = {},
     onEndVoiceCall: () -> Unit = {},
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
     onCreateNewChat: (String, String, Boolean, Boolean, Int) -> Unit,
@@ -288,8 +290,8 @@ fun ChatsScreen(
                             onSendMessage = { text ->
                                 onSendMessage(activeConversation.chatId, text, null, 0L)
                             },
-                            onSendVoiceMessage = { dur, wave ->
-                                onSendVoiceMessage(activeConversation.chatId, dur, wave)
+                            onSendVoiceMessage = { dur, wave, uri, size ->
+                                onSendVoiceMessage(activeConversation.chatId, dur, wave, uri, size)
                             },
                             onQuickPickGalleryPhoto = {
                                 chatPhotoPickerLauncher.launch(
@@ -336,8 +338,8 @@ fun ChatsScreen(
                     onSendMessage = { text ->
                         onSendMessage(activeConversation.chatId, text, null, 0L)
                     },
-                    onSendVoiceMessage = { dur, wave ->
-                        onSendVoiceMessage(activeConversation.chatId, dur, wave)
+                    onSendVoiceMessage = { dur, wave, uri, size ->
+                        onSendVoiceMessage(activeConversation.chatId, dur, wave, uri, size)
                     },
                     onQuickPickGalleryPhoto = {
                         chatPhotoPickerLauncher.launch(
@@ -443,7 +445,8 @@ fun ChatsScreen(
             callState = callState,
             onToggleMute = onToggleCallMute,
             onToggleSpeaker = onToggleCallSpeaker,
-            onEndCall = onEndVoiceCall
+            onEndCall = onEndVoiceCall,
+            onTriggerTestAudioTone = onTriggerCallTestAudioTone
         )
     }
 }
@@ -1223,7 +1226,7 @@ private fun ChatDetailPane(
     showBackButton: Boolean,
     onBack: () -> Unit,
     onSendMessage: (String) -> Unit,
-    onSendVoiceMessage: (Int, String) -> Unit,
+    onSendVoiceMessage: (Int, String, String?, Long) -> Unit,
     onQuickPickGalleryPhoto: () -> Unit,
     onOpenP2PAttach: () -> Unit,
     onToggleReaction: (String, String) -> Unit,
@@ -1239,7 +1242,7 @@ private fun ChatDetailPane(
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
     var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
-    val isSelfChat = conversation.chatId == YggRepository.SELF_NODE_CHAT_ID
+    val isSelfChat = YggRepository.isSelfChatId(conversation.chatId)
 
     val audioPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -1538,9 +1541,9 @@ private fun ChatDetailPane(
         if (isRecordingVoice) {
             VoiceRecordingComposerBar(
                 onCancelRecording = { isRecordingVoice = false },
-                onFinishAndSendVoice = { durationSec, waveformCsv ->
+                onFinishAndSendVoice = { durationSec, waveformCsv, localUri, _, sizeBytes ->
                     isRecordingVoice = false
-                    onSendVoiceMessage(durationSec, waveformCsv)
+                    onSendVoiceMessage(durationSec, waveformCsv, localUri, sizeBytes)
                 }
             )
         } else {
@@ -1758,7 +1761,8 @@ private fun EncryptedMessageBubble(
                             messageId = message.messageId,
                             durationSec = message.voiceDurationSec.coerceAtLeast(1),
                             waveformCsv = message.voiceWaveformCsv,
-                            attachmentSizeBytes = message.attachmentSizeBytes
+                            attachmentSizeBytes = message.attachmentSizeBytes,
+                            attachmentUri = message.attachmentUri
                         )
                     }
                     "IMAGE" -> {
@@ -1774,39 +1778,13 @@ private fun EncryptedMessageBubble(
                     else -> {
                         if (message.attachmentName != null) {
                             Spacer(modifier = Modifier.height(6.dp))
-                            Surface(
-                                color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.Description,
-                                        contentDescription = null,
-                                        tint = CyberTealSecondary,
-                                        modifier = Modifier.size(22.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = message.attachmentName,
-                                            style = MaterialTheme.typography.labelLarge,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                        Text(
-                                            text = "${(message.attachmentSizeBytes / 1024).coerceAtLeast(1)} КБ • Merkle: ${message.merkleRootHex?.take(12) ?: "verified"}...",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                }
-                            }
+                            FileAttachmentBubbleCard(
+                                messageId = message.messageId,
+                                fileName = message.attachmentName,
+                                fileUri = message.attachmentUri,
+                                sizeBytes = message.attachmentSizeBytes,
+                                merkleRootHex = message.merkleRootHex
+                            )
                         }
                     }
                 }

@@ -1,7 +1,17 @@
 // File: app/src/main/java/com/example/ui/screens/ProfilePrivacyScreen.kt
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,30 +30,31 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
-import android.widget.Toast
+import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Fingerprint
-import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.Hub
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.QrCode2
-import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.IconButton
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -59,11 +70,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.example.data.UserProfileEntity
 import com.example.engine.ParsedYggContactQr
+import com.example.service.YggForegroundServiceState
 import com.example.ui.components.QrContactModal
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
@@ -73,7 +90,21 @@ import com.example.viewmodel.YggGramUiState
 @Composable
 fun ProfilePrivacyScreen(
     uiState: YggGramUiState,
+    userProfiles: List<UserProfileEntity> = emptyList(),
+    foregroundServiceState: YggForegroundServiceState = YggForegroundServiceState(),
     onUpdateProfile: (String, String, String, String) -> Unit,
+    onCreateNewProfile: (
+        displayName: String,
+        handle: String,
+        bio: String,
+        runSimultaneouslyInBackground: Boolean,
+        switchImmediately: Boolean
+    ) -> Unit = { _, _, _, _, _ -> },
+    onSwitchProfile: (String) -> Unit = {},
+    onToggleProfileBackgroundActive: (String, Boolean) -> Unit = { _, _ -> },
+    onDeleteSecondaryProfile: (String) -> Unit = {},
+    onOpenChatWithProfile: (UserProfileEntity) -> Unit = {},
+    onToggleBackgroundService: (Boolean) -> Unit = {},
     onUpdatePrivacy: (
         sealedSenderGlobal: Boolean?,
         stripNetworkMetadata: Boolean?,
@@ -86,8 +117,16 @@ fun ProfilePrivacyScreen(
     ) -> Unit,
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {}
 ) {
+    val context = LocalContext.current
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
+    var showCreateProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showQrIdentityDialog by rememberSaveable { mutableStateOf(false) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        onToggleBackgroundService(true)
+    }
 
     val profile = uiState.userProfile
     val privacy = uiState.privacyMatrix
@@ -97,7 +136,7 @@ fun ProfilePrivacyScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Decentralized Profile Card
+        // 1. Current Decentralized Profile Card
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -157,7 +196,6 @@ fun ProfilePrivacyScreen(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    val context = LocalContext.current
                     Surface(
                         color = MaterialTheme.colorScheme.surfaceContainerLowest,
                         shape = RoundedCornerShape(12.dp),
@@ -200,7 +238,7 @@ fun ProfilePrivacyScreen(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Криптографическая подпись профиля: ${profile.profileSignatureHex}",
+                                text = "Порт P2P: :${profile.allocatedTcpPort} • Подпись: ${profile.profileSignatureHex}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -238,7 +276,325 @@ fun ProfilePrivacyScreen(
             }
         }
 
-        // 2. Flexible Privacy Settings Matrix
+        // 2. Multi-Profile Manager Card (Generate 2+ Profiles & Simultaneous Background Execution)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Groups, contentDescription = null, tint = EmeraldPrimary)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = "Мультипрофильность Yggdrasil (${userProfiles.size})",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Одновременная работа нескольких профилей на разных портах P2P",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Button(
+                            onClick = { showCreateProfileDialog = true },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier.testTag("create_new_profile_button")
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Новый профиль", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+
+                    Text(
+                        text = "Каждый профиль имеет собственную BIP-39 мнемонику, уникальный IPv6-адрес 200::/7 и выделенный TCP-сокет. Вы можете включить параллельную работу в фоне для любого профиля и даже переписываться или звонить между своими профилями по P2P.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    userProfiles.forEach { itemProfile ->
+                        val isPrimary = itemProfile.profileId == uiState.currentProfileId
+                        Surface(
+                            color = if (isPrimary) {
+                                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerLowest
+                            },
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(
+                                    width = if (isPrimary) 1.5.dp else 1.dp,
+                                    color = if (isPrimary) EmeraldPrimary else MaterialTheme.colorScheme.outlineVariant,
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(38.dp)
+                                                .clip(CircleShape)
+                                                .background(MaterialTheme.colorScheme.primaryContainer),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text(
+                                                text = itemProfile.displayName.take(2).uppercase(),
+                                                style = MaterialTheme.typography.titleSmall,
+                                                color = EmeraldPrimary,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(
+                                                    text = itemProfile.displayName,
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                if (isPrimary) {
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Surface(
+                                                        color = EmeraldPrimary.copy(alpha = 0.2f),
+                                                        shape = RoundedCornerShape(6.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = "АКТИВНЫЙ",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = EmeraldPrimary,
+                                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Text(
+                                                text = "${itemProfile.handle} • Порт :${itemProfile.allocatedTcpPort}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = CyberTealSecondary
+                                            )
+                                            Text(
+                                                text = itemProfile.yggIpv6Address,
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+
+                                    if (!isPrimary && userProfiles.size > 1) {
+                                        IconButton(
+                                            onClick = { onDeleteSecondaryProfile(itemProfile.profileId) },
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .testTag("delete_profile_${itemProfile.profileId}")
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Delete,
+                                                contentDescription = "Удалить профиль",
+                                                tint = MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // Toggle simultaneous background listening for this profile
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Одновременная работа в фоне (P2P сокет :${itemProfile.allocatedTcpPort})",
+                                            style = MaterialTheme.typography.labelMedium
+                                        )
+                                        Text(
+                                            text = if (itemProfile.isActiveInBackground || isPrimary) {
+                                                "Принимает сообщения, файлы и звонки в реальном времени"
+                                            } else {
+                                                "Сокет остановлен (только при переключении)"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (itemProfile.isActiveInBackground || isPrimary) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Switch(
+                                        checked = itemProfile.isActiveInBackground || isPrimary,
+                                        enabled = !isPrimary,
+                                        onCheckedChange = { enabled ->
+                                            onToggleProfileBackgroundActive(itemProfile.profileId, enabled)
+                                        },
+                                        modifier = Modifier.testTag("toggle_profile_bg_${itemProfile.profileId}")
+                                    )
+                                }
+
+                                if (!isPrimary) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        OutlinedButton(
+                                            onClick = { onSwitchProfile(itemProfile.profileId) },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("switch_profile_${itemProfile.profileId}")
+                                        ) {
+                                            Icon(Icons.Default.SwapHoriz, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Переключиться", style = MaterialTheme.typography.labelMedium)
+                                        }
+                                        Button(
+                                            onClick = { onOpenChatWithProfile(itemProfile) },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .testTag("chat_with_profile_${itemProfile.profileId}")
+                                        ) {
+                                            Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Написать P2P", style = MaterialTheme.typography.labelMedium)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Persistent Yggdrasil Foreground Service Card
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                Icons.Default.NotificationsActive,
+                                contentDescription = null,
+                                tint = if (uiState.isBackgroundServiceEnabled) EmeraldPrimary else AmberShieldTertiary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = "Фоновый сервис узла Yggdrasil",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = if (uiState.isBackgroundServiceEnabled) {
+                                        "Постоянное уведомление активно • Сокеты ${uiState.activePortsSummary}"
+                                    } else {
+                                        "Фоновое удержание соединения отключено"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (uiState.isBackgroundServiceEnabled) EmeraldPrimary else AmberShieldTertiary
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = uiState.isBackgroundServiceEnabled,
+                            onCheckedChange = { enabled ->
+                                if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    val hasPerm = ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.POST_NOTIFICATIONS
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                    if (!hasPerm) {
+                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                        return@Switch
+                                    }
+                                }
+                                onToggleBackgroundService(enabled)
+                            },
+                            modifier = Modifier.testTag("toggle_foreground_service_switch")
+                        )
+                    }
+
+                    Text(
+                        text = "Удерживает подключение к пирам Yggdrasil (200::/7) и фоновые P2P-сокеты всех активных профилей при сворачивании приложения. В шторке уведомлений доступны статус узлов, пинг и кнопка мгновенной остановки.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Активных профилей: ${foregroundServiceState.activeProfilesCount} • Пиров: ${foregroundServiceState.connectedPeersCount}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CyberTealSecondary
+                            )
+                            Text(
+                                text = "Порты: ${uiState.activePortsSummary}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = EmeraldPrimary
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Flexible Privacy Settings Matrix
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -363,7 +719,7 @@ fun ProfilePrivacyScreen(
             }
         }
 
-        // 3. Open-Source Architecture & Cryptographic Audit Card
+        // 5. Open-Source Architecture & Cryptographic Audit Card
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -409,6 +765,17 @@ fun ProfilePrivacyScreen(
         )
     }
 
+    if (showCreateProfileDialog) {
+        CreateNewDecentralizedProfileModal(
+            nextIndex = userProfiles.size + 1,
+            onDismiss = { showCreateProfileDialog = false },
+            onCreate = { name, handle, bio, runInBg, switchNow ->
+                onCreateNewProfile(name, handle, bio, runInBg, switchNow)
+                showCreateProfileDialog = false
+            }
+        )
+    }
+
     if (showQrIdentityDialog) {
         QrContactModal(
             uiState = uiState,
@@ -449,6 +816,130 @@ private fun PrivacyToggleItem(
             modifier = Modifier.testTag(tag)
         )
     }
+}
+
+@Composable
+private fun CreateNewDecentralizedProfileModal(
+    nextIndex: Int,
+    onDismiss: () -> Unit,
+    onCreate: (
+        displayName: String,
+        handle: String,
+        bio: String,
+        runSimultaneouslyInBackground: Boolean,
+        switchImmediately: Boolean
+    ) -> Unit
+) {
+    var name by rememberSaveable { mutableStateOf("Узел YggGram #$nextIndex") }
+    var handle by rememberSaveable { mutableStateOf("@node$nextIndex.ygg") }
+    var bio by rememberSaveable {
+        mutableStateOf("Независимый крипто-профиль #$nextIndex в сети Yggdrasil • Прямой P2P")
+    }
+    var runInBackground by rememberSaveable { mutableStateOf(true) }
+    var switchImmediately by rememberSaveable { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                "Сгенерировать новый профиль Yggdrasil",
+                style = MaterialTheme.typography.titleLarge
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "Будет сгенерирована новая 12-словная мнемоника BIP-39, независимый IPv6-адрес 200::/7 и отдельный фоновый порт P2P.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Имя нового профиля") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("new_profile_name_input")
+                )
+                OutlinedTextField(
+                    value = handle,
+                    onValueChange = { handle = it },
+                    label = { Text("Идентификатор (@handle.ygg)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("new_profile_handle_input")
+                )
+                OutlinedTextField(
+                    value = bio,
+                    onValueChange = { bio = it },
+                    label = { Text("Описание профиля") },
+                    maxLines = 2,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(
+                            text = "Одновременная работа в фоне",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                        Text(
+                            text = "Держать TCP-сокет этого профиля активным параллельно с основным профилем",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = runInBackground,
+                        onCheckedChange = { runInBackground = it },
+                        modifier = Modifier.testTag("new_profile_bg_switch")
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(
+                            text = "Сразу переключиться на этот профиль",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                        Text(
+                            text = "Сделать созданный профиль текущим на экране",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = switchImmediately,
+                        onCheckedChange = { switchImmediately = it },
+                        modifier = Modifier.testTag("new_profile_switch_now")
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCreate(name, handle, bio, runInBackground, switchImmediately) },
+                modifier = Modifier.testTag("confirm_create_profile_button")
+            ) {
+                Text("Сгенерировать ключи и создать")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Отмена")
+            }
+        }
+    )
 }
 
 @Composable
@@ -513,44 +1004,6 @@ private fun EditDecentralizedProfileModal(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("Отмена")
-            }
-        }
-    )
-}
-
-@Composable
-private fun DecentralizedIdentityUriModal(
-    uiState: YggGramUiState,
-    onDismiss: () -> Unit
-) {
-    val uri = "ygggram://${uiState.identity.yggIpv6Address}?pub=${uiState.identity.yggNodePublicKeyHex.take(32)}&spk=${uiState.identity.x25519SignedPreKeyHex.take(24)}"
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Децентрализованная визитка YggGram", style = MaterialTheme.typography.titleLarge) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    "Передайте этот URI собеседнику для прямого P2P-соединения в сети Yggdrasil без центральных серверов:",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceContainerLowest,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = uri,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = EmeraldPrimary,
-                        modifier = Modifier.padding(12.dp)
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Button(onClick = onDismiss) {
-                Text("Готово")
             }
         }
     )

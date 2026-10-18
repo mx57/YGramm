@@ -1,14 +1,20 @@
 // File: app/src/main/java/com/example/data/YggRepository.kt
 package com.example.data
 
+import android.content.Context
 import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.IncomingTwinPacket
+import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggCryptoEngine
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 
-class YggRepository(private val dao: YggDao) {
+class YggRepository(
+    private val dao: YggDao,
+    private val appContext: Context? = null
+) {
 
+    val userProfiles: Flow<List<UserProfileEntity>> = dao.observeUserProfiles()
     val conversations: Flow<List<ConversationEntity>> = dao.observeConversations()
     val allMessages: Flow<List<MessageEntity>> = dao.observeAllMessages()
     val fileTransfers: Flow<List<P2PFileTransferEntity>> = dao.observeFileTransfers()
@@ -21,14 +27,39 @@ class YggRepository(private val dao: YggDao) {
         dao.observeMessagesForChat(chatId)
 
     /**
-     * Initializes ONLY the user's real SLIP-0010 cryptographic key hierarchy and default
-     * public Yggdrasil peer entry points (marked as disconnected until probed over the real network).
-     * NEVER seeds fake conversations, fake messages, fake file transfers, or fake linked devices.
+     * Initializes the primary SLIP-0010 cryptographic profile, key hierarchy, and default
+     * public Yggdrasil peer entry points.
      */
-    suspend fun ensureInitialized(identity: DerivedIdentityHierarchy) {
+    suspend fun ensureInitialized(defaultIdentity: DerivedIdentityHierarchy): UserProfileEntity {
         val now = System.currentTimeMillis()
+        val existingProfiles = dao.getAllProfilesNow()
+        val primaryProfile = if (existingProfiles.isEmpty()) {
+            val created = UserProfileEntity(
+                profileId = DEFAULT_PROFILE_ID,
+                displayName = "Узел YggGram #1",
+                handle = "@node1.ygg",
+                bio = "Основной децентрализованный профиль в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
+                statusText = "В оверлее 200::/7 (Порт :51921)",
+                mnemonicCsv = defaultIdentity.mnemonicWords.joinToString(" "),
+                yggIpv6Address = defaultIdentity.yggIpv6Address,
+                yggPublicKeyHex = defaultIdentity.yggNodePublicKeyHex,
+                allocatedTcpPort = 51921,
+                isActiveInBackground = true,
+                isCurrentPrimary = true,
+                avatarColorHex = "#10B981",
+                createdAt = now
+            )
+            dao.upsertProfile(created)
+            created
+        } else {
+            existingProfiles.find { it.isCurrentPrimary } ?: existingProfiles.first()
+        }
+
         if (dao.getCryptoKeysNow().isEmpty()) {
-            val initialKeys = buildHierarchyKeyRecords(identity, epoch = 1, now = now)
+            val words = primaryProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+                .ifEmpty { defaultIdentity.mnemonicWords }
+            val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(words, epoch = 1)
+            val initialKeys = buildHierarchyKeyRecords(hierarchy, epoch = 1, now = now)
             dao.insertCryptoKeys(initialKeys)
         }
 
@@ -107,20 +138,157 @@ class YggRepository(private val dao: YggDao) {
             )
             dao.insertPeers(defaultPublicPeers)
         }
+        return primaryProfile
+    }
+
+    suspend fun getAllProfilesNow(): List<UserProfileEntity> = dao.getAllProfilesNow()
+
+    suspend fun createNewUserProfile(
+        displayName: String,
+        handle: String,
+        bio: String,
+        runSimultaneouslyInBackground: Boolean,
+        switchImmediately: Boolean
+    ): Pair<UserProfileEntity, DerivedIdentityHierarchy> {
+        val now = System.currentTimeMillis()
+        val existing = dao.getAllProfilesNow()
+        val index = existing.size + 1
+        val usedPorts = existing.map { it.allocatedTcpPort }.toSet()
+        val nextPort = (51921..51939).firstOrNull { it !in usedPorts } ?: (51920 + index)
+
+        val freshMnemonic = YggCryptoEngine.generateFreshMnemonic12()
+        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(freshMnemonic, epoch = 1)
+        val palette = listOf("#10B981", "#06B6D4", "#F59E0B", "#8B5CF6", "#EC4899")
+        val avatarHex = palette[(index - 1) % palette.size]
+
+        val cleanName = displayName.trim().ifBlank { "Узел YggGram #$index" }
+        val cleanHandle = handle.trim().ifBlank { "@node$index.ygg" }.let {
+            if (it.startsWith("@")) it else "@$it"
+        }
+        val cleanBio = bio.trim().ifBlank {
+            "Независимый крипто-профиль #$index в сети Yggdrasil • P2P порт :$nextPort"
+        }
+
+        val newProfileId = "profile_${UUID.randomUUID().toString().take(8)}"
+        val newEntity = UserProfileEntity(
+            profileId = newProfileId,
+            displayName = cleanName,
+            handle = cleanHandle,
+            bio = cleanBio,
+            statusText = if (runSimultaneouslyInBackground) {
+                "Активен параллельно в фоне (Порт :$nextPort)"
+            } else {
+                "Готов к переключению (Порт :$nextPort)"
+            },
+            mnemonicCsv = freshMnemonic.joinToString(" "),
+            yggIpv6Address = hierarchy.yggIpv6Address,
+            yggPublicKeyHex = hierarchy.yggNodePublicKeyHex,
+            allocatedTcpPort = nextPort,
+            isActiveInBackground = runSimultaneouslyInBackground,
+            isCurrentPrimary = switchImmediately,
+            avatarColorHex = avatarHex,
+            createdAt = now
+        )
+
+        if (switchImmediately) {
+            val demoted = existing.map { it.copy(isCurrentPrimary = false) }
+            dao.insertProfiles(demoted + newEntity)
+            rotateKeysForEpoch(hierarchy, 1)
+        } else {
+            dao.upsertProfile(newEntity)
+        }
+
+        return newEntity to hierarchy
+    }
+
+    suspend fun switchPrimaryUserProfile(profileId: String): Pair<UserProfileEntity, DerivedIdentityHierarchy>? {
+        val all = dao.getAllProfilesNow()
+        val target = all.find { it.profileId == profileId } ?: return null
+        val updatedList = all.map {
+            it.copy(
+                isCurrentPrimary = it.profileId == profileId,
+                // Keep previously active profiles active if configured, and ensure the selected primary is active
+                isActiveInBackground = if (it.profileId == profileId) true else it.isActiveInBackground
+            )
+        }
+        dao.insertProfiles(updatedList)
+        val updatedTarget = updatedList.first { it.profileId == profileId }
+        val words = updatedTarget.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            if (words.size >= 6) words else YggCryptoEngine.generateFreshMnemonic12(),
+            epoch = 1
+        )
+        rotateKeysForEpoch(hierarchy, 1)
+        return updatedTarget to hierarchy
+    }
+
+    suspend fun setProfileBackgroundActive(profileId: String, activeInBackground: Boolean): List<UserProfileEntity> {
+        val all = dao.getAllProfilesNow()
+        val updated = all.map { prof ->
+            if (prof.profileId == profileId) {
+                // Current primary profile always stays active while selected
+                val effectiveActive = if (prof.isCurrentPrimary) true else activeInBackground
+                val status = if (effectiveActive) {
+                    "Активен параллельно в фоне (Порт :${prof.allocatedTcpPort})"
+                } else {
+                    "На паузе в фоне (Порт :${prof.allocatedTcpPort})"
+                }
+                prof.copy(
+                    isActiveInBackground = effectiveActive,
+                    statusText = status
+                )
+            } else prof
+        }
+        dao.insertProfiles(updated)
+        return updated
+    }
+
+    suspend fun updateCurrentProfileMetadata(
+        profileId: String,
+        displayName: String,
+        handle: String,
+        bio: String,
+        statusText: String
+    ): UserProfileEntity? {
+        val existing = dao.getProfileById(profileId) ?: return null
+        val updated = existing.copy(
+            displayName = displayName.trim().ifBlank { existing.displayName },
+            handle = handle.trim().ifBlank { existing.handle },
+            bio = bio.trim(),
+            statusText = statusText.trim().ifBlank { existing.statusText }
+        )
+        dao.upsertProfile(updated)
+        return updated
+    }
+
+    suspend fun deleteSecondaryProfile(profileId: String): List<UserProfileEntity> {
+        val all = dao.getAllProfilesNow()
+        if (all.size <= 1) return all
+        val target = all.find { it.profileId == profileId } ?: return all
+        if (target.isCurrentPrimary) return all
+        dao.deleteProfile(profileId)
+        return dao.getAllProfilesNow()
     }
 
     /**
-     * Creates or retrieves the "Избранное • Мой узел Yggdrasil" self-chat for honest
-     * connectivity testing through external public Yggdrasil peers.
+     * Creates or retrieves the "Избранное • Мой узел Yggdrasil" self-chat for the current profile.
      */
-    suspend fun ensureSelfYggdrasilConversation(identity: DerivedIdentityHierarchy): String {
-        val existing = dao.getConversationById(SELF_NODE_CHAT_ID)
+    suspend fun ensureSelfYggdrasilConversation(
+        identity: DerivedIdentityHierarchy,
+        ownerProfileId: String = DEFAULT_PROFILE_ID
+    ): String {
+        val selfChatId = if (ownerProfileId == DEFAULT_PROFILE_ID) {
+            SELF_NODE_CHAT_ID
+        } else {
+            "${SELF_NODE_CHAT_ID}_$ownerProfileId"
+        }
+        val existing = dao.getConversationById(selfChatId)
         if (existing != null) {
             return existing.chatId
         }
         val now = System.currentTimeMillis()
         val selfConv = ConversationEntity(
-            chatId = SELF_NODE_CHAT_ID,
+            chatId = selfChatId,
             title = "Избранное • Мой узел Yggdrasil",
             yggIpv6Address = identity.yggIpv6Address,
             publicKeyHex = identity.yggNodePublicKeyHex,
@@ -134,7 +302,8 @@ class YggRepository(private val dao: YggDao) {
             isOnlineInMesh = true,
             avatarColorHex = "#10B981",
             bioStatus = "Маршрут строго через внешние публичные пиры Yggdrasil (без локального loopback)",
-            routeTransportSummary = "Yggdrasil External Mesh Relay (0200::/7)"
+            routeTransportSummary = "Yggdrasil External Mesh Relay (0200::/7)",
+            ownerProfileId = ownerProfileId
         )
         dao.upsertConversation(selfConv)
         return selfConv.chatId
@@ -210,6 +379,7 @@ class YggRepository(private val dao: YggDao) {
     suspend fun sendEncryptedMessage(
         chatId: String,
         plainText: String,
+        senderName: String = "Вы",
         senderIpv6: String,
         isOfflineMode: Boolean,
         sealedSenderGlobal: Boolean,
@@ -244,7 +414,7 @@ class YggRepository(private val dao: YggDao) {
         val message = MessageEntity(
             messageId = "msg_${UUID.randomUUID()}",
             chatId = chatId,
-            senderName = "Вы",
+            senderName = senderName,
             senderIpv6 = senderIpv6,
             cipherPayloadHex = cipherHex,
             plainText = plainText,
@@ -331,7 +501,11 @@ class YggRepository(private val dao: YggDao) {
     }
 
     companion object {
+        const val DEFAULT_PROFILE_ID = "profile_primary"
         const val SELF_NODE_CHAT_ID = "chat_self_ygg_node"
+
+        fun isSelfChatId(chatId: String): Boolean =
+            chatId == SELF_NODE_CHAT_ID || chatId.startsWith("${SELF_NODE_CHAT_ID}_")
 
         fun parseReactionsMap(raw: String): Map<String, Pair<Int, Boolean>> {
             if (raw.isBlank()) return emptyMap()
@@ -380,37 +554,88 @@ class YggRepository(private val dao: YggDao) {
         )
     }
 
-    suspend fun recordIncomingTwinMessage(packet: IncomingTwinPacket, activeChatId: String?): String {
-        var conv = if (packet.targetChatId.isNotBlank()) {
-            dao.getConversationById(packet.targetChatId)
-        } else null
+    /**
+     * Records an incoming P2P message (from an external peer, self-echo, or a concurrent local profile),
+     * saves any attached binary file/voice note/image to disk, and routes it to the target profile's conversation list.
+     */
+    suspend fun recordIncomingTwinMessage(
+        packet: IncomingTwinPacket,
+        activeChatId: String?,
+        currentPrimaryProfileId: String = DEFAULT_PROFILE_ID
+    ): String {
+        val allProfiles = dao.getAllProfilesNow()
+        val targetOwnerProfileId = when {
+            packet.recipientProfileId.isNotBlank() -> packet.recipientProfileId
+            packet.recipientIpv6.isNotBlank() -> {
+                allProfiles.find { it.yggIpv6Address.equals(packet.recipientIpv6, ignoreCase = true) }?.profileId
+                    ?: currentPrimaryProfileId
+            }
+            else -> currentPrimaryProfileId
+        }
+
+        val allConvs = dao.getAllConversationsNow()
+        var conv: ConversationEntity? = null
+
+        // If this is a self-echo packet in a self-chat, match the exact targetChatId
+        if (packet.targetChatId.isNotBlank() && isSelfChatId(packet.targetChatId)) {
+            conv = dao.getConversationById(packet.targetChatId)
+        }
+
+        // Otherwise match by (ownerProfileId + senderIpv6) so each profile gets its own dialog with the sender!
+        if (conv == null) {
+            conv = allConvs.find {
+                it.ownerProfileId == targetOwnerProfileId &&
+                    !isSelfChatId(it.chatId) &&
+                    it.yggIpv6Address.equals(packet.senderIpv6, ignoreCase = true)
+            }
+        }
 
         if (conv == null) {
-            val newChatId = "chat_${packet.senderIpv6.hashCode().toUInt()}"
-            val existingByIpv6 = dao.getConversationById(newChatId)
-            if (existingByIpv6 != null) {
-                conv = existingByIpv6
+            val newChatId = "chat_${targetOwnerProfileId}_${packet.senderIpv6.hashCode().toUInt()}"
+            val senderProfile = allProfiles.find { it.yggIpv6Address.equals(packet.senderIpv6, ignoreCase = true) }
+            val endpointHint = if (senderProfile != null) {
+                "127.0.0.1:${senderProfile.allocatedTcpPort}"
             } else {
-                val created = ConversationEntity(
-                    chatId = newChatId,
-                    title = packet.senderNodeLabel.ifBlank { "Пир ${packet.senderIpv6.take(16)}" },
-                    yggIpv6Address = packet.senderIpv6,
-                    publicKeyHex = packet.senderPubKeyHex.ifBlank { YggCryptoEngine.sha256Hex(packet.senderIpv6) },
-                    protocolType = "X3DH_DOUBLE_RATCHET",
-                    isVerified = true,
-                    sealedSenderEnabled = true,
-                    disappearingTtlSeconds = 0,
-                    unreadCount = 0,
-                    lastMessagePreview = packet.plainText,
-                    lastTimestamp = packet.timestamp,
-                    isOnlineInMesh = true,
-                    avatarColorHex = "#10B981",
-                    bioStatus = "Входящий пир Yggdrasil",
-                    routeTransportSummary = "Yggdrasil Mesh (${packet.rttMs} мс)"
-                )
-                dao.upsertConversation(created)
-                conv = created
+                "Входящий пир Yggdrasil"
             }
+            val created = ConversationEntity(
+                chatId = newChatId,
+                title = packet.senderNodeLabel.ifBlank { "Пир ${packet.senderIpv6.take(16)}" },
+                yggIpv6Address = packet.senderIpv6,
+                publicKeyHex = packet.senderPubKeyHex.ifBlank { YggCryptoEngine.sha256Hex(packet.senderIpv6) },
+                protocolType = "X3DH_DOUBLE_RATCHET",
+                isVerified = true,
+                sealedSenderEnabled = true,
+                disappearingTtlSeconds = 0,
+                unreadCount = 0,
+                lastMessagePreview = packet.plainText,
+                lastTimestamp = packet.timestamp,
+                isOnlineInMesh = true,
+                avatarColorHex = senderProfile?.avatarColorHex ?: "#10B981",
+                bioStatus = endpointHint,
+                routeTransportSummary = if (senderProfile != null) {
+                    "Direct P2P (127.0.0.1:${senderProfile.allocatedTcpPort})"
+                } else {
+                    "Yggdrasil Mesh (${packet.rttMs} мс)"
+                },
+                ownerProfileId = targetOwnerProfileId
+            )
+            dao.upsertConversation(created)
+            conv = created
+        }
+
+        val resolvedAttachmentUri = if (appContext != null && (packet.attachmentName != null || packet.attachmentType != null)) {
+            YggAudioMediaEngine.saveIncomingP2PAttachment(
+                context = appContext,
+                attachmentName = packet.attachmentName,
+                attachmentType = packet.attachmentType,
+                attachmentBase64 = packet.attachmentBase64,
+                fallbackUri = packet.attachmentUri,
+                voiceDurationSec = packet.voiceDurationSec,
+                voiceWaveformCsv = packet.voiceWaveformCsv
+            )
+        } else {
+            packet.attachmentUri
         }
 
         val merkleRoot = packet.attachmentName?.let {
@@ -434,20 +659,48 @@ class YggRepository(private val dao: YggDao) {
             merkleRootHex = merkleRoot,
             transferProgress = 1.0f,
             attachmentType = packet.attachmentType,
-            attachmentUri = packet.attachmentUri,
+            attachmentUri = resolvedAttachmentUri,
             voiceDurationSec = packet.voiceDurationSec,
             voiceWaveformCsv = packet.voiceWaveformCsv,
             reactionsJson = ""
         )
         dao.insertMessage(msg)
-        val unreadIncrement = if (activeChatId == conv.chatId) 0 else 1
+
+        if (packet.attachmentName != null && merkleRoot != null && packet.attachmentType != "VOICE") {
+            val (chunks, _) = YggCryptoEngine.computeFastCdcMerkleProfile(packet.attachmentName, packet.attachmentSizeBytes)
+            val rxTransfer = P2PFileTransferEntity(
+                transferId = "tx_rx_${UUID.randomUUID()}",
+                chatId = conv.chatId,
+                peerName = packet.senderNodeLabel,
+                peerIpv6 = packet.senderIpv6,
+                fileName = packet.attachmentName,
+                fileSizeBytes = packet.attachmentSizeBytes,
+                chunkCount = chunks,
+                completedChunks = chunks,
+                merkleRootSha256 = merkleRoot,
+                speedKbps = 1850,
+                status = "VERIFIED_COMPLETE",
+                isOutgoing = false,
+                protocol = "YGG_OVERLAY_STREAM",
+                timestamp = packet.timestamp
+            )
+            dao.upsertFileTransfer(rxTransfer)
+        }
+
+        val isCurrentlyViewing = (targetOwnerProfileId == currentPrimaryProfileId) && (activeChatId == conv.chatId)
+        val previewPrefix = when (packet.attachmentType) {
+            "VOICE" -> "🎤 Голосовое (${packet.voiceDurationSec}с) "
+            "IMAGE" -> "🖼️ Фото (${packet.attachmentName}) "
+            "FILE" -> "📎 Файл (${packet.attachmentName}) "
+            else -> ""
+        }
+        val firstLine = packet.plainText.lineSequence().firstOrNull() ?: packet.plainText
         dao.upsertConversation(
             conv.copy(
-                lastMessagePreview = packet.plainText.lineSequence().firstOrNull() ?: packet.plainText,
+                lastMessagePreview = "$previewPrefix$firstLine".trim(),
                 lastTimestamp = packet.timestamp,
-                unreadCount = if (unreadIncrement == 0) 0 else conv.unreadCount + 1,
-                isOnlineInMesh = true,
-                routeTransportSummary = "Yggdrasil Mesh (${packet.rttMs} мс)"
+                unreadCount = if (isCurrentlyViewing) 0 else conv.unreadCount + 1,
+                isOnlineInMesh = true
             )
         )
         return conv.chatId
@@ -472,11 +725,6 @@ class YggRepository(private val dao: YggDao) {
         dao.deleteConversation(chatId)
     }
 
-    /**
-     * Creates a new real contact or MLS group session without inserting any fake welcome messages.
-     * Also parses `ygggram://` URI links (including `pub=` and `lan=`), Ed25519 hex public keys,
-     * and Yggdrasil IPv6 addresses.
-     */
     suspend fun createNewConversation(
         title: String,
         yggIpv6Input: String,
@@ -484,7 +732,8 @@ class YggRepository(private val dao: YggDao) {
         sealedSender: Boolean,
         disappearingSeconds: Int,
         directEndpointHint: String = "",
-        localIdentity: DerivedIdentityHierarchy? = null
+        localIdentity: DerivedIdentityHierarchy? = null,
+        ownerProfileId: String = DEFAULT_PROFILE_ID
     ): String {
         val now = System.currentTimeMillis()
         val rawInput = yggIpv6Input.trim()
@@ -519,14 +768,32 @@ class YggRepository(private val dao: YggDao) {
             else -> YggCryptoEngine.computeYggdrasilIpv6(extractedPubKey.toByteArray())
         }
 
-        // If user entered their own Yggdrasil IPv6 or Public Key, route it through Yggdrasil External Mesh
         val isSelfNode = localIdentity != null && (
             cleanIpv6.equals(localIdentity.yggIpv6Address, ignoreCase = true) ||
                 extractedPubKey.equals(localIdentity.yggNodePublicKeyHex, ignoreCase = true)
             )
 
         if (isSelfNode && localIdentity != null) {
-            return ensureSelfYggdrasilConversation(localIdentity)
+            return ensureSelfYggdrasilConversation(localIdentity, ownerProfileId)
+        }
+
+        // Reuse existing conversation if this profile already has a chat with cleanIpv6
+        val existingForProfile = dao.getAllConversationsNow().find {
+            it.ownerProfileId == ownerProfileId &&
+                !isSelfChatId(it.chatId) &&
+                it.yggIpv6Address.equals(cleanIpv6, ignoreCase = true)
+        }
+        if (existingForProfile != null) {
+            if (extractedLanHint.isNotBlank()) {
+                dao.upsertConversation(
+                    existingForProfile.copy(
+                        bioStatus = extractedLanHint,
+                        routeTransportSummary = "Direct P2P ($extractedLanHint)",
+                        isOnlineInMesh = true
+                    )
+                )
+            }
+            return existingForProfile.chatId
         }
 
         val endpointSummary = when {
@@ -548,10 +815,11 @@ class YggRepository(private val dao: YggDao) {
             unreadCount = 0,
             lastMessagePreview = "Нет сообщений • Начните диалог",
             lastTimestamp = now,
-            isOnlineInMesh = false,
+            isOnlineInMesh = extractedLanHint.startsWith("127.0.0.1:"),
             avatarColorHex = if (isMlsGroup) "#06B6D4" else "#10B981",
             bioStatus = extractedLanHint.ifBlank { "Контакт в сети Yggdrasil" },
-            routeTransportSummary = endpointSummary
+            routeTransportSummary = endpointSummary,
+            ownerProfileId = ownerProfileId
         )
         dao.upsertConversation(conv)
         return chatId

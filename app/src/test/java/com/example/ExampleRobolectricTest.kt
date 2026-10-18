@@ -205,4 +205,79 @@ class ExampleRobolectricTest {
             senderNode.stop()
         }
     }
+
+    @Test
+    fun `multi profile generation concurrent mode and binary voice media p2p roundtrip work`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao(), app)
+
+        val mnemonic = listOf(
+            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+        )
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(mnemonic, epoch = 1)
+        repo.ensureInitialized(identity)
+
+        // 1. Verify initial profile exists and create a second concurrent profile
+        val (secondProfile, _) = repo.createNewUserProfile(
+            displayName = "Резервный Узел Бета",
+            handle = "@beta_mesh.ygg",
+            bio = "Второй параллельный профиль Yggdrasil",
+            runSimultaneouslyInBackground = true,
+            switchImmediately = false
+        )
+        assertNotNull(secondProfile)
+        assertTrue(secondProfile.yggIpv6Address.startsWith("02"))
+        assertTrue(secondProfile.isActiveInBackground)
+
+        val allProfiles = repo.getAllProfilesNow()
+        assertEquals(2, allProfiles.size)
+
+        // 2. Switch active profile to the new profile and verify active state
+        val switchedPair = repo.switchPrimaryUserProfile(secondProfile.profileId)
+        assertNotNull(switchedPair)
+        assertEquals(secondProfile.profileId, switchedPair?.first?.profileId)
+        assertEquals(true, switchedPair?.first?.isCurrentPrimary)
+
+        // 3. Verify real WAV voice generation and P2P Base64 binary attachment roundtrip
+        val (savedVoiceUri, voiceB64) = com.example.engine.YggAudioMediaEngine.prepareAttachmentForP2P(
+            context = app,
+            attachmentName = "voice_test_note.wav",
+            attachmentType = "VOICE",
+            attachmentUri = null,
+            voiceDurationSec = 3,
+            voiceWaveformCsv = "0.30,0.65,0.85,0.50,0.90"
+        )
+        assertNotNull(savedVoiceUri)
+        assertTrue("Encoded voice WAV Base64 payload must not be empty", voiceB64.isNotBlank())
+
+        val decodedRxUri = com.example.engine.YggAudioMediaEngine.saveIncomingP2PAttachment(
+            context = app,
+            attachmentName = "voice_test_note.wav",
+            attachmentType = "VOICE",
+            attachmentBase64 = voiceB64,
+            fallbackUri = null,
+            voiceDurationSec = 3,
+            voiceWaveformCsv = "0.30,0.65,0.85,0.50,0.90"
+        )
+        assertNotNull("Receiver must decode and save incoming voice WAV file", decodedRxUri)
+
+        // 4. Verify YggNodeForegroundService state updates
+        com.example.service.YggNodeForegroundService.startOrUpdateNodeService(
+            context = app,
+            activeProfilesCount = 2,
+            connectedPeersCount = 4,
+            primaryIpv6 = secondProfile.yggIpv6Address,
+            activePortsSummary = ":43100, :43101",
+            txPackets = 12,
+            rxPackets = 15
+        )
+        val fgState = com.example.service.YggNodeForegroundService.serviceState.value
+        assertEquals(secondProfile.yggIpv6Address, fgState.primaryIpv6)
+        assertEquals(2, fgState.activeProfilesCount)
+        assertEquals(4, fgState.connectedPeersCount)
+    }
 }

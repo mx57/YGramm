@@ -8,6 +8,7 @@ import androidx.room.RoomDatabase
 
 @Database(
     entities = [
+        UserProfileEntity::class,
         ConversationEntity::class,
         MessageEntity::class,
         P2PFileTransferEntity::class,
@@ -16,7 +17,7 @@ import androidx.room.RoomDatabase
         BackupSnapshotEntity::class,
         CryptoKeyRecordEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {

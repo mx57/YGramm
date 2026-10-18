@@ -4,6 +4,23 @@ package com.example.data
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
+@Entity(tableName = "ygg_profiles")
+data class UserProfileEntity(
+    @PrimaryKey val profileId: String,
+    val displayName: String,
+    val handle: String,
+    val bio: String,
+    val statusText: String,
+    val mnemonicCsv: String,
+    val yggIpv6Address: String,
+    val yggPublicKeyHex: String,
+    val allocatedTcpPort: Int,
+    val isActiveInBackground: Boolean,
+    val isCurrentPrimary: Boolean,
+    val avatarColorHex: String,
+    val createdAt: Long
+)
+
 @Entity(tableName = "conversations")
 data class ConversationEntity(
     @PrimaryKey val chatId: String,
@@ -20,7 +37,8 @@ data class ConversationEntity(
     val isOnlineInMesh: Boolean,
     val avatarColorHex: String,
     val bioStatus: String,
-    val routeTransportSummary: String
+    val routeTransportSummary: String,
+    val ownerProfileId: String = "profile_primary"
 )
 
 @Entity(tableName = "messages")

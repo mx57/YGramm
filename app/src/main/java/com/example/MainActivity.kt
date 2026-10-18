@@ -8,6 +8,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -22,18 +23,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -48,6 +53,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,10 +67,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.compose.material.icons.filled.QrCodeScanner
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import com.example.ui.components.NetworkStatusIndicator
 import com.example.ui.components.QrContactModal
 import com.example.ui.components.YggNetworkStatus
@@ -95,6 +99,8 @@ fun YggGramRootApp(
     viewModel: YggGramViewModel = viewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val userProfiles by viewModel.userProfiles.collectAsStateWithLifecycle()
+    val foregroundServiceState by viewModel.foregroundServiceState.collectAsStateWithLifecycle()
     val conversations by viewModel.conversations.collectAsStateWithLifecycle()
     val allMessages by viewModel.allMessages.collectAsStateWithLifecycle()
     val fileTransfers by viewModel.fileTransfers.collectAsStateWithLifecycle()
@@ -105,6 +111,7 @@ fun YggGramRootApp(
     val queuedOfflineCount by viewModel.queuedOfflineMessagesCount.collectAsStateWithLifecycle()
 
     var showGlobalQrModal by rememberSaveable { mutableStateOf(false) }
+    var showProfileQuickMenu by rememberSaveable { mutableStateOf(false) }
 
     if (uiState.activeTab != YggNavTab.CHATS) {
         BackHandler {
@@ -114,6 +121,7 @@ fun YggGramRootApp(
 
     val totalUnread = conversations.sumOf { it.unreadCount }
     val connectedPeers = peers.count { it.isConnected }
+    val activeBgProfilesCount = userProfiles.count { it.isActiveInBackground || it.isCurrentPrimary }.coerceAtLeast(1)
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val useNavigationRail = maxWidth >= 720.dp
@@ -187,7 +195,7 @@ fun YggGramRootApp(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "${uiState.identity.yggIpv6Address.take(18)}...",
+                                        text = "${uiState.userProfile.handle} (${uiState.identity.yggIpv6Address.take(14)}...)",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = CyberTealSecondary,
                                         maxLines = 1,
@@ -198,6 +206,102 @@ fun YggGramRootApp(
                         }
                     },
                     actions = {
+                        // Quick Multi-Profile Switcher Button in TopAppBar
+                        Box {
+                            Surface(
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { showProfileQuickMenu = true }
+                                    .testTag("top_bar_profile_switcher_button")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        Icons.Default.Groups,
+                                        contentDescription = "Профили Yggdrasil",
+                                        tint = CyberTealSecondary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "${userProfiles.size}/$activeBgProfilesCount",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = CyberTealSecondary,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            DropdownMenu(
+                                expanded = showProfileQuickMenu,
+                                onDismissRequest = { showProfileQuickMenu = false }
+                            ) {
+                                userProfiles.forEach { prof ->
+                                    val isCurrent = prof.profileId == uiState.currentProfileId
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text(
+                                                    text = "${prof.displayName} ${if (isCurrent) "• (Активен)" else ""}",
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (isCurrent) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = "${prof.yggIpv6Address.take(18)}... • Порт :${prof.allocatedTcpPort}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        },
+                                        onClick = {
+                                            showProfileQuickMenu = false
+                                            if (!isCurrent) {
+                                                viewModel.switchActiveProfile(prof.profileId)
+                                            }
+                                        }
+                                    )
+                                }
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "+ Создать новый профиль (одновременный P2P)",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = EmeraldPrimary
+                                        )
+                                    },
+                                    onClick = {
+                                        showProfileQuickMenu = false
+                                        viewModel.createNewProfile(
+                                            displayName = "Узел YggGram #${userProfiles.size + 1}",
+                                            handle = "@node${userProfiles.size + 1}.ygg",
+                                            bio = "Параллельный профиль Yggdrasil",
+                                            runSimultaneouslyInBackground = true,
+                                            switchImmediately = false
+                                        )
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Управление профилями и фоновым сервисом...",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = CyberTealSecondary
+                                        )
+                                    },
+                                    onClick = {
+                                        showProfileQuickMenu = false
+                                        viewModel.selectTab(YggNavTab.PROFILE_PRIVACY)
+                                    }
+                                )
+                            }
+                        }
+
                         IconButton(
                             onClick = { showGlobalQrModal = true },
                             modifier = Modifier.testTag("top_bar_qr_button")
@@ -272,7 +376,17 @@ fun YggGramRootApp(
                             selected = uiState.activeTab == YggNavTab.PROFILE_PRIVACY,
                             onClick = { viewModel.selectTab(YggNavTab.PROFILE_PRIVACY) },
                             icon = {
-                                Icon(Icons.Default.Person, contentDescription = "Профиль и Приватность")
+                                BadgedBox(
+                                    badge = {
+                                        if (userProfiles.size > 1) {
+                                            Badge(containerColor = EmeraldPrimary) {
+                                                Text(userProfiles.size.toString(), color = Color(0xFF042217))
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Icon(Icons.Default.Person, contentDescription = "Профиль и Приватность")
+                                }
                             },
                             label = { Text(stringResource(R.string.nav_profile)) },
                             modifier = Modifier.testTag("nav_tab_profile")
@@ -380,6 +494,7 @@ fun YggGramRootApp(
                                 onStartVoiceCall = viewModel::startVoiceCall,
                                 onToggleCallMute = viewModel::toggleCallMute,
                                 onToggleCallSpeaker = viewModel::toggleCallSpeakerphone,
+                                onTriggerCallTestAudioTone = viewModel::triggerCallTestAudioTone,
                                 onEndVoiceCall = viewModel::endVoiceCall,
                                 onAddContactFromQr = viewModel::addContactFromQrPayload,
                                 onCreateNewChat = viewModel::createNewChatOrGroup,
@@ -432,7 +547,15 @@ fun YggGramRootApp(
 
                             YggNavTab.PROFILE_PRIVACY -> ProfilePrivacyScreen(
                                 uiState = uiState,
+                                userProfiles = userProfiles,
+                                foregroundServiceState = foregroundServiceState,
                                 onUpdateProfile = viewModel::updateDecentralizedProfile,
+                                onCreateNewProfile = viewModel::createNewProfile,
+                                onSwitchProfile = viewModel::switchActiveProfile,
+                                onToggleProfileBackgroundActive = viewModel::toggleProfileBackgroundExecution,
+                                onDeleteSecondaryProfile = viewModel::deleteSecondaryProfile,
+                                onOpenChatWithProfile = viewModel::openChatWithSecondaryProfile,
+                                onToggleBackgroundService = viewModel::setBackgroundServiceEnabled,
                                 onUpdatePrivacy = viewModel::updatePrivacySetting,
                                 onAddContactFromQr = { payload ->
                                     viewModel.addContactFromQrPayload(payload)

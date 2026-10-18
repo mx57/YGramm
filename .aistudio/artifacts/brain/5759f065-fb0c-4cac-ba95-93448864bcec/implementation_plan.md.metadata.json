@@ -1,6 +1,6 @@
 {
-  "summary": "План обновления YggGram: QR-сканер и генератор визитки контакта, система реакций в стиле Telegram/WhatsApp, отправка изображений/файлов и голосовых сообщений с волной, VoIP-звонки через Yggdrasil/P2P и исправление верстки интерфейса.",
-  "updatedAt": "2026-10-18T18:59:20.407213924Z",
+  "summary": "Implementation plan for the Yggdrasil background foreground service, real microphone voice message recording and audio playback, full P2P binary media/file transfer, live VoIP audio streaming, and multi-profile management with configurable simultaneous background execution.",
+  "updatedAt": "2026-10-18T20:07:41.792344972Z",
   "requestFeedback": true,
   "userFacing": true
 }

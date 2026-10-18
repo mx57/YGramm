@@ -10,11 +10,32 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface YggDao {
+    @Query("SELECT * FROM ygg_profiles ORDER BY isCurrentPrimary DESC, createdAt ASC")
+    fun observeUserProfiles(): Flow<List<UserProfileEntity>>
+
+    @Query("SELECT * FROM ygg_profiles ORDER BY isCurrentPrimary DESC, createdAt ASC")
+    suspend fun getAllProfilesNow(): List<UserProfileEntity>
+
+    @Query("SELECT * FROM ygg_profiles WHERE profileId = :profileId LIMIT 1")
+    suspend fun getProfileById(profileId: String): UserProfileEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertProfile(profile: UserProfileEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertProfiles(profiles: List<UserProfileEntity>)
+
+    @Query("DELETE FROM ygg_profiles WHERE profileId = :profileId")
+    suspend fun deleteProfile(profileId: String)
+
     @Query("SELECT * FROM conversations ORDER BY lastTimestamp DESC")
     fun observeConversations(): Flow<List<ConversationEntity>>
 
     @Query("SELECT * FROM conversations WHERE chatId = :chatId LIMIT 1")
     suspend fun getConversationById(chatId: String): ConversationEntity?
+
+    @Query("SELECT * FROM conversations")
+    suspend fun getAllConversationsNow(): List<ConversationEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertConversations(conversations: List<ConversationEntity>)

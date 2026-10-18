@@ -26,7 +26,9 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -53,7 +55,8 @@ fun VoiceCallOverlaySheet(
     callState: ActiveVoiceCallState,
     onToggleMute: () -> Unit,
     onToggleSpeaker: () -> Unit,
-    onEndCall: () -> Unit
+    onEndCall: () -> Unit,
+    onTriggerTestAudioTone: () -> Unit = {}
 ) {
     val minutes = callState.durationSeconds / 60
     val seconds = callState.durationSeconds % 60
@@ -66,7 +69,7 @@ fun VoiceCallOverlaySheet(
         Card(
             modifier = Modifier
                 .fillMaxWidth(0.92f)
-                .padding(vertical = 24.dp),
+                .padding(vertical = 20.dp),
             shape = RoundedCornerShape(26.dp),
             colors = CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
@@ -83,9 +86,9 @@ fun VoiceCallOverlaySheet(
                             )
                         )
                     )
-                    .padding(22.dp),
+                    .padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 // Top Security Badge
                 Surface(
@@ -104,7 +107,7 @@ fun VoiceCallOverlaySheet(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "E2EE VoIP • Yggdrasil 0200::/7",
+                            text = "E2EE VoIP PCM/Opus • Yggdrasil 0200::/7",
                             style = MaterialTheme.typography.labelMedium,
                             color = EmeraldPrimary
                         )
@@ -114,7 +117,7 @@ fun VoiceCallOverlaySheet(
                 // Avatar Circle
                 Box(
                     modifier = Modifier
-                        .size(86.dp)
+                        .size(80.dp)
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.primaryContainer)
                         .border(2.dp, EmeraldPrimary, CircleShape),
@@ -151,7 +154,7 @@ fun VoiceCallOverlaySheet(
                     text = when (callState.callStatus) {
                         "ACTIVE_ENCRYPTED" -> durationFormatted
                         "OFFLINE_ERROR" -> "Ошибка маршрута"
-                        else -> "Соединение..."
+                        else -> "Гудок вызова..."
                     },
                     style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Monospace),
                     color = if (callState.callStatus == "OFFLINE_ERROR") AmberShieldTertiary else EmeraldPrimary,
@@ -164,30 +167,29 @@ fun VoiceCallOverlaySheet(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                // Telegram-style SAS 4-Emoji Key Verification Box
+                // Live Microphone & Audio Stream Level Meter + Test Audio Tone Button
                 Surface(
-                    color = MaterialTheme.colorScheme.surfaceContainerLowest.copy(alpha = 0.85f),
+                    color = MaterialTheme.colorScheme.surfaceContainerLowest.copy(alpha = 0.88f),
                     shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(
                         modifier = Modifier.padding(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "Ключ сверки шифрования звонка (если 4 эмодзи совпадают у собеседника — канал защищен):",
+                            text = "Ключ сверки шифрования звонка (SAS 4 эмодзи):",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
                         Text(
                             text = callState.verificationEmojis,
                             style = MaterialTheme.typography.headlineSmall
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Icon(
                                 Icons.Default.GraphicEq,
@@ -196,15 +198,67 @@ fun VoiceCallOverlaySheet(
                                 modifier = Modifier.size(16.dp)
                             )
                             Text(
-                                text = "Opus ${callState.audioBitrateKbps} kbps • Кадры TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}",
+                                text = "PCM/Opus ${callState.audioBitrateKbps} kbps • Кадры TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}",
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                                 color = CyberTealSecondary
+                            )
+                        }
+
+                        // Live microphone / audio level indicator
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = if (callState.isMuted) "Микрофон отключен" else "Уровень микрофона / аудиоканала",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (callState.isMuted) AmberShieldTertiary else EmeraldPrimary
+                                )
+                                Text(
+                                    text = "${(callState.micAmplitudeLevel * 100).toInt()}%",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = CyberTealSecondary
+                                )
+                            }
+                            LinearProgressIndicator(
+                                progress = {
+                                    if (callState.isMuted) 0.02f else callState.micAmplitudeLevel.coerceIn(0.05f, 1.0f)
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp)),
+                                color = if (callState.isMuted) AmberShieldTertiary else EmeraldPrimary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = onTriggerTestAudioTone,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("call_test_audio_tone_button")
+                        ) {
+                            Icon(
+                                Icons.Default.VolumeUp,
+                                contentDescription = null,
+                                tint = EmeraldPrimary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Проверить звук в динамике (Тест аудиоканала)",
+                                style = MaterialTheme.typography.labelMedium
                             )
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(4.dp))
 
                 // Call Controls Row (Mute, End Call, Speaker)
                 Row(
