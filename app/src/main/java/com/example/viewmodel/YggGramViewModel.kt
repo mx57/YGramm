@@ -243,7 +243,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun startNetworkConnectivityObserver() {
-        val connectivityManager = application.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+        val connectivityManager = getApplication<Application>().getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
         if (connectivityManager != null) {
             val request = android.net.NetworkRequest.Builder()
                 .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
