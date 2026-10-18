@@ -148,7 +148,8 @@ class YggRepository(
         handle: String,
         bio: String,
         runSimultaneouslyInBackground: Boolean,
-        switchImmediately: Boolean
+        switchImmediately: Boolean,
+        nodeRelayRole: String = "PEER_RELAY"
     ): Pair<UserProfileEntity, DerivedIdentityHierarchy> {
         val now = System.currentTimeMillis()
         val existing = dao.getAllProfilesNow()
@@ -169,6 +170,12 @@ class YggRepository(
             "Независимый крипто-профиль #$index в сети Yggdrasil • P2P порт :$nextPort"
         }
 
+        val roleLabel = when (nodeRelayRole) {
+            "CLIENT_ONLY" -> "Только клиент"
+            "SF_BLIND_RELAY" -> "S&F Ретранслятор"
+            else -> "Пир-узел"
+        }
+
         val newProfileId = "profile_${UUID.randomUUID().toString().take(8)}"
         val newEntity = UserProfileEntity(
             profileId = newProfileId,
@@ -176,9 +183,9 @@ class YggRepository(
             handle = cleanHandle,
             bio = cleanBio,
             statusText = if (runSimultaneouslyInBackground) {
-                "Активен параллельно в фоне (Порт :$nextPort)"
+                "$roleLabel • В фоне (:$nextPort)"
             } else {
-                "Готов к переключению (Порт :$nextPort)"
+                "$roleLabel • Готов (:$nextPort)"
             },
             mnemonicCsv = freshMnemonic.joinToString(" "),
             yggIpv6Address = hierarchy.yggIpv6Address,
@@ -187,7 +194,9 @@ class YggRepository(
             isActiveInBackground = runSimultaneouslyInBackground,
             isCurrentPrimary = switchImmediately,
             avatarColorHex = avatarHex,
-            createdAt = now
+            createdAt = now,
+            nodeRelayRole = nodeRelayRole,
+            relayedPacketsCount = 0
         )
 
         if (switchImmediately) {
@@ -228,10 +237,15 @@ class YggRepository(
             if (prof.profileId == profileId) {
                 // Current primary profile always stays active while selected
                 val effectiveActive = if (prof.isCurrentPrimary) true else activeInBackground
+                val roleLabel = when (prof.nodeRelayRole) {
+                    "CLIENT_ONLY" -> "Только клиент"
+                    "SF_BLIND_RELAY" -> "S&F Ретранслятор"
+                    else -> "Пир-узел"
+                }
                 val status = if (effectiveActive) {
-                    "Активен параллельно в фоне (Порт :${prof.allocatedTcpPort})"
+                    "$roleLabel • В фоне (:${prof.allocatedTcpPort})"
                 } else {
-                    "На паузе в фоне (Порт :${prof.allocatedTcpPort})"
+                    "$roleLabel • На паузе (:${prof.allocatedTcpPort})"
                 }
                 prof.copy(
                     isActiveInBackground = effectiveActive,
@@ -241,6 +255,35 @@ class YggRepository(
         }
         dao.insertProfiles(updated)
         return updated
+    }
+
+    suspend fun setProfileNodeRelayRole(profileId: String, nodeRelayRole: String): List<UserProfileEntity> {
+        val all = dao.getAllProfilesNow()
+        val updated = all.map { prof ->
+            if (prof.profileId == profileId) {
+                val roleLabel = when (nodeRelayRole) {
+                    "CLIENT_ONLY" -> "Только клиент"
+                    "SF_BLIND_RELAY" -> "S&F Ретранслятор"
+                    else -> "Пир-узел"
+                }
+                val status = if (prof.isActiveInBackground || prof.isCurrentPrimary) {
+                    "$roleLabel • В фоне (:${prof.allocatedTcpPort})"
+                } else {
+                    "$roleLabel • На паузе (:${prof.allocatedTcpPort})"
+                }
+                prof.copy(
+                    nodeRelayRole = nodeRelayRole,
+                    statusText = status
+                )
+            } else prof
+        }
+        dao.insertProfiles(updated)
+        return updated
+    }
+
+    suspend fun incrementProfileRelayedPackets(profileId: String, delta: Int = 1) {
+        val existing = dao.getProfileById(profileId) ?: return
+        dao.upsertProfile(existing.copy(relayedPacketsCount = existing.relayedPacketsCount + delta))
     }
 
     suspend fun updateCurrentProfileMetadata(

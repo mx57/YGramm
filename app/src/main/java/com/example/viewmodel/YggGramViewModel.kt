@@ -30,8 +30,13 @@ import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
+import com.example.service.YggAlertCategory
 import com.example.service.YggForegroundServiceState
 import com.example.service.YggNodeForegroundService
+import com.example.service.YggNotificationCenter
+import com.example.service.YggPopupNotificationItem
+import com.example.ui.components.PendingProfileSwitchRequest
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -116,6 +121,8 @@ data class DecentralizedUserProfile(
     val statusText: String = "В оверлее 200::/7 (Порт :51921)",
     val allocatedTcpPort: Int = 51921,
     val isActiveInBackground: Boolean = true,
+    val nodeRelayRole: String = "PEER_RELAY",
+    val relayedPacketsCount: Int = 0,
     val profileSignatureHex: String = "ed25519_sig:9f41a08c273b6501e849201c73d6a9021f384e55b601a29c"
 )
 
@@ -176,6 +183,9 @@ data class YggGramUiState(
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
     val privacyMatrix: PrivacyMatrixState = PrivacyMatrixState(),
     val activeVoiceCall: ActiveVoiceCallState? = null,
+    val activePopupNotification: YggPopupNotificationItem? = null,
+    val pendingProfileSwitchRequest: PendingProfileSwitchRequest? = null,
+    val recentNotificationsHistory: List<YggPopupNotificationItem> = emptyList(),
     val statusBannerMessage: String? = null
 )
 
@@ -207,20 +217,44 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         onPacketReceived = { packet ->
             viewModelScope.launch {
                 val currentPrimaryId = _uiState.value.currentProfileId
+                val allProfs = repository.getAllProfilesNow()
+                val targetProfile = allProfs.find {
+                    it.profileId == packet.recipientProfileId ||
+                        it.yggIpv6Address.equals(packet.recipientIpv6, ignoreCase = true)
+                } ?: allProfs.find { it.profileId == currentPrimaryId } ?: allProfs.firstOrNull()
+
                 val chatId = repository.recordIncomingTwinMessage(
                     packet = packet,
                     activeChatId = _uiState.value.selectedChatId,
                     currentPrimaryProfileId = currentPrimaryId
                 )
-                val targetProfileName = userProfiles.value.find {
-                    it.profileId == packet.recipientProfileId ||
-                        it.yggIpv6Address.equals(packet.recipientIpv6, ignoreCase = true)
-                }?.displayName
 
-                val profileSuffix = if (targetProfileName != null && packet.recipientProfileId.isNotBlank() && packet.recipientProfileId != currentPrimaryId) {
-                    " [для профиля «$targetProfileName»]"
+                val targetProfileName = targetProfile?.displayName
+                val profileSuffix = if (targetProfile != null && targetProfile.profileId != currentPrimaryId) {
+                    " [для профиля «${targetProfile.displayName}»]"
                 } else {
                     ""
+                }
+
+                // Dispatch Popup & Android System Notification if the recipient profile is enabled in settings
+                if (targetProfile != null && (targetProfile.isActiveInBackground || targetProfile.isCurrentPrimary)) {
+                    val isVoice = packet.attachmentType == "VOICE"
+                    val category = if (isVoice) YggAlertCategory.NEW_VOICE else YggAlertCategory.NEW_MESSAGE
+                    val previewText = when (packet.attachmentType) {
+                        "VOICE" -> "🎙️ Голосовое сообщение (${packet.voiceDurationSec.coerceAtLeast(1)} сек) • PCM/Opus AEAD"
+                        "IMAGE" -> "🖼️ Фотография: ${packet.attachmentName ?: "image.png"} — ${packet.plainText}"
+                        "FILE" -> "📎 P2P Файл: ${packet.attachmentName ?: "file.bin"} — ${packet.plainText}"
+                        else -> packet.plainText
+                    }
+                    emitPopupAndSystemNotification(
+                        category = category,
+                        targetProfile = targetProfile,
+                        chatId = chatId,
+                        senderName = packet.senderNodeLabel,
+                        senderIpv6 = packet.senderIpv6,
+                        messagePreview = previewText,
+                        voiceDurationSec = packet.voiceDurationSec
+                    )
                 }
 
                 _uiState.update {
@@ -232,7 +266,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         } else {
                             it.selectedChatId
                         },
-                        statusBannerMessage = "Получен пакет Yggdrasil от «${packet.senderNodeLabel}»$profileSuffix (${packet.rttMs} мс)"
+                        statusBannerMessage = "Получен пакет Yggdrasil от «$targetProfileName <- ${packet.senderNodeLabel}»$profileSuffix (${packet.rttMs} мс)"
                     )
                 }
                 syncForegroundServiceNotification()
@@ -279,6 +313,52 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     emoji = reaction.emoji,
                     byMe = false
                 )
+            }
+        },
+        onIncomingCallSignalReceived = { callSig ->
+            viewModelScope.launch {
+                val allProfs = repository.getAllProfilesNow()
+                val targetProfile = allProfs.find {
+                    it.profileId == callSig.recipientProfileId ||
+                        it.yggIpv6Address.equals(callSig.recipientIpv6, ignoreCase = true)
+                } ?: allProfs.find { it.isCurrentPrimary } ?: allProfs.firstOrNull() ?: return@launch
+
+                if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) {
+                    return@launch
+                }
+
+                // Ensure a conversation exists for the caller in that target profile
+                val targetConvId = if (callSig.chatId.isNotBlank() && repository.getConversation(callSig.chatId)?.ownerProfileId == targetProfile.profileId) {
+                    callSig.chatId
+                } else {
+                    repository.createNewConversation(
+                        title = callSig.callerName.ifBlank { "Узел Yggdrasil" },
+                        yggIpv6Input = callSig.callerIpv6.ifBlank { "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8" },
+                        isMlsGroup = false,
+                        sealedSender = true,
+                        disappearingSeconds = 0,
+                        ownerProfileId = targetProfile.profileId
+                    )
+                }
+
+                val isMissed = callSig.signalAction == "MISSED"
+                emitPopupAndSystemNotification(
+                    category = if (isMissed) YggAlertCategory.MISSED_CALL else YggAlertCategory.INCOMING_CALL,
+                    targetProfile = targetProfile,
+                    chatId = targetConvId,
+                    senderName = callSig.callerName.ifBlank { "Узел Yggdrasil" },
+                    senderIpv6 = callSig.callerIpv6.ifBlank { "0201::mesh" },
+                    messagePreview = if (isMissed) {
+                        "Пропущенный зашифрованный аудиозвонок Yggdrasil 0200::/7"
+                    } else {
+                        "Входящий зашифрованный голосовой вызов (Opus/PCM XChaCha20-Poly1305)"
+                    }
+                )
+            }
+        },
+        onProfileRelayPacketHandled = { profileId, _ ->
+            viewModelScope.launch {
+                repository.incrementProfileRelayedPackets(profileId, 1)
             }
         }
     )
@@ -373,9 +453,161 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     statusText = profileEntity.statusText,
                     allocatedTcpPort = profileEntity.allocatedTcpPort,
                     isActiveInBackground = profileEntity.isActiveInBackground,
+                    nodeRelayRole = profileEntity.nodeRelayRole,
+                    relayedPacketsCount = profileEntity.relayedPacketsCount,
                     profileSignatureHex = "ed25519_sig:${sigHash.take(44)}"
                 )
             )
+        }
+    }
+
+    private fun emitPopupAndSystemNotification(
+        category: YggAlertCategory,
+        targetProfile: UserProfileEntity,
+        chatId: String,
+        senderName: String,
+        senderIpv6: String,
+        messagePreview: String,
+        voiceDurationSec: Int = 0
+    ) {
+        val app = getApplication<Application>()
+        val item = YggPopupNotificationItem(
+            notificationId = "notif_${UUID.randomUUID().toString().take(8)}",
+            category = category,
+            targetProfileId = targetProfile.profileId,
+            targetProfileName = targetProfile.displayName,
+            targetProfileIpv6 = targetProfile.yggIpv6Address,
+            targetProfileColorHex = targetProfile.avatarColorHex,
+            targetProfileRelayRole = targetProfile.nodeRelayRole,
+            chatId = chatId,
+            senderName = senderName,
+            senderIpv6 = senderIpv6,
+            messagePreview = messagePreview,
+            voiceDurationSec = voiceDurationSec,
+            timestamp = System.currentTimeMillis()
+        )
+        _uiState.update { state ->
+            state.copy(
+                activePopupNotification = item,
+                recentNotificationsHistory = (listOf(item) + state.recentNotificationsHistory).take(25)
+            )
+        }
+        YggNotificationCenter.postSystemHeadsUpNotification(app, item)
+    }
+
+    fun dismissPopupNotification() {
+        _uiState.update { it.copy(activePopupNotification = null) }
+    }
+
+    fun handlePopupNotificationAction(item: YggPopupNotificationItem, actionType: String) {
+        val currentId = _uiState.value.currentProfileId
+        if (item.targetProfileId.isNotBlank() && item.targetProfileId != currentId) {
+            // Target notification belongs to a background profile -> ask user confirmation before switching!
+            _uiState.update {
+                it.copy(
+                    pendingProfileSwitchRequest = PendingProfileSwitchRequest(
+                        notification = item,
+                        actionType = actionType
+                    )
+                )
+            }
+        } else {
+            _uiState.update { it.copy(activePopupNotification = null) }
+            executeNotificationTargetAction(item, actionType)
+        }
+    }
+
+    fun confirmProfileSwitchFromNotification(request: PendingProfileSwitchRequest) {
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    pendingProfileSwitchRequest = null,
+                    activePopupNotification = null
+                )
+            }
+            val pair = repository.switchPrimaryUserProfile(request.notification.targetProfileId)
+            if (pair != null) {
+                val (targetProfile, _) = pair
+                val allProfs = repository.getAllProfilesNow()
+                networkEngine.syncConcurrentProfileListeners(allProfs)
+                applyUserProfileEntityToState(targetProfile)
+                syncForegroundServiceNotification()
+            }
+            executeNotificationTargetAction(request.notification, request.actionType)
+        }
+    }
+
+    fun cancelProfileSwitchFromNotification() {
+        _uiState.update { it.copy(pendingProfileSwitchRequest = null) }
+    }
+
+    fun declineIncomingCallNotification(item: YggPopupNotificationItem) {
+        viewModelScope.launch {
+            val allProfs = repository.getAllProfilesNow()
+            val targetProf = allProfs.find { it.profileId == item.targetProfileId } ?: return@launch
+            emitPopupAndSystemNotification(
+                category = YggAlertCategory.MISSED_CALL,
+                targetProfile = targetProf,
+                chatId = item.chatId,
+                senderName = item.senderName,
+                senderIpv6 = item.senderIpv6,
+                messagePreview = "Пропущенный вызов от «${item.senderName}» (отклонен)"
+            )
+        }
+    }
+
+    private fun executeNotificationTargetAction(item: YggPopupNotificationItem, actionType: String) {
+        viewModelScope.launch {
+            if (item.chatId.isNotBlank()) {
+                repository.markConversationRead(item.chatId)
+            }
+            _uiState.update {
+                it.copy(
+                    activeTab = YggNavTab.CHATS,
+                    selectedChatId = item.chatId.ifBlank { it.selectedChatId }
+                )
+            }
+            if (actionType == "ANSWER_CALL" || actionType == "CALLBACK_MISSED") {
+                kotlinx.coroutines.delay(120L)
+                if (item.chatId.isNotBlank()) {
+                    startVoiceCall(item.chatId)
+                }
+            }
+        }
+    }
+
+    fun handleSystemNotificationIntent(
+        targetProfileId: String,
+        chatId: String,
+        categoryName: String
+    ) {
+        if (targetProfileId.isBlank() && chatId.isBlank()) return
+        viewModelScope.launch {
+            val allProfs = repository.getAllProfilesNow()
+            val targetProf = allProfs.find { it.profileId == targetProfileId }
+                ?: allProfs.find { it.profileId == _uiState.value.currentProfileId }
+                ?: return@launch
+            val conv = if (chatId.isNotBlank()) repository.getConversation(chatId) else null
+            val cat = runCatching { YggAlertCategory.valueOf(categoryName) }.getOrDefault(YggAlertCategory.NEW_MESSAGE)
+            val syntheticItem = YggPopupNotificationItem(
+                notificationId = "sys_intent_${System.currentTimeMillis()}",
+                category = cat,
+                targetProfileId = targetProf.profileId,
+                targetProfileName = targetProf.displayName,
+                targetProfileIpv6 = targetProf.yggIpv6Address,
+                targetProfileColorHex = targetProf.avatarColorHex,
+                targetProfileRelayRole = targetProf.nodeRelayRole,
+                chatId = chatId,
+                senderName = conv?.title ?: "Узел Yggdrasil",
+                senderIpv6 = conv?.yggIpv6Address ?: "0200::/7",
+                messagePreview = conv?.lastMessagePreview ?: "Открытие события из системного уведомления Android"
+            )
+            val actionType = when (cat) {
+                YggAlertCategory.INCOMING_CALL -> "ANSWER_CALL"
+                YggAlertCategory.MISSED_CALL -> "CALLBACK_MISSED"
+                else -> "OPEN_CHAT"
+            }
+            handlePopupNotificationAction(syntheticItem, actionType)
         }
     }
 
@@ -425,7 +657,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         handle: String,
         bio: String,
         runSimultaneouslyInBackground: Boolean,
-        switchImmediately: Boolean
+        switchImmediately: Boolean,
+        nodeRelayRole: String = "PEER_RELAY"
     ) {
         viewModelScope.launch {
             val (created, _) = repository.createNewUserProfile(
@@ -433,7 +666,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 handle = handle,
                 bio = bio,
                 runSimultaneouslyInBackground = runSimultaneouslyInBackground,
-                switchImmediately = switchImmediately
+                switchImmediately = switchImmediately,
+                nodeRelayRole = nodeRelayRole
             )
             val allProfs = repository.getAllProfilesNow()
             networkEngine.syncConcurrentProfileListeners(allProfs)
@@ -454,6 +688,86 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             syncForegroundServiceNotification()
+        }
+    }
+
+    fun setProfileNodeRelayRole(profileId: String, nodeRelayRole: String) {
+        viewModelScope.launch {
+            val updatedList = repository.setProfileNodeRelayRole(profileId, nodeRelayRole)
+            networkEngine.syncConcurrentProfileListeners(updatedList)
+            val target = updatedList.find { it.profileId == profileId }
+            if (target != null && target.profileId == _uiState.value.currentProfileId) {
+                applyUserProfileEntityToState(target)
+            }
+            val roleDisplay = when (nodeRelayRole) {
+                "CLIENT_ONLY" -> "Только клиент (транзит отключен)"
+                "SF_BLIND_RELAY" -> "S&F Ретранслятор (слепое хранение и пересылка)"
+                else -> "Пир-узел (маршрутизация оверлея 0200::/7)"
+            }
+            if (target != null && (target.isActiveInBackground || target.isCurrentPrimary)) {
+                networkEngine.dispatchRelayRoleVerificationFrame(target.profileId, target.yggIpv6Address)
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Профиль «${target?.displayName ?: profileId}»: установлена роль «$roleDisplay»"
+                )
+            }
+            syncForegroundServiceNotification()
+        }
+    }
+
+    /**
+     * Triggers a live notification event (Incoming Call, Missed Call, Voice Message, or P2P Message)
+     * for any enabled profile so the user can test pop-up & Android system notifications and
+     * background profile-switching confirmation.
+     */
+    fun triggerProfileTestNotification(profileId: String, category: YggAlertCategory) {
+        viewModelScope.launch {
+            val allProfs = repository.getAllProfilesNow()
+            val targetProfile = allProfs.find { it.profileId == profileId } ?: return@launch
+            if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Включите профиль «${targetProfile.displayName}» в фоновый режим для приема уведомлений")
+                }
+                return@launch
+            }
+            val senderLabel = if (targetProfile.profileId == _uiState.value.currentProfileId) {
+                "Узел Мимир • Северный Хаб"
+            } else {
+                _uiState.value.userProfile.displayName
+            }
+            val senderIpv6 = if (targetProfile.profileId == _uiState.value.currentProfileId) {
+                "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+            } else {
+                _uiState.value.identity.yggIpv6Address
+            }
+
+            val chatId = repository.createNewConversation(
+                title = senderLabel,
+                yggIpv6Input = senderIpv6,
+                isMlsGroup = false,
+                sealedSender = true,
+                disappearingSeconds = 0,
+                directEndpointHint = "127.0.0.1:${_uiState.value.userProfile.allocatedTcpPort}",
+                ownerProfileId = targetProfile.profileId
+            )
+
+            val preview = when (category) {
+                YggAlertCategory.INCOMING_CALL -> "Входящий голосовой вызов через оверлей Yggdrasil (Opus/PCM AEAD)"
+                YggAlertCategory.MISSED_CALL -> "Пропущенный голосовой вызов • Нажмите «Перезвонить»"
+                YggAlertCategory.NEW_VOICE -> "🎙️ Голосовое сообщение (6 сек) • Записано с микрофона (PCM 16 кГц)"
+                YggAlertCategory.NEW_MESSAGE -> "Новое зашифрованное сообщение X3DH + Double Ratchet для профиля «${targetProfile.displayName}»"
+            }
+
+            emitPopupAndSystemNotification(
+                category = category,
+                targetProfile = targetProfile,
+                chatId = chatId,
+                senderName = senderLabel,
+                senderIpv6 = senderIpv6,
+                messagePreview = preview,
+                voiceDurationSec = if (category == YggAlertCategory.NEW_VOICE) 6 else 0
+            )
         }
     }
 
@@ -1267,7 +1581,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val (reachable, initialRtt) = networkEngine.probeVoiceCallChannel(
                 peerIpv6 = conv.yggIpv6Address,
                 directEndpointHint = directHint,
-                candidatePeers = candidatePeers
+                candidatePeers = candidatePeers,
+                senderIpv6 = _uiState.value.identity.yggIpv6Address,
+                callerName = _uiState.value.userProfile.displayName,
+                chatId = conv.chatId,
+                signalAction = "RINGING"
             )
 
             if (!reachable && candidatePeers.isEmpty() && !isLocalLoopback) {

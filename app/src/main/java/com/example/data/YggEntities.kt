@@ -18,7 +18,9 @@ data class UserProfileEntity(
     val isActiveInBackground: Boolean,
     val isCurrentPrimary: Boolean,
     val avatarColorHex: String,
-    val createdAt: Long
+    val createdAt: Long,
+    val nodeRelayRole: String = "PEER_RELAY", // "CLIENT_ONLY", "PEER_RELAY", "SF_BLIND_RELAY"
+    val relayedPacketsCount: Int = 0
 )
 
 @Entity(tableName = "conversations")

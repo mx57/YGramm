@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.data.UserProfileEntity
 import com.example.engine.ParsedYggContactQr
+import com.example.service.YggAlertCategory
 import com.example.service.YggForegroundServiceState
 import com.example.ui.components.QrContactModal
 import com.example.ui.theme.AmberShieldTertiary
@@ -98,10 +99,13 @@ fun ProfilePrivacyScreen(
         handle: String,
         bio: String,
         runSimultaneouslyInBackground: Boolean,
-        switchImmediately: Boolean
-    ) -> Unit = { _, _, _, _, _ -> },
+        switchImmediately: Boolean,
+        nodeRelayRole: String
+    ) -> Unit = { _, _, _, _, _, _ -> },
     onSwitchProfile: (String) -> Unit = {},
     onToggleProfileBackgroundActive: (String, Boolean) -> Unit = { _, _ -> },
+    onSetProfileRelayRole: (String, String) -> Unit = { _, _ -> },
+    onTriggerProfileTestNotification: (String, YggAlertCategory) -> Unit = { _, _ -> },
     onDeleteSecondaryProfile: (String) -> Unit = {},
     onOpenChatWithProfile: (UserProfileEntity) -> Unit = {},
     onToggleBackgroundService: (Boolean) -> Unit = {},
@@ -462,6 +466,153 @@ fun ProfilePrivacyScreen(
                                     )
                                 }
 
+                                // Per-Profile Node Relay Role Selector: CLIENT_ONLY / PEER_RELAY / SF_BLIND_RELAY
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.7f),
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "Роль в сети (Пир и ретранслятор):",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = "Транзит: ${itemProfile.relayedPacketsCount} пак.",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                                color = CyberTealSecondary
+                                            )
+                                        }
+
+                                        val roles = listOf(
+                                            "CLIENT_ONLY" to "Только клиент",
+                                            "PEER_RELAY" to "Пир-узел",
+                                            "SF_BLIND_RELAY" to "S&F Ретранслятор"
+                                        )
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            roles.forEach { (roleCode, roleTitle) ->
+                                                val selected = itemProfile.nodeRelayRole == roleCode
+                                                FilterChip(
+                                                    selected = selected,
+                                                    onClick = {
+                                                        onSetProfileRelayRole(itemProfile.profileId, roleCode)
+                                                    },
+                                                    label = {
+                                                        Text(
+                                                            text = roleTitle,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                                                        )
+                                                    },
+                                                    colors = FilterChipDefaults.filterChipColors(
+                                                        selectedContainerColor = when (roleCode) {
+                                                            "CLIENT_ONLY" -> MaterialTheme.colorScheme.secondaryContainer
+                                                            "SF_BLIND_RELAY" -> AmberShieldTertiary.copy(alpha = 0.25f)
+                                                            else -> EmeraldPrimary.copy(alpha = 0.22f)
+                                                        },
+                                                        selectedLabelColor = when (roleCode) {
+                                                            "CLIENT_ONLY" -> CyberTealSecondary
+                                                            "SF_BLIND_RELAY" -> AmberShieldTertiary
+                                                            else -> EmeraldPrimary
+                                                        }
+                                                    ),
+                                                    modifier = Modifier.testTag("role_chip_${itemProfile.profileId}_$roleCode")
+                                                )
+                                            }
+                                        }
+
+                                        Text(
+                                            text = when (itemProfile.nodeRelayRole) {
+                                                "CLIENT_ONLY" -> "Режим «Только клиент»: узел не маршрутизирует чужой трафик и отклоняет транзитные пакеты."
+                                                "SF_BLIND_RELAY" -> "Режим «S&F ретранслятор»: узел работает как пир Yggdrasil и хранит слепые офлайн-конверты (Hashcash PoW)."
+                                                else -> "Режим «Пир-узел»: узел участвует в маршрутизации пакетов оверлейной сети Yggdrasil 0200::/7."
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+
+                                // Quick Notification Test Bar for enabled profiles (Incoming Call, Missed Call, Voice, Message)
+                                if (itemProfile.isActiveInBackground || isPrimary) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Text(
+                                            text = "Тест всплывающих уведомлений профиля «${itemProfile.displayName}»:",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .horizontalScroll(rememberScrollState()),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            OutlinedButton(
+                                                onClick = {
+                                                    onTriggerProfileTestNotification(
+                                                        itemProfile.profileId,
+                                                        YggAlertCategory.INCOMING_CALL
+                                                    )
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                modifier = Modifier.testTag("test_notif_call_${itemProfile.profileId}")
+                                            ) {
+                                                Text("📞 Звонок", style = MaterialTheme.typography.labelSmall)
+                                            }
+                                            OutlinedButton(
+                                                onClick = {
+                                                    onTriggerProfileTestNotification(
+                                                        itemProfile.profileId,
+                                                        YggAlertCategory.MISSED_CALL
+                                                    )
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                modifier = Modifier.testTag("test_notif_missed_${itemProfile.profileId}")
+                                            ) {
+                                                Text("📲 Пропущенный", style = MaterialTheme.typography.labelSmall)
+                                            }
+                                            OutlinedButton(
+                                                onClick = {
+                                                    onTriggerProfileTestNotification(
+                                                        itemProfile.profileId,
+                                                        YggAlertCategory.NEW_VOICE
+                                                    )
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                modifier = Modifier.testTag("test_notif_voice_${itemProfile.profileId}")
+                                            ) {
+                                                Text("🎙️ Голосовое", style = MaterialTheme.typography.labelSmall)
+                                            }
+                                            OutlinedButton(
+                                                onClick = {
+                                                    onTriggerProfileTestNotification(
+                                                        itemProfile.profileId,
+                                                        YggAlertCategory.NEW_MESSAGE
+                                                    )
+                                                },
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                modifier = Modifier.testTag("test_notif_msg_${itemProfile.profileId}")
+                                            ) {
+                                                Text("💬 Сообщение", style = MaterialTheme.typography.labelSmall)
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if (!isPrimary) {
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -769,8 +920,8 @@ fun ProfilePrivacyScreen(
         CreateNewDecentralizedProfileModal(
             nextIndex = userProfiles.size + 1,
             onDismiss = { showCreateProfileDialog = false },
-            onCreate = { name, handle, bio, runInBg, switchNow ->
-                onCreateNewProfile(name, handle, bio, runInBg, switchNow)
+            onCreate = { name, handle, bio, runInBg, switchNow, relayRole ->
+                onCreateNewProfile(name, handle, bio, runInBg, switchNow, relayRole)
                 showCreateProfileDialog = false
             }
         )
@@ -827,7 +978,8 @@ private fun CreateNewDecentralizedProfileModal(
         handle: String,
         bio: String,
         runSimultaneouslyInBackground: Boolean,
-        switchImmediately: Boolean
+        switchImmediately: Boolean,
+        nodeRelayRole: String
     ) -> Unit
 ) {
     var name by rememberSaveable { mutableStateOf("Узел YggGram #$nextIndex") }
@@ -837,6 +989,7 @@ private fun CreateNewDecentralizedProfileModal(
     }
     var runInBackground by rememberSaveable { mutableStateOf(true) }
     var switchImmediately by rememberSaveable { mutableStateOf(false) }
+    var selectedRelayRole by rememberSaveable { mutableStateOf("PEER_RELAY") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -878,6 +1031,31 @@ private fun CreateNewDecentralizedProfileModal(
                     maxLines = 2,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Text(
+                    text = "Роль в сети Yggdrasil (Пир / Ретранслятор):",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val roleOptions = listOf(
+                        "CLIENT_ONLY" to "Только клиент",
+                        "PEER_RELAY" to "Пир-узел",
+                        "SF_BLIND_RELAY" to "S&F Ретранслятор"
+                    )
+                    roleOptions.forEach { (code, label) ->
+                        FilterChip(
+                            selected = selectedRelayRole == code,
+                            onClick = { selectedRelayRole = code },
+                            label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                            modifier = Modifier.testTag("new_profile_role_$code")
+                        )
+                    }
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -928,7 +1106,7 @@ private fun CreateNewDecentralizedProfileModal(
         },
         confirmButton = {
             Button(
-                onClick = { onCreate(name, handle, bio, runInBackground, switchImmediately) },
+                onClick = { onCreate(name, handle, bio, runInBackground, switchImmediately, selectedRelayRole) },
                 modifier = Modifier.testTag("confirm_create_profile_button")
             ) {
                 Text("Сгенерировать ключи и создать")

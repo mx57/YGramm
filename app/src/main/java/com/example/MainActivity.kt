@@ -1,6 +1,7 @@
 // File: app/src/main/java/com/example/MainActivity.kt
 package com.example
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -52,6 +53,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -67,8 +69,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.service.YggNotificationCenter
 import com.example.ui.components.NetworkStatusIndicator
+import com.example.ui.components.ProfileSwitchConfirmationDialog
 import com.example.ui.components.QrContactModal
+import com.example.ui.components.YggInAppNotificationBannerOverlay
 import com.example.ui.components.YggNetworkStatus
 import com.example.ui.screens.ChatsScreen
 import com.example.ui.screens.NetworkDpiScreen
@@ -80,23 +85,41 @@ import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.YggGramTheme
 import com.example.viewmodel.YggGramViewModel
 import com.example.viewmodel.YggNavTab
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class MainActivity : ComponentActivity() {
+
+    private val incomingNotificationIntent = MutableStateFlow<Intent?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        incomingNotificationIntent.value = intent
         enableEdgeToEdge()
         setContent {
+            val latestIntent by incomingNotificationIntent.asStateFlow().collectAsStateWithLifecycle()
             YggGramTheme {
-                YggGramRootApp()
+                YggGramRootApp(
+                    notificationIntent = latestIntent,
+                    onNotificationIntentConsumed = { incomingNotificationIntent.value = null }
+                )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        incomingNotificationIntent.value = intent
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun YggGramRootApp(
-    viewModel: YggGramViewModel = viewModel()
+    viewModel: YggGramViewModel = viewModel(),
+    notificationIntent: Intent? = null,
+    onNotificationIntentConsumed: () -> Unit = {}
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val userProfiles by viewModel.userProfiles.collectAsStateWithLifecycle()
@@ -112,6 +135,24 @@ fun YggGramRootApp(
 
     var showGlobalQrModal by rememberSaveable { mutableStateOf(false) }
     var showProfileQuickMenu by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(notificationIntent) {
+        val intent = notificationIntent ?: return@LaunchedEffect
+        val targetProfId = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_PROFILE_ID).orEmpty()
+        val targetChatId = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CHAT_ID).orEmpty()
+        val categoryName = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CATEGORY).orEmpty()
+        if (targetProfId.isNotBlank() || targetChatId.isNotBlank()) {
+            viewModel.handleSystemNotificationIntent(
+                targetProfileId = targetProfId,
+                chatId = targetChatId,
+                categoryName = categoryName
+            )
+            intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_PROFILE_ID)
+            intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CHAT_ID)
+            intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CATEGORY)
+            onNotificationIntentConsumed()
+        }
+    }
 
     if (uiState.activeTab != YggNavTab.CHATS) {
         BackHandler {
@@ -242,6 +283,11 @@ fun YggGramRootApp(
                             ) {
                                 userProfiles.forEach { prof ->
                                     val isCurrent = prof.profileId == uiState.currentProfileId
+                                    val roleBadge = when (prof.nodeRelayRole) {
+                                        "CLIENT_ONLY" -> "Только клиент"
+                                        "SF_BLIND_RELAY" -> "S&F Ретранслятор"
+                                        else -> "Пир-узел"
+                                    }
                                     DropdownMenuItem(
                                         text = {
                                             Column {
@@ -252,7 +298,7 @@ fun YggGramRootApp(
                                                     color = if (isCurrent) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
                                                 )
                                                 Text(
-                                                    text = "${prof.yggIpv6Address.take(18)}... • Порт :${prof.allocatedTcpPort}",
+                                                    text = "$roleBadge • Порт :${prof.allocatedTcpPort} • ${prof.yggIpv6Address.take(16)}...",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
@@ -437,6 +483,15 @@ fun YggGramRootApp(
                 }
 
                 Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    // Animated Pop-Up Notification Banner for all enabled profiles (Calls, Missed Calls, Voice, Messages)
+                    YggInAppNotificationBannerOverlay(
+                        notification = uiState.activePopupNotification,
+                        currentActiveProfileId = uiState.currentProfileId,
+                        onPrimaryAction = viewModel::handlePopupNotificationAction,
+                        onDeclineIncomingCall = viewModel::declineIncomingCallNotification,
+                        onDismiss = viewModel::dismissPopupNotification
+                    )
+
                     AnimatedVisibility(visible = uiState.statusBannerMessage != null) {
                         uiState.statusBannerMessage?.let { msg ->
                             Surface(
@@ -553,6 +608,8 @@ fun YggGramRootApp(
                                 onCreateNewProfile = viewModel::createNewProfile,
                                 onSwitchProfile = viewModel::switchActiveProfile,
                                 onToggleProfileBackgroundActive = viewModel::toggleProfileBackgroundExecution,
+                                onSetProfileRelayRole = viewModel::setProfileNodeRelayRole,
+                                onTriggerProfileTestNotification = viewModel::triggerProfileTestNotification,
                                 onDeleteSecondaryProfile = viewModel::deleteSecondaryProfile,
                                 onOpenChatWithProfile = viewModel::openChatWithSecondaryProfile,
                                 onToggleBackgroundService = viewModel::setBackgroundServiceEnabled,
@@ -566,6 +623,15 @@ fun YggGramRootApp(
                     }
                 }
             }
+        }
+
+        if (uiState.pendingProfileSwitchRequest != null) {
+            ProfileSwitchConfirmationDialog(
+                pendingRequest = uiState.pendingProfileSwitchRequest,
+                currentProfileName = uiState.userProfile.displayName,
+                onConfirmSwitchAndExecute = viewModel::confirmProfileSwitchFromNotification,
+                onDismiss = viewModel::cancelProfileSwitchFromNotification
+            )
         }
 
         if (showGlobalQrModal) {

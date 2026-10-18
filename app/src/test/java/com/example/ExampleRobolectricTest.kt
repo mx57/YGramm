@@ -279,5 +279,30 @@ class ExampleRobolectricTest {
         assertEquals(secondProfile.yggIpv6Address, fgState.primaryIpv6)
         assertEquals(2, fgState.activeProfilesCount)
         assertEquals(4, fgState.connectedPeersCount)
+
+        // 5. Verify per-profile relay role configuration (CLIENT_ONLY, PEER_RELAY, SF_BLIND_RELAY) and transit counter
+        val updatedRoles = repo.setProfileNodeRelayRole(secondProfile.profileId, "SF_BLIND_RELAY")
+        val updatedSecond = updatedRoles.find { it.profileId == secondProfile.profileId }
+        assertNotNull(updatedSecond)
+        assertEquals("SF_BLIND_RELAY", updatedSecond?.nodeRelayRole)
+
+        repo.incrementProfileRelayedPackets(secondProfile.profileId, 3)
+        val afterRelayCount = repo.getAllProfilesNow().find { it.profileId == secondProfile.profileId }
+        assertEquals(3, afterRelayCount?.relayedPacketsCount)
+
+        // 6. Verify YggNotificationCenter posts heads-up notifications for enabled profiles without throwing
+        val testPopupItem = com.example.service.YggPopupNotificationItem(
+            notificationId = "test_notif_call_01",
+            category = com.example.service.YggAlertCategory.INCOMING_CALL,
+            targetProfileId = secondProfile.profileId,
+            targetProfileName = secondProfile.displayName,
+            targetProfileIpv6 = secondProfile.yggIpv6Address,
+            targetProfileRelayRole = "SF_BLIND_RELAY",
+            chatId = "chat_test_01",
+            senderName = "Узел Мимир",
+            senderIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+            messagePreview = "Входящий голосовой вызов Yggdrasil"
+        )
+        com.example.service.YggNotificationCenter.postSystemHeadsUpNotification(app, testPopupItem)
     }
 }

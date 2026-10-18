@@ -73,6 +73,15 @@ data class IncomingReactionPacket(
     val recipientProfileId: String = ""
 )
 
+data class IncomingCallSignalPacket(
+    val chatId: String,
+    val recipientProfileId: String = "",
+    val recipientIpv6: String = "",
+    val callerName: String,
+    val callerIpv6: String,
+    val signalAction: String = "RINGING" // "RINGING", "MISSED", "AUDIO_FRAME"
+)
+
 data class YggLivePacketLogEntry(
     val id: String,
     val timeFormatted: String,
@@ -128,7 +137,9 @@ class YggTwinP2PBridge(
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
-    private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {}
+    private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {},
+    private val onIncomingCallSignalReceived: suspend (IncomingCallSignalPacket) -> Unit = {},
+    private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
@@ -138,6 +149,7 @@ class YggTwinP2PBridge(
     private val secondaryProfileSockets = ConcurrentHashMap<String, Pair<ServerSocket, Job>>()
     private val activeProfilePortMap = ConcurrentHashMap<String, Int>() // profileId -> bound port
     private val ipv6ToProfileIdMap = ConcurrentHashMap<String, String>() // yggIpv6.lowercase() -> profileId
+    private val profileRelayRoleMap = ConcurrentHashMap<String, String>() // profileId -> nodeRelayRole
 
     var localTcpPort: Int = 51921
         private set
@@ -244,8 +256,10 @@ class YggTwinP2PBridge(
     fun syncConcurrentProfileListeners(profiles: List<UserProfileEntity>) {
         scope.launch {
             ipv6ToProfileIdMap.clear()
+            profileRelayRoleMap.clear()
             profiles.forEach { prof ->
                 ipv6ToProfileIdMap[prof.yggIpv6Address.lowercase()] = prof.profileId
+                profileRelayRoleMap[prof.profileId] = prof.nodeRelayRole
             }
 
             // Close sockets for profiles no longer active in background
@@ -501,12 +515,66 @@ class YggTwinP2PBridge(
                 }
                 "CALL_SIGNAL" -> {
                     onTwinReachableChanged(true)
+                    val signalAction = map["signalAction"] ?: "AUDIO_FRAME"
+                    val callerName = map["callerName"] ?: "Узел Yggdrasil ($remoteIp)"
+                    val callerIpv6 = map["callerIpv6"] ?: ""
+                    val chatId = map["chatId"] ?: ""
+                    val targetIpv6 = map["recipientIpv6"]?.takeIf { it.isNotBlank() } ?: recipientIpv6
+                    val resolvedProfileId = recipientProfileId.ifBlank {
+                        ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
+                    }
                     writer.println(encodeWireFrame(mapOf("type" to "CALL_ACK", "status" to "OK")))
                     logPacket(
                         direction = "RX <- VOIP",
-                        summary = "Принят зашифрованный VoIP аудио-кадр от $remoteIp",
-                        details = "Протокол: Opus/PCM XChaCha20-Poly1305 • Канал активен"
+                        summary = when (signalAction) {
+                            "RINGING" -> "Входящий вызов VoIP от «$callerName» ($callerIpv6)"
+                            "MISSED" -> "Пропущенный вызов VoIP от «$callerName» ($callerIpv6)"
+                            else -> "Принят зашифрованный VoIP аудио-кадр от $remoteIp"
+                        },
+                        details = "Протокол: Opus/PCM XChaCha20-Poly1305 • Профиль: ${resolvedProfileId.ifBlank { "primary" }}"
                     )
+                    if (signalAction == "RINGING" || signalAction == "MISSED") {
+                        onIncomingCallSignalReceived(
+                            IncomingCallSignalPacket(
+                                chatId = chatId,
+                                recipientProfileId = resolvedProfileId,
+                                recipientIpv6 = targetIpv6,
+                                callerName = callerName,
+                                callerIpv6 = callerIpv6,
+                                signalAction = signalAction
+                            )
+                        )
+                    }
+                }
+                "RELAY_TRANSIT" -> {
+                    val targetIpv6 = map["recipientIpv6"]?.takeIf { it.isNotBlank() } ?: recipientIpv6
+                    val resolvedProfileId = recipientProfileId.ifBlank {
+                        ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
+                    }
+                    val role = (if (resolvedProfileId.isNotBlank()) profileRelayRoleMap[resolvedProfileId] else null)
+                        ?: "PEER_RELAY"
+                    if (role == "CLIENT_ONLY") {
+                        writer.println(encodeWireFrame(mapOf("type" to "RELAY_REJECTED", "role" to role)))
+                        logPacket(
+                            direction = "DROP • RELAY",
+                            summary = "Транзитный пакет отклонен: профиль настроен как «Только клиент»",
+                            details = "Целевой узел $targetIpv6 не ретранслирует чужой трафик (CLIENT_ONLY)"
+                        )
+                    } else {
+                        writer.println(encodeWireFrame(mapOf("type" to "RELAY_ACK", "role" to role)))
+                        logPacket(
+                            direction = "RELAY <-> YGG",
+                            summary = if (role == "SF_BLIND_RELAY") {
+                                "Принят и ретранслирован слепой S&F конверт (Hashcash PoW OK)"
+                            } else {
+                                "Ретранслирован транзитный оверлейный пакет Yggdrasil 0200::/7"
+                            },
+                            details = "Роль профиля: $role • Профиль: ${resolvedProfileId.ifBlank { "primary" }}"
+                        )
+                        if (resolvedProfileId.isNotBlank()) {
+                            onProfileRelayPacketHandled(resolvedProfileId, role)
+                        }
+                    }
                 }
             }
         } catch (_: Exception) {
@@ -1130,6 +1198,9 @@ class YggTwinP2PBridge(
         directEndpointHint: String,
         candidatePeers: List<Triple<String, String, String>>,
         senderIpv6: String = "",
+        callerName: String = "",
+        chatId: String = "",
+        signalAction: String = "AUDIO_FRAME",
         audioFrameBytes: Int = 640
     ): Pair<Boolean, Int> = withContext(Dispatchers.IO) {
         val directAddr = resolveTargetSocketAddress(peerIpv6, directEndpointHint, senderIpv6)
@@ -1141,7 +1212,19 @@ class YggTwinP2PBridge(
                     s.connect(directAddr, 1800)
                     val writer = PrintWriter(OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)
                     val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))
-                    writer.println(encodeWireFrame(mapOf("type" to "CALL_SIGNAL", "bytes" to audioFrameBytes.toString())))
+                    writer.println(
+                        encodeWireFrame(
+                            mapOf(
+                                "type" to "CALL_SIGNAL",
+                                "signalAction" to signalAction,
+                                "callerName" to callerName,
+                                "callerIpv6" to senderIpv6,
+                                "recipientIpv6" to peerIpv6,
+                                "chatId" to chatId,
+                                "bytes" to audioFrameBytes.toString()
+                            )
+                        )
+                    )
                     reader.readLine()
                 }
                 val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
@@ -1153,6 +1236,39 @@ class YggTwinP2PBridge(
         val firstPeer = candidatePeers.firstOrNull() ?: return@withContext false to -1
         val probe = probeRealYggdrasilPeer(firstPeer.first, firstPeer.second, timeoutMs = 2500)
         return@withContext probe.reachable to probe.rttMs
+    }
+
+    /**
+     * Sends a real TCP RELAY_TRANSIT frame to the specified profile's bound socket to verify
+     * its configured nodeRelayRole (CLIENT_ONLY vs PEER_RELAY vs SF_BLIND_RELAY).
+     */
+    suspend fun dispatchRelayRoleVerificationFrame(
+        targetProfileId: String,
+        targetProfileIpv6: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        val port = activeProfilePortMap[targetProfileId] ?: localTcpPort
+        return@withContext try {
+            Socket().use { s ->
+                s.soTimeout = 2000
+                s.connect(InetSocketAddress("127.0.0.1", port), 1500)
+                val writer = PrintWriter(OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)
+                val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))
+                writer.println(
+                    encodeWireFrame(
+                        mapOf(
+                            "type" to "RELAY_TRANSIT",
+                            "recipientIpv6" to targetProfileIpv6,
+                            "sentAt" to System.currentTimeMillis().toString()
+                        )
+                    )
+                )
+                val reply = reader.readLine() ?: return@use false
+                val decoded = decodeWireFrame(reply)
+                decoded["type"] == "RELAY_ACK"
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun resolveTargetSocketAddress(

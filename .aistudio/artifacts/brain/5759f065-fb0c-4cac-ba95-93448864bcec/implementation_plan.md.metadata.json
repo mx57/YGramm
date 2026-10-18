@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan for the Yggdrasil background foreground service, real microphone voice message recording and audio playback, full P2P binary media/file transfer, live VoIP audio streaming, and multi-profile management with configurable simultaneous background execution.",
-  "updatedAt": "2026-10-18T20:07:41.792344972Z",
+  "summary": "Implementation plan for YggGram multi-profile pop-up & Android system notifications (incoming calls, missed calls, text/voice/media messages), profile switch confirmation modal, and per-profile Yggdrasil node routing role selector (Client Only, Peer Node, S&F Relay).",
+  "updatedAt": "2026-10-18T20:58:01.253331771Z",
   "requestFeedback": true,
   "userFacing": true
 }
