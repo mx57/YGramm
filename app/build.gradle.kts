@@ -18,7 +18,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.ygggram.vxkprm"
+    applicationId = "com.aistudio.ygggram.vxkprm.node2"
     minSdk = 24
     targetSdk = 36
     versionCode = 1

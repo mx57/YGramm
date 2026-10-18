@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">YggGram</string>
+    <string name="app_name">YggGram Клон #2</string>
     <string name="nav_chats">Чаты</string>
     <string name="nav_network">Сеть и ТСПУ</string>
     <string name="nav_vault">Ключи и Синхр.</string>
