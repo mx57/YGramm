@@ -194,12 +194,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private val database = YggDatabase.getInstance(application)
     private val repository = YggRepository(database.yggDao(), application.applicationContext)
 
-    private val defaultMnemonic = listOf(
-        "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
-        "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+    // Bootstrap identity for the first UI frame only: a fresh random mnemonic per launch.
+    // ensureInitialized() persists the real mnemonic on first run, so no fixed default
+    // key material ever ships with the app.
+    private val initialIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+        YggCryptoEngine.generateFreshMnemonic12(),
+        epoch = 1
     )
-
-    private val initialIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(defaultMnemonic, epoch = 1)
 
     private val _uiState = MutableStateFlow(
         YggGramUiState(
@@ -397,12 +398,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     val cryptoKeys: StateFlow<List<CryptoKeyRecordEntity>> = repository.cryptoKeys
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val queuedOfflineMessagesCount: StateFlow<Int> = combine(allMessages) { (msgs) ->
-        msgs.count { it.deliveryState == "QUEUED_OFFLINE_SF" }
+    val queuedOfflineMessagesCount: StateFlow<Int> = combine(allMessages, conversations) { msgs, convs ->
+        val ownerChatIds = convs.map { it.chatId }.toSet()
+        msgs.count { it.deliveryState == "QUEUED_OFFLINE_SF" && it.chatId in ownerChatIds }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     init {
         YggNodeForegroundService.onUserRequestedStop = {
+            networkEngine.stop()
             _uiState.update {
                 it.copy(
                     isBackgroundServiceEnabled = false,
@@ -425,6 +428,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             networkEngine.start()
             val allProfs = repository.getAllProfilesNow()
             networkEngine.syncConcurrentProfileListeners(allProfs)
+            networkEngine.initializeNativeCore(
+                mnemonicCsv = _uiState.value.identity.mnemonicWords.joinToString(" "),
+                filesDir = getApplication<Application>().filesDir.absolutePath,
+                peerUris = YggPeerScannerCatalog.initialCatalog.map { it.endpointUri }
+            )
             startNetworkAndAirplaneObserver()
             syncForegroundServiceNotification()
             refreshRealPeerConnectivity()
@@ -433,10 +441,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     private fun applyUserProfileEntityToState(profileEntity: UserProfileEntity) {
         val words = profileEntity.mnemonicCsv.split(" ").filter { it.isNotBlank() }
-        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(
-            if (words.size >= 6) words else defaultMnemonic,
-            epoch = 1
-        )
+        val effectiveWords = if (words.size >= 6) {
+            words
+        } else {
+            // Legacy profile without usable mnemonic: generate and persist a fresh one so the
+            // derived identity remains stable across restarts.
+            val fresh = YggCryptoEngine.generateFreshMnemonic12()
+            viewModelScope.launch {
+                repository.persistProfileMnemonic(profileEntity.profileId, fresh)
+            }
+            fresh
+        }
+        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(effectiveWords, epoch = 1)
         val sigHash = YggCryptoEngine.sha256Hex(
             "${profileEntity.displayName}:${profileEntity.handle}:${profileEntity.bio}:${hierarchy.yggNodePublicKeyHex}"
         )
@@ -646,6 +662,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     "Фоновый сервис Yggdrasil отключен"
                 }
             )
+        }
+        if (enabled) {
+            viewModelScope.launch {
+                networkEngine.start()
+                networkEngine.syncConcurrentProfileListeners(repository.getAllProfilesNow())
+            }
+        } else {
+            networkEngine.stop()
         }
         syncForegroundServiceNotification()
     }
@@ -1198,6 +1222,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     )
                     if (overlayRelay.delivered) {
                         deliveredCount++
+                        if (!overlayRelay.endToEndConfirmed) {
+                            repository.markMessageSentP2P(msg.messageId)
+                        }
                         if (overlayRelay.relayEndpointUri.isNotBlank()) {
                             repository.updatePeerTrafficByEndpoint(
                                 endpointUri = overlayRelay.relayEndpointUri,
@@ -1419,15 +1446,30 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         rxDelta = overlayResult.rxBytes
                     )
                 }
+                if (!overlayResult.endToEndConfirmed) {
+                    repository.markMessageSentP2P(savedMsg.messageId)
+                }
+                val localTargetName = overlayResult.deliveredToProfileId.takeIf { it.isNotBlank() }
+                    ?.let { pid -> repository.getAllProfilesNow().find { it.profileId == pid }?.displayName }
                 repository.updateConversationRouteStatus(
                     chatId = chatId,
                     isOnline = true,
-                    routeSummary = "Yggdrasil • ${overlayResult.relayRegionLabel} (${overlayResult.rttMs} мс)"
+                    routeSummary = if (localTargetName != null) {
+                        "Локальный профиль «$localTargetName» (внутренний P2P-мост устройства)"
+                    } else {
+                        "Yggdrasil • ${overlayResult.relayRegionLabel} (${overlayResult.rttMs} мс)"
+                    }
                 )
                 _uiState.update {
                     it.copy(
                         rxPacketsCount = it.rxPacketsCount + 1,
-                        statusBannerMessage = "Доставлено через пир Yggdrasil ${overlayResult.relayEndpointUri} (${overlayResult.relayRegionLabel}, RTT ${overlayResult.rttMs} мс)"
+                        statusBannerMessage = if (localTargetName != null) {
+                            "Сообщение доставлено профилю «$localTargetName» этого устройства (внутренний P2P-мост, ACK получен)"
+                        } else if (overlayResult.endToEndConfirmed) {
+                            "Доставлено через пир Yggdrasil ${overlayResult.relayEndpointUri} (${overlayResult.relayRegionLabel}, RTT ${overlayResult.rttMs} мс)"
+                        } else {
+                            "Передано в оверлей через пир ${overlayResult.relayEndpointUri} (${overlayResult.relayRegionLabel}) — ожидается ACK получателя"
+                        }
                     )
                 }
             } else {
@@ -1531,7 +1573,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 disappearingSeconds = _uiState.value.privacyMatrix.defaultDisappearingSeconds,
                 directEndpointHint = parsedQr.directLanHint,
                 localIdentity = _uiState.value.identity,
-                ownerProfileId = _uiState.value.currentProfileId
+                ownerProfileId = _uiState.value.currentProfileId,
+                peerX25519PublicKeyHex = parsedQr.x25519PubKeyHex
             )
             if (parsedQr.directLanHint.isNotBlank()) {
                 networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
@@ -1834,6 +1877,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     voiceWaveformCsv = message.voiceWaveformCsv
                 )
                 if (overlayRes.delivered) {
+                    if (!overlayRes.endToEndConfirmed) {
+                        repository.markMessageSentP2P(message.messageId)
+                    }
                     if (overlayRes.relayEndpointUri.isNotBlank()) {
                         repository.updatePeerTrafficByEndpoint(
                             endpointUri = overlayRes.relayEndpointUri,
@@ -2263,9 +2309,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         disappearingSeconds: Int
     ) {
         if (title.isBlank() && yggIpv6Input.isBlank()) return
+        val parts = yggIpv6Input.split("|", ",", " ").map { it.trim() }.filter { it.isNotEmpty() }
+        val primaryAddr = parts.firstOrNull() ?: yggIpv6Input.trim()
+        if (primaryAddr.isBlank()) {
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Укажите адрес узла (IPv6 2xx:…, Ed25519-ключ или ygggram://-ссылку) — контакт без адреса узла создать нельзя"
+                )
+            }
+            return
+        }
         viewModelScope.launch {
-            val parts = yggIpv6Input.split("|", ",", " ").map { it.trim() }.filter { it.isNotEmpty() }
-            val primaryAddr = parts.firstOrNull() ?: yggIpv6Input.trim()
             val directHint = parts.drop(1).firstOrNull { it.contains(":") && it.contains(".") }
                 ?: if (primaryAddr.contains(".") && primaryAddr.contains(":")) primaryAddr else ""
 
@@ -2528,15 +2582,27 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun regenerateNewSeedIdentity() {
         val freshWords = YggCryptoEngine.generateFreshMnemonic12()
         val freshIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(freshWords, epoch = 1)
-        _uiState.update {
-            it.copy(
-                identity = freshIdentity,
-                keyEpoch = 1,
-                statusBannerMessage = "Сгенерирована новая BIP-39 мнемоника и IPv6-адрес узла ${freshIdentity.yggIpv6Address.take(19)}..."
-            )
-        }
         viewModelScope.launch {
-            repository.rotateKeysForEpoch(freshIdentity, 1)
+            val updatedProfile = repository.regenerateProfileIdentity(
+                profileId = _uiState.value.currentProfileId,
+                identity = freshIdentity
+            )
+            if (updatedProfile == null) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Не удалось перегенерировать идентичность: профиль не найден"
+                    )
+                }
+                return@launch
+            }
+            applyUserProfileEntityToState(updatedProfile)
+            networkEngine.syncConcurrentProfileListeners(repository.getAllProfilesNow())
+            _uiState.update {
+                it.copy(
+                    keyEpoch = 1,
+                    statusBannerMessage = "Сгенерирована новая BIP-39 мнемоника и IPv6-адрес узла ${freshIdentity.yggIpv6Address.take(19)}..."
+                )
+            }
             syncForegroundServiceNotification()
         }
     }

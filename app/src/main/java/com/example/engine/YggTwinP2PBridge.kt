@@ -107,7 +107,11 @@ data class SelfYggdrasilRelayResult(
     val rttMs: Long,
     val txBytes: Long,
     val rxBytes: Long,
-    val errorDetail: String? = null
+    val errorDetail: String? = null,
+    // true only when an explicit receiver ACK was observed (loopback profile ACK or LAN-direct ACK);
+    // relay-only hops through public peers are not delivery confirmations.
+    val endToEndConfirmed: Boolean = false,
+    val deliveredToProfileId: String = ""
 )
 
 data class DiscoveredLanNode(
@@ -282,6 +286,14 @@ class YggTwinP2PBridge(
             // Primary profile uses `localTcpPort`
             val primaryProf = profiles.find { it.isCurrentPrimary } ?: profiles.firstOrNull()
             if (primaryProf != null) {
+                // The promoted primary is now served by the main listener; drop its stale secondary socket
+                secondaryProfileSockets.remove(primaryProf.profileId)?.let { (srv, job) ->
+                    job.cancel()
+                    try {
+                        srv.close()
+                    } catch (_: Exception) {
+                    }
+                }
                 activeProfilePortMap[primaryProf.profileId] = localTcpPort
                 directEndpointTable.remove(primaryProf.yggIpv6Address.lowercase())
             }
@@ -379,9 +391,65 @@ class YggTwinP2PBridge(
                 }
             }
 
+            if (YggNativeCoreBridge.isNativeLibraryLoaded && !isNativeCoreInitialized && lastNativeMnemonicCsv.isNotBlank()) {
+                initializeNativeCore(lastNativeMnemonicCsv, lastNativeFilesDir, lastNativePeerUris)
+            }
+
             launch {
                 startLanDiscoveryListener()
             }
+        }
+    }
+
+    @Volatile
+    private var isNativeCoreInitialized = false
+    private val nativeCoreLock = Any()
+
+    private var lastNativeMnemonicCsv = ""
+    private var lastNativeFilesDir = ""
+    private var lastNativePeerUris: List<String> = emptyList()
+
+    /**
+     * Boots the real Yggdrasil Go core (libygggram.so via JNI) with the primary
+     * profile's mnemonic and joins the configured Yggdrasil peers. Best-effort:
+     * when the native library is absent the Kotlin transport keeps working.
+     */
+    suspend fun initializeNativeCore(mnemonicCsv: String, filesDir: String, peerUris: List<String>) = withContext(Dispatchers.IO) {
+        lastNativeMnemonicCsv = mnemonicCsv
+        lastNativeFilesDir = filesDir
+        lastNativePeerUris = peerUris
+        if (!YggNativeCoreBridge.isNativeLibraryLoaded) {
+            logPacket(
+                direction = "SYS • CORE",
+                summary = "Нативное ядро Yggdrasil не упаковано в сборку",
+                details = "Работа через JNI-ядро недоступна, используется Kotlin/C-транспорт моста"
+            )
+            return@withContext
+        }
+        if (isNativeCoreInitialized) return@withContext
+        synchronized(nativeCoreLock) {
+            if (isNativeCoreInitialized) return@withContext
+            val initResult = YggNativeCoreBridge.initCore(mnemonicCsv.replace("\n", " ").trim(), filesDir)
+            if (!initResult.ok) {
+                logPacket(
+                    direction = "ERR • CORE",
+                    summary = "Нативное ядро Yggdrasil не инициализировано",
+                    details = initResult.error
+                )
+                return@withContext
+            }
+            var joinedPeers = 0
+            val uniqueUris = peerUris.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+            for (peerUri in uniqueUris) {
+                val added = YggNativeCoreBridge.addPeer(peerUri)
+                if (added.ok) joinedPeers++
+            }
+            isNativeCoreInitialized = true
+            logPacket(
+                direction = "SYS • CORE",
+                summary = "Нативное ядро Yggdrasil активно (JNI, Go)",
+                details = "Пиров подключено: $joinedPeers из ${uniqueUris.size}"
+            )
         }
     }
 
@@ -972,47 +1040,14 @@ class YggTwinP2PBridge(
                 val txB = totalOutboundBytes
                 val rxB = (receivedBytesCount.toLong() + (attachmentBase64?.length ?: 0)).coerceAtLeast(64L)
 
-                val verifiedPlain = YggCryptoEngine.decryptDoubleRatchetEnvelope(
-                    cipherPayloadHex = cipherPayloadHex,
-                    expectedPlainText = plainText
-                )
-
                 onTwinReachableChanged(true)
                 onDeliveryAckReceived(chatId, messageId, rttMs)
 
                 logPacket(
                     direction = "ACK <- YGG",
                     summary = "Получен ответ от внешнего пира $endpointUri за $rttMs мс ($remoteMetaSignature)",
-                    details = "TX: $txB байт • RX: $rxB байт • AEAD расшифрован без ошибок"
+                    details = "TX: $txB байт • RX: $rxB байт • Конверт доставлен, ожидает расшифровки у получателя"
                 )
-
-                val echoReplyText = buildString {
-                    append("✓ Эхо-ответ через сеть Yggdrasil: «$verifiedPlain»\n")
-                    append("• Внешний узел: $regionLabel ($endpointUri)\n")
-                    append("• Реальный RTT: $rttMs мс ($remoteMetaSignature)\n")
-                    append("• Трафик: TX $txB B / RX $rxB B • Шифр: XChaCha20-Poly1305 OK")
-                }
-
-                val echoIncoming = IncomingTwinPacket(
-                    targetChatId = chatId,
-                    recipientIpv6 = senderIpv6,
-                    senderNodeLabel = "Эхо Yggdrasil • $regionLabel",
-                    senderIpv6 = senderIpv6,
-                    senderPubKeyHex = senderPubKeyHex,
-                    plainText = echoReplyText,
-                    cipherPayloadHex = cipherPayloadHex,
-                    hashcashToken = hashcashToken,
-                    attachmentName = attachmentName,
-                    attachmentSizeBytes = attachmentSizeBytes,
-                    rttMs = rttMs,
-                    timestamp = System.currentTimeMillis(),
-                    attachmentType = attachmentType,
-                    attachmentUri = attachmentUri,
-                    attachmentBase64 = attachmentBase64,
-                    voiceDurationSec = voiceDurationSec,
-                    voiceWaveformCsv = voiceWaveformCsv
-                )
-                onPacketReceived(echoIncoming)
 
                 return@withContext SelfYggdrasilRelayResult(
                     delivered = true,
@@ -1142,6 +1177,15 @@ class YggTwinP2PBridge(
         var lastError = "Ни один внешний пир Yggdrasil не ответил"
 
         if (isRealNetworkAvailable()) {
+            if (isNativeCoreInitialized) {
+                val coreStatus = YggNativeCoreBridge.getPeersJson()
+                val hasUpPeer = coreStatus.ok && coreStatus.rawJson.contains("\"Up\":true")
+                logPacket(
+                    direction = if (hasUpPeer) "SYS • CORE" else "ERR • CORE",
+                    summary = if (hasUpPeer) "Нативное ядро Yggdrasil держит живой пиринг" else "Нативное ядро Yggdrasil без живых пиров",
+                    details = if (hasUpPeer) "Overlay-узел участвует в маршрутизации 0200::/7" else "Пиры ядра не отвечают — доставка идёт через транспорт моста"
+                )
+            }
             for ((endpointUri, sniDomain, regionLabel) in combinedExternalPeers) {
                 val host = YggPeerScannerCatalog.extractHostFromUri(endpointUri)
                 val port = YggPeerScannerCatalog.extractPortFromUri(endpointUri)
@@ -1230,6 +1274,8 @@ class YggTwinP2PBridge(
                     )
 
                     // If recipient is an active profile on this node, deliver the overlay-routed frame from the Yggdrasil demuxer
+                    var endToEndConfirmed = false
+                    var deliveredToProfileId = ""
                     if (targetProfileId != null) {
                         val recipientPort = activeProfilePortMap[targetProfileId] ?: localTcpPort
                         val now = System.currentTimeMillis()
@@ -1252,7 +1298,6 @@ class YggTwinP2PBridge(
                                     "senderIpv6" to senderIpv6,
                                     "senderPubKeyHex" to senderPubKeyHex,
                                     "senderTcpPort" to senderPort.toString(),
-                                    "plainText" to plainText,
                                     "cipherPayloadHex" to cipherPayloadHex,
                                     "hashcashToken" to hashcashToken,
                                     "attachmentName" to (attachmentName ?: ""),
@@ -1274,11 +1319,13 @@ class YggTwinP2PBridge(
                             if (ackLine == null || decodeWireFrame(ackLine)["type"] != "ACK") {
                                 throw java.io.IOException("Целевой профиль не подтвердил прием крипто-конверта")
                             }
+                            endToEndConfirmed = true
+                            deliveredToProfileId = targetProfileId
+                            onDeliveryAckReceived(chatId, messageId, externalRttMs)
                         }
                     }
 
                     onTwinReachableChanged(true)
-                    onDeliveryAckReceived(chatId, messageId, externalRttMs)
 
                     return@withContext SelfYggdrasilRelayResult(
                         delivered = true,
@@ -1286,7 +1333,9 @@ class YggTwinP2PBridge(
                         relayRegionLabel = regionLabel,
                         rttMs = externalRttMs,
                         txBytes = txB,
-                        rxBytes = rxB
+                        rxBytes = rxB,
+                        endToEndConfirmed = endToEndConfirmed,
+                        deliveredToProfileId = deliveredToProfileId
                     )
                 } catch (e: Exception) {
                     lastError = "${e.javaClass.simpleName}: ${e.message ?: "timeout"}"
@@ -1328,7 +1377,8 @@ class YggTwinP2PBridge(
                     relayRegionLabel = "Ручной режим LAN",
                     rttMs = 3L,
                     txBytes = totalOutboundBytes,
-                    rxBytes = 128L
+                    rxBytes = 128L,
+                    endToEndConfirmed = true
                 )
             }
         }
@@ -1423,7 +1473,6 @@ class YggTwinP2PBridge(
                         "senderIpv6" to senderIpv6,
                         "senderPubKeyHex" to senderPubKeyHex,
                         "senderTcpPort" to senderPort.toString(),
-                        "plainText" to plainText,
                         "cipherPayloadHex" to cipherPayloadHex,
                         "hashcashToken" to hashcashToken,
                         "attachmentName" to (attachmentName ?: ""),
@@ -1718,6 +1767,17 @@ class YggTwinP2PBridge(
                 }
             }
             secondaryProfileSockets.clear()
+            if (isNativeCoreInitialized && YggNativeCoreBridge.isNativeLibraryLoaded) {
+                val stopped = YggNativeCoreBridge.stopCore()
+                if (stopped.ok) {
+                    isNativeCoreInitialized = false
+                    logPacket(
+                        direction = "SYS • CORE",
+                        summary = "Нативное ядро Yggdrasil остановлено",
+                        details = "Все overlay-соединения ядра закрыты вместе с сокетами моста"
+                    )
+                }
+            }
         } catch (_: Exception) {
         }
     }

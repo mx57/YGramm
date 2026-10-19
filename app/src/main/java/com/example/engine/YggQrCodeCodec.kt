@@ -18,7 +18,8 @@ data class ParsedYggContactQr(
     val yggIpv6Address: String,
     val ed25519PubKeyHex: String,
     val directLanHint: String,
-    val rawUri: String
+    val rawUri: String,
+    val x25519PubKeyHex: String = ""
 )
 
 /**
@@ -38,7 +39,8 @@ object YggQrCodeCodec {
         yggIpv6Address: String,
         ed25519PubKeyHex: String,
         localLanIp: String?,
-        localPort: Int
+        localPort: Int,
+        x25519PubKeyHex: String = ""
     ): String {
         val encodedName = try {
             URLEncoder.encode(displayName.trim().ifBlank { "Узел YggGram" }, StandardCharsets.UTF_8.name())
@@ -50,7 +52,12 @@ object YggQrCodeCodec {
         } else {
             ""
         }
-        return "ygggram://${yggIpv6Address.trim()}?pub=${ed25519PubKeyHex.trim()}&name=$encodedName$lanPart"
+        val xpubPart = if (x25519PubKeyHex.trim().length == 64) {
+            "&xpub=${x25519PubKeyHex.trim().lowercase()}"
+        } else {
+            ""
+        }
+        return "ygggram://${yggIpv6Address.trim()}?pub=${ed25519PubKeyHex.trim()}&name=$encodedName$xpubPart$lanPart"
     }
 
     fun parseContactString(rawInput: String): ParsedYggContactQr? {
@@ -88,7 +95,8 @@ object YggQrCodeCodec {
                 yggIpv6Address = ipv6,
                 ed25519PubKeyHex = pubKey,
                 directLanHint = lan,
-                rawUri = trimmed
+                rawUri = trimmed,
+                x25519PubKeyHex = params["xpub"]?.takeIf { it.length == 64 } ?: ""
             )
         }
 
@@ -316,31 +324,8 @@ object YggQrCodeCodec {
             }
         }
 
-        // Attempt 2: Deterministic cryptographic extraction from the scanned image's pixel digest
-        // so any QR screenshot or photo from gallery reliably yields a verifiable Yggdrasil node identity.
-        val sampleStepX = (w / 16).coerceAtLeast(1)
-        val sampleStepY = (h / 16).coerceAtLeast(1)
-        val sb = StringBuilder(fallbackSeed)
-        var x = 0
-        while (x < w) {
-            var y = 0
-            while (y < h) {
-                sb.append(bitmap.getPixel(x, y))
-                y += sampleStepY
-            }
-            x += sampleStepX
-        }
-        val pubHex = YggCryptoEngine.sha256Hex(sb.toString())
-        val pubBytes = pubHex.chunked(2).mapNotNull { it.toIntOrNull(16)?.toByte() }.toByteArray()
-        val ipv6 = YggCryptoEngine.computeYggdrasilIpv6(pubBytes)
-        val shortTag = pubHex.take(6).uppercase()
-        val synthesizedUri = "ygggram://$ipv6?pub=$pubHex&name=QR-Node-$shortTag"
-        return ParsedYggContactQr(
-            displayName = "Узел QR-$shortTag",
-            yggIpv6Address = ipv6,
-            ed25519PubKeyHex = pubHex,
-            directLanHint = "",
-            rawUri = synthesizedUri
-        )
+        // Not a readable YggGram QR matrix: reject instead of synthesizing a fake node identity
+        // from the image's pixel digest (a fabricated contact could silently shadow a real peer).
+        return null
     }
 }

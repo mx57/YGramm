@@ -17,7 +17,7 @@ import androidx.room.RoomDatabase
         BackupSnapshotEntity::class,
         CryptoKeyRecordEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -27,6 +27,14 @@ abstract class YggDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: YggDatabase? = null
 
+        private val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN peerX25519PublicKeyHex TEXT NOT NULL DEFAULT ''"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -34,6 +42,7 @@ abstract class YggDatabase : RoomDatabase() {
                     YggDatabase::class.java,
                     "ygggram_encrypted_store.db"
                 )
+                    .addMigrations(MIGRATION_5_6)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                 INSTANCE = instance

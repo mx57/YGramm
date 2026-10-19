@@ -104,7 +104,8 @@ fun QrContactModal(
             yggIpv6Address = uiState.identity.yggIpv6Address,
             ed25519PubKeyHex = uiState.identity.yggNodePublicKeyHex,
             localLanIp = uiState.localLanIp,
-            localPort = uiState.localUdpPort
+            localPort = uiState.localUdpPort,
+            x25519PubKeyHex = uiState.identity.x25519IdentityPubHex
         )
     }
 
@@ -513,7 +514,7 @@ private fun CameraQrPreviewBox(
                                 }
                                 if (bmp != null) {
                                     val candidate = YggQrCodeCodec.decodeQrBitmap(bmp)
-                                    if (candidate != null && candidate.rawUri.contains("name=") && !candidate.rawUri.contains("QR-Node-")) {
+                                    if (candidate != null) {
                                         alreadyTriggered = true
                                         previewView.post {
                                             onQrDetected(candidate)

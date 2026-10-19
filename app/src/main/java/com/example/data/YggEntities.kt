@@ -40,7 +40,8 @@ data class ConversationEntity(
     val avatarColorHex: String,
     val bioStatus: String,
     val routeTransportSummary: String,
-    val ownerProfileId: String = "profile_primary"
+    val ownerProfileId: String = "profile_primary",
+    val peerX25519PublicKeyHex: String = ""
 )
 
 @Entity(tableName = "messages")
