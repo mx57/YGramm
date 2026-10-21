@@ -1,18 +1,22 @@
 // File: app/src/main/java/com/example/viewmodel/YggGramViewModel.kt
 package com.example.viewmodel
 
+import android.Manifest
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.BackupSnapshotEntity
+import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
 import com.example.data.CryptoKeyRecordEntity
 import com.example.data.LinkedDeviceEntity
@@ -25,30 +29,47 @@ import com.example.data.YggRepository
 import com.example.engine.CountryFilterOption
 import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.DiscoveredYggPeer
+import com.example.engine.IncomingCallAudioPacket
+import com.example.engine.IncomingCallSignalPacket
+import com.example.engine.OverlayProbeOutcome
+import com.example.engine.SelfYggdrasilRelayResult
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
+import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
 import com.example.service.YggAlertCategory
+import com.example.service.YggCallAlertController
 import com.example.service.YggForegroundServiceState
 import com.example.service.YggNodeForegroundService
 import com.example.service.YggNotificationCenter
 import com.example.service.YggPopupNotificationItem
+import com.example.service.YggQuickReplyBus
 import com.example.ui.components.PendingProfileSwitchRequest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class YggNavTab {
     CHATS,
@@ -118,7 +139,7 @@ data class DecentralizedUserProfile(
     val displayName: String = "Узел YggGram #1",
     val handle: String = "@node1.ygg",
     val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
-    val statusText: String = "В оверлее 200::/7 (Порт :51921)",
+    val statusText: String = "В оверлее 200::/7 (Порт 51921)",
     val allocatedTcpPort: Int = 51921,
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
@@ -135,25 +156,39 @@ data class PrivacyMatrixState(
     val hashcashDifficultyBits: Int = 10,
     val allowDirectLanDiscovery: Boolean = false,
     val webDavEndpointUrl: String = "https://webdav.private-node.org:8443/ygg-zk-vault",
-    val autoSyncOnMeshConnect: Boolean = true
+    val autoSyncOnMeshConnect: Boolean = true,
+    val inAppNotificationsEnabled: Boolean = true,
+    val systemNotificationsEnabled: Boolean = true,
+    val suppressNotificationsForOpenChat: Boolean = true,
+    val messageNotificationsEnabled: Boolean = true,
+    val voiceNotificationsEnabled: Boolean = true,
+    val callNotificationsEnabled: Boolean = true
 )
 
 data class ActiveVoiceCallState(
     val chatId: String,
     val peerTitle: String,
     val peerIpv6: String,
-    val callStatus: String, // "DIALING_YGG", "ACTIVE_ENCRYPTED", "OFFLINE_ERROR"
+    // "DIALING_YGG", "RINGING_INCOMING", "ACTIVE_ENCRYPTED", "OFFLINE_ERROR"
+    val callStatus: String,
     val statusSubtext: String,
     val durationSeconds: Int = 0,
     val isMuted: Boolean = false,
     val isSpeakerphoneOn: Boolean = true,
-    val isLoopbackEchoEnabled: Boolean = true,
-    val micAmplitudeLevel: Float = 0.18f,
+    val isLoopbackEchoEnabled: Boolean = false,
+    val micAmplitudeLevel: Float = 0f,
     val verificationEmojis: String = "🔐 🛰️ 🐉 ⚡",
     val liveRttMs: Int = -1,
-    val audioBitrateKbps: Int = 48,
+    val audioBitrateKbps: Int = 256,
     val txAudioFrames: Int = 0,
-    val rxAudioFrames: Int = 0
+    val rxAudioFrames: Int = 0,
+    val isIncoming: Boolean = false,
+    val callId: String = "",
+    val transport: String = "",
+    val mediaEncrypted: Boolean = false,
+    // True while the peer's X25519 key is still unknown: an SAS derived from an
+    // empty peer key would differ on the two phones, so it must not be shown.
+    val sasPending: Boolean = false
 )
 
 data class YggGramUiState(
@@ -180,12 +215,15 @@ data class YggGramUiState(
     val isSeedPhraseRevealed: Boolean = false,
     val antiDpiConfig: AntiDpiConfigState = AntiDpiConfigState(),
     val peerScanner: PeerScannerState = PeerScannerState(),
+    val coreMesh: YggNativeCoreBridge.CoreMeshState = YggNativeCoreBridge.CoreMeshState(available = false),
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
     val privacyMatrix: PrivacyMatrixState = PrivacyMatrixState(),
     val activeVoiceCall: ActiveVoiceCallState? = null,
     val activePopupNotification: YggPopupNotificationItem? = null,
     val pendingProfileSwitchRequest: PendingProfileSwitchRequest? = null,
     val recentNotificationsHistory: List<YggPopupNotificationItem> = emptyList(),
+    // chatId -> peer label; entries expire a few seconds after the last TYPING frame.
+    val typingPeers: Map<String, String> = emptyMap(),
     val statusBannerMessage: String? = null
 )
 
@@ -194,12 +232,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private val database = YggDatabase.getInstance(application)
     private val repository = YggRepository(database.yggDao(), application.applicationContext)
 
-    private val defaultMnemonic = listOf(
-        "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
-        "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
-    )
+    private val uiPrefs = application.getSharedPreferences("ygggram_ui_prefs", android.content.Context.MODE_PRIVATE)
+    // Notifications are suppressed for a chat only while that chat is actually on screen.
+    @Volatile
+    private var appIsForeground: Boolean = true
 
-    private val initialIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(defaultMnemonic, epoch = 1)
+    // Bootstrap identity for the first UI frame only: a fresh random mnemonic per launch.
+    // ensureInitialized() persists the real mnemonic on first run, so no fixed default
+    // key material ever ships with the app.
+    private val initialIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+        YggCryptoEngine.generateFreshMnemonic12(),
+        epoch = 1
+    )
 
     private val _uiState = MutableStateFlow(
         YggGramUiState(
@@ -210,7 +254,75 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     val foregroundServiceState: StateFlow<YggForegroundServiceState> = YggNodeForegroundService.serviceState
 
+    /** Call journal of the active profile, newest first. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val callLog: StateFlow<List<CallLogEntity>> = _uiState
+        .map { it.currentProfileId }
+        .distinctUntilChanged()
+        .flatMapLatest { repository.observeCallLog(it) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Full-text message search across the active profile's conversations. */
+    @OptIn(
+        kotlinx.coroutines.ExperimentalCoroutinesApi::class,
+        kotlinx.coroutines.FlowPreview::class
+    )
+    val messageSearchResults: StateFlow<List<MessageEntity>> = _uiState
+        .map { it.currentProfileId to it.searchQuery.trim() }
+        .distinctUntilChanged()
+        .debounce(250L)
+        .flatMapLatest { (profileId, query) -> repository.searchMessages(profileId, query) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    private val typingExpiryJobs =
+        java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+    private val lastTypingSentAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private companion object {
+        const val TYPING_THROTTLE_MS = 4_000L
+        const val TYPING_EXPIRY_MS = 6_000L
+    }
+
     private var activeCallJob: kotlinx.coroutines.Job? = null
+
+    private data class CallSessionContext(
+        val chatId: String,
+        val callId: String,
+        val peerTitle: String,
+        val peerIpv6: String,
+        val peerNodeKeyHex: String,
+        val peerLanHint: String,
+        val localProfileId: String,
+        val localIpv6: String,
+        val localName: String,
+        val localX25519PrivateKey: ByteArray,
+        val localX25519PubHex: String,
+        val peerX25519PubHex: String,
+        val isIncoming: Boolean
+    )
+
+    @Volatile
+    private var activeCallContext: CallSessionContext? = null
+
+    @Volatile
+    private var activeCallStartedAt: Long = 0L
+
+    @Volatile
+    private var activeCallMediaKey: ByteArray? = null
+
+    private var callMediaSendJob: kotlinx.coroutines.Job? = null
+    private var callTickerJob: kotlinx.coroutines.Job? = null
+    private var callTimeoutJob: kotlinx.coroutines.Job? = null
+    private var pendingCallAccept: CompletableDeferred<IncomingCallSignalPacket>? = null
+    private var pendingCallAcceptCallId: String = ""
+    // A retried RINGING can arrive after the call was declined or answered; it
+    // must not ring again or answer an already finished call.
+    private val recentlyEndedCallIds = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val callRxFrameCounter = AtomicLong(0L)
+    private val callMicQueue = Channel<ByteArray>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    @Volatile
+    private var callLastLevelEmitAt: Long = 0L
 
     private val networkEngine = YggTwinP2PBridge(
         context = application.applicationContext,
@@ -220,7 +332,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 val allProfs = repository.getAllProfilesNow()
                 val targetProfile = allProfs.find {
                     it.profileId == packet.recipientProfileId ||
-                        it.yggIpv6Address.equals(packet.recipientIpv6, ignoreCase = true)
+                        sameMeshAddress(it.yggIpv6Address, packet.recipientIpv6)
                 } ?: allProfs.find { it.profileId == currentPrimaryId } ?: allProfs.firstOrNull()
 
                 val chatId = repository.recordIncomingTwinMessage(
@@ -236,8 +348,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     ""
                 }
 
+                // The message is already on screen when its chat is open under the active
+                // profile: no popup, no system notification and no banner in that case.
+                val chatVisibleNow = targetProfile != null &&
+                    isChatCurrentlyVisible(chatId, targetProfile.profileId)
+                val suppressForOpenChat = chatVisibleNow &&
+                    _uiState.value.privacyMatrix.suppressNotificationsForOpenChat
+
                 // Dispatch Popup & Android System Notification if the recipient profile is enabled in settings
-                if (targetProfile != null && (targetProfile.isActiveInBackground || targetProfile.isCurrentPrimary)) {
+                if (!suppressForOpenChat &&
+                    targetProfile != null &&
+                    (targetProfile.isActiveInBackground || targetProfile.isCurrentPrimary)
+                ) {
                     val isVoice = packet.attachmentType == "VOICE"
                     val category = if (isVoice) YggAlertCategory.NEW_VOICE else YggAlertCategory.NEW_MESSAGE
                     val previewText = when (packet.attachmentType) {
@@ -261,20 +383,41 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     it.copy(
                         isTwinAppReachable = true,
                         rxPacketsCount = it.rxPacketsCount + 1,
+                        typingPeers = it.typingPeers - chatId,
                         selectedChatId = if (packet.recipientProfileId.isBlank() || packet.recipientProfileId == currentPrimaryId) {
                             it.selectedChatId ?: chatId
                         } else {
                             it.selectedChatId
                         },
-                        statusBannerMessage = "Получен пакет Yggdrasil от «$targetProfileName <- ${packet.senderNodeLabel}»$profileSuffix (${packet.rttMs} мс)"
+                        statusBannerMessage = if (suppressForOpenChat) {
+                            it.statusBannerMessage
+                        } else {
+                            "Получен пакет Yggdrasil от «$targetProfileName <- ${packet.senderNodeLabel}»$profileSuffix (${packet.rttMs} мс)"
+                        }
                     )
+                }
+                if (chatVisibleNow) {
+                    launch { flushReadReceipts(chatId) }
                 }
                 syncForegroundServiceNotification()
             }
         },
-        onDeliveryAckReceived = { _, messageId, _ ->
+        onDeliveryAckReceived = { chatId, messageId, rttMs ->
             viewModelScope.launch {
                 repository.markMessageDelivered(messageId)
+                if (chatId.isNotBlank()) {
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = true,
+                        routeSummary = "Доставка подтверждена ACK получателя (${rttMs} мс)"
+                    )
+                }
+                _uiState.update {
+                    it.copy(
+                        rxPacketsCount = it.rxPacketsCount + 1,
+                        statusBannerMessage = "Получатель подтвердил доставку ACK (${rttMs} мс)"
+                    )
+                }
             }
         },
         onTwinReachableChanged = { reachable ->
@@ -291,12 +434,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 val chatId = repository.createNewConversation(
                     title = lanNode.displayName,
                     yggIpv6Input = lanNode.yggIpv6,
-                    isMlsGroup = false,
-                    sealedSender = true,
                     disappearingSeconds = 0,
                     directEndpointHint = "${lanNode.hostIp}:${lanNode.tcpPort}",
                     localIdentity = _uiState.value.identity,
-                    ownerProfileId = _uiState.value.currentProfileId
+                    ownerProfileId = _uiState.value.currentProfileId,
+                    peerEd25519PublicKeyHex = lanNode.pubKeyHex
                 )
                 _uiState.update {
                     it.copy(
@@ -308,53 +450,67 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         },
         onReactionReceived = { reaction ->
             viewModelScope.launch {
-                repository.toggleReactionOnMessage(
-                    messageId = reaction.messageId,
-                    emoji = reaction.emoji,
-                    byMe = false
-                )
+                val added = reaction.action != "REMOVE"
+                var applied: MessageEntity? = null
+                // A reaction can overtake its message when both travel as separate
+                // overlay datagrams; retry briefly before giving up on the lookup.
+                for (attempt in 0..2) {
+                    applied = repository.applyPeerReaction(
+                        wireMessageId = reaction.messageId,
+                        emoji = reaction.emoji,
+                        added = added
+                    )
+                    if (applied != null) break
+                    if (attempt < 2) delay(700)
+                }
+                val target = applied
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = if (target != null) {
+                            if (added) "Получена реакция ${reaction.emoji} от ${reaction.senderIpv6.take(16)}…"
+                            else "Собеседник снял реакцию ${reaction.emoji}"
+                        } else {
+                            "Реакция ${reaction.emoji} получена, но сообщение для неё не найдено"
+                        }
+                    )
+                }
+            }
+        },
+        onReadReceiptReceived = { _, ids ->
+            viewModelScope.launch {
+                ids.forEach { repository.markOutgoingMessageRead(it) }
+                if (ids.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Собеседник прочитал сообщений: ${ids.size}")
+                    }
+                }
+            }
+        },
+        onTypingReceived = { peerChatId, label, senderIpv6 ->
+            viewModelScope.launch {
+                val localChatId = repository.findConversationIdByPeerIpv6(
+                    senderIpv6 = senderIpv6,
+                    ownerProfileId = _uiState.value.currentProfileId
+                ) ?: peerChatId
+                _uiState.update { it.copy(typingPeers = it.typingPeers + (localChatId to label)) }
+                typingExpiryJobs.remove(localChatId)?.cancel()
+                typingExpiryJobs[localChatId] = viewModelScope.launch {
+                    delay(TYPING_EXPIRY_MS)
+                    _uiState.update { state ->
+                        if (state.typingPeers[localChatId] == label) {
+                            state.copy(typingPeers = state.typingPeers - localChatId)
+                        } else {
+                            state
+                        }
+                    }
+                }
             }
         },
         onIncomingCallSignalReceived = { callSig ->
-            viewModelScope.launch {
-                val allProfs = repository.getAllProfilesNow()
-                val targetProfile = allProfs.find {
-                    it.profileId == callSig.recipientProfileId ||
-                        it.yggIpv6Address.equals(callSig.recipientIpv6, ignoreCase = true)
-                } ?: allProfs.find { it.isCurrentPrimary } ?: allProfs.firstOrNull() ?: return@launch
-
-                if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) {
-                    return@launch
-                }
-
-                // Ensure a conversation exists for the caller in that target profile
-                val targetConvId = if (callSig.chatId.isNotBlank() && repository.getConversation(callSig.chatId)?.ownerProfileId == targetProfile.profileId) {
-                    callSig.chatId
-                } else {
-                    repository.createNewConversation(
-                        title = callSig.callerName.ifBlank { "Узел Yggdrasil" },
-                        yggIpv6Input = callSig.callerIpv6.ifBlank { "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8" },
-                        isMlsGroup = false,
-                        sealedSender = true,
-                        disappearingSeconds = 0,
-                        ownerProfileId = targetProfile.profileId
-                    )
-                }
-
-                val isMissed = callSig.signalAction == "MISSED"
-                emitPopupAndSystemNotification(
-                    category = if (isMissed) YggAlertCategory.MISSED_CALL else YggAlertCategory.INCOMING_CALL,
-                    targetProfile = targetProfile,
-                    chatId = targetConvId,
-                    senderName = callSig.callerName.ifBlank { "Узел Yggdrasil" },
-                    senderIpv6 = callSig.callerIpv6.ifBlank { "0201::mesh" },
-                    messagePreview = if (isMissed) {
-                        "Пропущенный зашифрованный аудиозвонок Yggdrasil 0200::/7"
-                    } else {
-                        "Входящий зашифрованный голосовой вызов (Opus/PCM XChaCha20-Poly1305)"
-                    }
-                )
-            }
+            viewModelScope.launch { handleIncomingCallSignal(callSig) }
+        },
+        onCallAudioFrameReceived = { packet ->
+            handleIncomingCallAudioFrame(packet)
         },
         onProfileRelayPacketHandled = { profileId, _ ->
             viewModelScope.launch {
@@ -397,12 +553,26 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     val cryptoKeys: StateFlow<List<CryptoKeyRecordEntity>> = repository.cryptoKeys
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val queuedOfflineMessagesCount: StateFlow<Int> = combine(allMessages) { (msgs) ->
-        msgs.count { it.deliveryState == "QUEUED_OFFLINE_SF" }
+    val queuedOfflineMessagesCount: StateFlow<Int> = combine(allMessages, conversations) { msgs, convs ->
+        val ownerChatIds = convs.map { it.chatId }.toSet()
+        msgs.count { it.deliveryState == "QUEUED_OFFLINE_SF" && it.chatId in ownerChatIds }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     init {
+        _uiState.update { state ->
+            state.copy(
+                privacyMatrix = state.privacyMatrix.copy(
+                    inAppNotificationsEnabled = uiPrefs.getBoolean("notif_in_app", true),
+                    systemNotificationsEnabled = uiPrefs.getBoolean("notif_system", true),
+                    suppressNotificationsForOpenChat = uiPrefs.getBoolean("notif_suppress_open_chat", true),
+                    messageNotificationsEnabled = uiPrefs.getBoolean("notif_messages", true),
+                    voiceNotificationsEnabled = uiPrefs.getBoolean("notif_voice", true),
+                    callNotificationsEnabled = uiPrefs.getBoolean("notif_calls", true)
+                )
+            )
+        }
         YggNodeForegroundService.onUserRequestedStop = {
+            networkEngine.stop()
             _uiState.update {
                 it.copy(
                     isBackgroundServiceEnabled = false,
@@ -428,15 +598,56 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             startNetworkAndAirplaneObserver()
             syncForegroundServiceNotification()
             refreshRealPeerConnectivity()
+            YggQuickReplyBus.drain(getApplication()).forEach { deliverQuickReply(it) }
+            YggQuickReplyBus.registerHandler { reply ->
+                viewModelScope.launch { deliverQuickReply(reply) }
+            }
         }
+
+        // The store-and-forward queue used to be flushed only on an offline -> online
+        // transition, so a message queued while the overlay had no live peer stayed
+        // queued for the whole session even after the route recovered.
+        viewModelScope.launch {
+            while (true) {
+                delay(45_000L)
+                if (repository.getQueuedMessages().isEmpty()) continue
+                if (!networkEngine.isRealNetworkAvailable()) continue
+                flushQueuedMessagesOverRealNetwork()
+            }
+        }
+
+        // The peer card must reflect the real Go core: only the core knows which
+        // public links are up and which remote nodes its routing tree reached.
+        viewModelScope.launch {
+            while (true) {
+                refreshCoreMeshState()
+                delay(8_000L)
+            }
+        }
+    }
+
+    private suspend fun refreshCoreMeshState() {
+        val profileId = _uiState.value.currentProfileId
+        val state = withContext(Dispatchers.IO) {
+            YggNativeCoreBridge.readMeshState(profileId)
+        }
+        _uiState.update { it.copy(coreMesh = state) }
     }
 
     private fun applyUserProfileEntityToState(profileEntity: UserProfileEntity) {
         val words = profileEntity.mnemonicCsv.split(" ").filter { it.isNotBlank() }
-        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(
-            if (words.size >= 6) words else defaultMnemonic,
-            epoch = 1
-        )
+        val effectiveWords = if (words.size >= 6) {
+            words
+        } else {
+            // Legacy profile without usable mnemonic: generate and persist a fresh one so the
+            // derived identity remains stable across restarts.
+            val fresh = YggCryptoEngine.generateFreshMnemonic12()
+            viewModelScope.launch {
+                repository.persistProfileMnemonic(profileEntity.profileId, fresh)
+            }
+            fresh
+        }
+        val hierarchy = YggCryptoEngine.deriveHierarchyFromMnemonic(effectiveWords, epoch = 1)
         val sigHash = YggCryptoEngine.sha256Hex(
             "${profileEntity.displayName}:${profileEntity.handle}:${profileEntity.bio}:${hierarchy.yggNodePublicKeyHex}"
         )
@@ -461,6 +672,57 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun isChatCurrentlyVisible(chatId: String, profileId: String): Boolean {
+        if (!appIsForeground || chatId.isBlank()) return false
+        val state = _uiState.value
+        return state.activeTab == YggNavTab.CHATS &&
+            state.selectedChatId == chatId &&
+            (profileId.isBlank() || profileId == state.currentProfileId)
+    }
+
+    fun setAppForeground(foreground: Boolean) {
+        appIsForeground = foreground
+    }
+
+    /**
+     * Notification switches are persisted so they survive restarts; the popup and the
+     * Android heads-up notification are gated independently because a user may want
+     * in-app alerts without system tray noise (or the other way around).
+     */
+    fun updateNotificationPreferences(
+        inAppNotificationsEnabled: Boolean? = null,
+        systemNotificationsEnabled: Boolean? = null,
+        suppressNotificationsForOpenChat: Boolean? = null,
+        messageNotificationsEnabled: Boolean? = null,
+        voiceNotificationsEnabled: Boolean? = null,
+        callNotificationsEnabled: Boolean? = null
+    ) {
+        _uiState.update { state ->
+            val p = state.privacyMatrix
+            val next = p.copy(
+                inAppNotificationsEnabled = inAppNotificationsEnabled ?: p.inAppNotificationsEnabled,
+                systemNotificationsEnabled = systemNotificationsEnabled ?: p.systemNotificationsEnabled,
+                suppressNotificationsForOpenChat = suppressNotificationsForOpenChat ?: p.suppressNotificationsForOpenChat,
+                messageNotificationsEnabled = messageNotificationsEnabled ?: p.messageNotificationsEnabled,
+                voiceNotificationsEnabled = voiceNotificationsEnabled ?: p.voiceNotificationsEnabled,
+                callNotificationsEnabled = callNotificationsEnabled ?: p.callNotificationsEnabled
+            )
+            state.copy(
+                privacyMatrix = next,
+                statusBannerMessage = "Настройки уведомлений сохранены"
+            )
+        }
+        val p = _uiState.value.privacyMatrix
+        uiPrefs.edit()
+            .putBoolean("notif_in_app", p.inAppNotificationsEnabled)
+            .putBoolean("notif_system", p.systemNotificationsEnabled)
+            .putBoolean("notif_suppress_open_chat", p.suppressNotificationsForOpenChat)
+            .putBoolean("notif_messages", p.messageNotificationsEnabled)
+            .putBoolean("notif_voice", p.voiceNotificationsEnabled)
+            .putBoolean("notif_calls", p.callNotificationsEnabled)
+            .apply()
+    }
+
     private fun emitPopupAndSystemNotification(
         category: YggAlertCategory,
         targetProfile: UserProfileEntity,
@@ -468,8 +730,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         senderName: String,
         senderIpv6: String,
         messagePreview: String,
-        voiceDurationSec: Int = 0
+        voiceDurationSec: Int = 0,
+        callId: String = ""
     ) {
+        val privacy = _uiState.value.privacyMatrix
+        val categoryAllowed = when (category) {
+            YggAlertCategory.NEW_MESSAGE -> privacy.messageNotificationsEnabled
+            YggAlertCategory.NEW_VOICE -> privacy.voiceNotificationsEnabled
+            YggAlertCategory.INCOMING_CALL, YggAlertCategory.MISSED_CALL -> privacy.callNotificationsEnabled
+        }
+        if (!categoryAllowed) return
+        if (!privacy.inAppNotificationsEnabled && !privacy.systemNotificationsEnabled) return
+
         val app = getApplication<Application>()
         val item = YggPopupNotificationItem(
             notificationId = "notif_${UUID.randomUUID().toString().take(8)}",
@@ -484,15 +756,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             senderIpv6 = senderIpv6,
             messagePreview = messagePreview,
             voiceDurationSec = voiceDurationSec,
+            callId = callId,
             timestamp = System.currentTimeMillis()
         )
-        _uiState.update { state ->
-            state.copy(
-                activePopupNotification = item,
-                recentNotificationsHistory = (listOf(item) + state.recentNotificationsHistory).take(25)
-            )
+        if (privacy.inAppNotificationsEnabled && appIsForeground) {
+            _uiState.update { state ->
+                state.copy(
+                    activePopupNotification = item,
+                    recentNotificationsHistory = (listOf(item) + state.recentNotificationsHistory).take(25)
+                )
+            }
         }
-        YggNotificationCenter.postSystemHeadsUpNotification(app, item)
+        if (privacy.systemNotificationsEnabled) {
+            YggNotificationCenter.postSystemHeadsUpNotification(app, item)
+        }
     }
 
     fun dismissPopupNotification() {
@@ -542,6 +819,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun declineIncomingCallNotification(item: YggPopupNotificationItem) {
+        val ctx = activeCallContext
+        if (ctx != null && ctx.isIncoming &&
+            _uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING" &&
+            (item.chatId.isBlank() || item.chatId == ctx.chatId)
+        ) {
+            declineIncomingCall()
+            return
+        }
         viewModelScope.launch {
             val allProfs = repository.getAllProfilesNow()
             val targetProf = allProfs.find { it.profileId == item.targetProfileId } ?: return@launch
@@ -567,7 +852,23 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     selectedChatId = item.chatId.ifBlank { it.selectedChatId }
                 )
             }
-            if (actionType == "ANSWER_CALL" || actionType == "CALLBACK_MISSED") {
+            if (actionType == "ANSWER_CALL") {
+                kotlinx.coroutines.delay(120L)
+                val pendingIncoming = activeCallContext?.isIncoming == true &&
+                    _uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING"
+                if (pendingIncoming) {
+                    acceptIncomingCall()
+                }
+                // Without a live ring there is nothing to answer. Redialling from
+                // the notification used to place an outgoing call by surprise.
+            } else if (actionType == YggNotificationCenter.ACTION_DECLINE_CALL) {
+                kotlinx.coroutines.delay(120L)
+                val pendingIncoming = activeCallContext?.isIncoming == true &&
+                    _uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING"
+                if (pendingIncoming) {
+                    declineIncomingCall()
+                }
+            } else if (actionType == "CALLBACK_MISSED") {
                 kotlinx.coroutines.delay(120L)
                 if (item.chatId.isNotBlank()) {
                     startVoiceCall(item.chatId)
@@ -579,10 +880,37 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun handleSystemNotificationIntent(
         targetProfileId: String,
         chatId: String,
-        categoryName: String
+        categoryName: String,
+        action: String = "",
+        callId: String = ""
     ) {
         if (targetProfileId.isBlank() && chatId.isBlank()) return
         viewModelScope.launch {
+            if (action == YggNotificationCenter.ACTION_DECLINE_CALL) {
+                val ctx = activeCallContext
+                val ringing = ctx?.isIncoming == true &&
+                    _uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING" &&
+                    (callId.isBlank() || ctx.callId == callId)
+                if (ringing) {
+                    declineIncomingCall()
+                }
+                if (callId.isNotBlank()) {
+                    YggNotificationCenter.cancelIncomingCall(getApplication(), callId)
+                }
+                return@launch
+            }
+            if (action == YggNotificationCenter.ACTION_ANSWER_CALL) {
+                val ctx = activeCallContext
+                val ringing = ctx?.isIncoming == true &&
+                    _uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING" &&
+                    (callId.isBlank() || ctx.callId == callId)
+                if (ringing) {
+                    acceptIncomingCall()
+                    return@launch
+                }
+                // The ring is gone (answered elsewhere or already timed out);
+                // just open the conversation instead of dialling back.
+            }
             val allProfs = repository.getAllProfilesNow()
             val targetProf = allProfs.find { it.profileId == targetProfileId }
                 ?: allProfs.find { it.profileId == _uiState.value.currentProfileId }
@@ -600,11 +928,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 chatId = chatId,
                 senderName = conv?.title ?: "Узел Yggdrasil",
                 senderIpv6 = conv?.yggIpv6Address ?: "0200::/7",
-                messagePreview = conv?.lastMessagePreview ?: "Открытие события из системного уведомления Android"
+                messagePreview = conv?.lastMessagePreview ?: "Открытие события из системного уведомления Android",
+                callId = callId
             )
+            // Tapping a call notification opens the app: answering is an explicit
+            // action in the notification, not a side effect of a tap.
             val actionType = when (cat) {
-                YggAlertCategory.INCOMING_CALL -> "ANSWER_CALL"
-                YggAlertCategory.MISSED_CALL -> "CALLBACK_MISSED"
+                YggAlertCategory.INCOMING_CALL -> "OPEN_CHAT"
+                YggAlertCategory.MISSED_CALL -> "OPEN_CHAT"
                 else -> "OPEN_CHAT"
             }
             handlePopupNotificationAction(syntheticItem, actionType)
@@ -646,6 +977,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     "Фоновый сервис Yggdrasil отключен"
                 }
             )
+        }
+        if (enabled) {
+            viewModelScope.launch {
+                networkEngine.start()
+                networkEngine.syncConcurrentProfileListeners(repository.getAllProfilesNow())
+            }
+        } else {
+            networkEngine.stop()
         }
         syncForegroundServiceNotification()
     }
@@ -745,8 +1084,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val chatId = repository.createNewConversation(
                 title = senderLabel,
                 yggIpv6Input = senderIpv6,
-                isMlsGroup = false,
-                sealedSender = true,
                 disappearingSeconds = 0,
                 directEndpointHint = "",
                 ownerProfileId = targetProfile.profileId
@@ -756,7 +1093,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 YggAlertCategory.INCOMING_CALL -> "Входящий голосовой вызов через оверлей Yggdrasil (Opus/PCM AEAD)"
                 YggAlertCategory.MISSED_CALL -> "Пропущенный голосовой вызов • Нажмите «Перезвонить»"
                 YggAlertCategory.NEW_VOICE -> "🎙️ Голосовое сообщение (6 сек) • Записано с микрофона (PCM 16 кГц)"
-                YggAlertCategory.NEW_MESSAGE -> "Новое зашифрованное сообщение X3DH + Double Ratchet для профиля «${targetProfile.displayName}»"
+                YggAlertCategory.NEW_MESSAGE -> "Новое сообщение, защищённое X25519 + AES-256-GCM, для профиля «${targetProfile.displayName}»"
+            }
+
+            if (_uiState.value.privacyMatrix.systemNotificationsEnabled &&
+                !YggNotificationCenter.canPostNotifications(getApplication<Application>())
+            ) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Системные уведомления заблокированы Android: разрешите их в профиле или настройках приложения")
+                }
             }
 
             emitPopupAndSystemNotification(
@@ -839,8 +1184,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val chatId = repository.createNewConversation(
                 title = "${targetProfile.displayName} (${targetProfile.handle})",
                 yggIpv6Input = "ygggram://${targetProfile.yggIpv6Address}?pub=${targetProfile.yggPublicKeyHex}",
-                isMlsGroup = false,
-                sealedSender = true,
                 disappearingSeconds = 0,
                 directEndpointHint = "",
                 localIdentity = _uiState.value.identity,
@@ -986,15 +1329,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
             val aliveCount = results.count { it.second.reachable }
             val bestRtt = results.filter { it.second.reachable }.minOfOrNull { it.second.rttMs }
+            val coreMesh = withContext(Dispatchers.IO) {
+                YggNativeCoreBridge.readMeshState(_uiState.value.currentProfileId)
+            }
             _uiState.update { state ->
+                // The core is the authority: a peer can refuse the plain TCP/TLS
+                // handshake while the Yggdrasil link over the same endpoint is up.
                 val report = if (aliveCount > 0) {
-                    "Соединение с сетью Yggdrasil активно: живых пиров $aliveCount из ${results.size} (лучший пинг: ${bestRtt ?: "-"} мс)"
+                    "TCP/TLS-сканер: живых пиров $aliveCount из ${results.size} (лучший пинг: ${bestRtt ?: "-"} мс)"
                 } else {
-                    "Ни один из ${results.size} пиров не ответил на TCP/TLS рукопожатие (проверьте сеть или выберите живой пир в Сканере)"
+                    "TCP/TLS-сканер: ни один из ${results.size} пиров не ответил на рукопожатие"
                 }
                 state.copy(
                     rxPacketsCount = state.rxPacketsCount + aliveCount,
                     txPacketsCount = state.txPacketsCount + results.size,
+                    coreMesh = coreMesh,
                     antiDpiConfig = state.antiDpiConfig.copy(
                         isProbingRoutes = false,
                         lastProbeReport = report
@@ -1007,6 +1356,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     override fun onCleared() {
         super.onCleared()
+        YggQuickReplyBus.unregisterHandler()
+        typingExpiryJobs.values.forEach { it.cancel() }
+        typingExpiryJobs.clear()
         try {
             airplaneReceiver?.let { getApplication<Application>().unregisterReceiver(it) }
         } catch (_: Exception) {
@@ -1029,15 +1381,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (chatId != null) {
             viewModelScope.launch {
                 repository.markConversationRead(chatId)
+                flushReadReceipts(chatId)
             }
         }
     }
 
     /**
-     * Opens the dedicated "Избранное • Мой узел Yggdrasil" self-chat and optionally
-     * sends an immediate test message routed strictly through external public Yggdrasil peers.
+     * Opens the dedicated "Избранное • Мой узел Yggdrasil" self-chat.
      */
-    fun openSelfYggdrasilTestChat(sendInitialTestMessage: Boolean = false) {
+    fun openSelfYggdrasilTestChat() {
         viewModelScope.launch {
             val selfChatId = repository.ensureSelfYggdrasilConversation(
                 identity = _uiState.value.identity,
@@ -1049,13 +1401,63 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     selectedChatId = selfChatId
                 )
             }
-            if (sendInitialTestMessage) {
-                sendMessage(
-                    chatId = selfChatId,
-                    plainText = "Тест связи Yggdrasil: проверка маршрута через внешний публичный пир до моего узла ${_uiState.value.identity.yggIpv6Address}"
+        }
+    }
+
+    /**
+     * Runs a real round trip through the 0200::/7 overlay and reports the result
+     * in the banner and in the self-chat route status.
+     *
+     * A node cannot address itself inside the overlay, so the check addresses a
+     * remote node from the routing tree and waits for its session acknowledgement.
+     */
+    fun runYggdrasilOverlaySelfTest() {
+        viewModelScope.launch {
+            updateConnectivitySnapshot()
+            val profileId = _uiState.value.currentProfileId
+            val selfChatId = repository.ensureSelfYggdrasilConversation(
+                identity = _uiState.value.identity,
+                ownerProfileId = profileId
+            )
+            val outcome = networkEngine.probeOverlayRoundTrip(profileId)
+            applyOverlayProbeOutcome(outcome, selfChatId)
+        }
+    }
+
+    private suspend fun applyOverlayProbeOutcome(outcome: OverlayProbeOutcome, selfChatId: String?) {
+        if (outcome.confirmed) {
+            val routeSummary = "Yggdrasil • оверлей (интернет, RTT ${outcome.rttMs} мс)"
+            if (!selfChatId.isNullOrBlank()) {
+                repository.updateConversationRouteStatus(selfChatId, true, routeSummary)
+            }
+            repository.updatePeerTrafficByEndpoint(
+                endpointUri = "overlay://yggdrasil-0200::7",
+                rttMs = outcome.rttMs.toInt(),
+                txDelta = outcome.txBytes,
+                rxDelta = 0L
+            )
+            _uiState.update {
+                it.copy(
+                    rxPacketsCount = it.rxPacketsCount + 1,
+                    statusBannerMessage = "Оверлей Yggdrasil подтверждён: ответ удалённой ноды через 0200::/7 за ${outcome.rttMs} мс"
+                )
+            }
+        } else {
+            if (!selfChatId.isNullOrBlank()) {
+                repository.updateConversationRouteStatus(
+                    selfChatId,
+                    false,
+                    "Маршрут оверлея не подтверждён (${outcome.errorDetail ?: "нет ответа удалённой ноды"})"
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Оверлей Yggdrasil не подтверждён: ${outcome.errorDetail ?: "нет ответа удалённой ноды"}"
                 )
             }
         }
+        refreshCoreMeshState()
+        syncForegroundServiceNotification()
     }
 
     fun deleteChat(chatId: String) {
@@ -1101,8 +1503,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private fun isConversationSelfNode(conv: ConversationEntity?, identity: DerivedIdentityHierarchy): Boolean {
         if (conv == null) return false
         return YggRepository.isSelfChatId(conv.chatId) ||
-            conv.yggIpv6Address.equals(identity.yggIpv6Address, ignoreCase = true) ||
-            conv.publicKeyHex.equals(identity.yggNodePublicKeyHex, ignoreCase = true)
+            conv.publicKeyHex.equals(identity.yggNodePublicKeyHex, ignoreCase = true) ||
+            sameMeshAddress(conv.yggIpv6Address, identity.yggIpv6Address)
+    }
+
+    private fun sameMeshAddress(first: String, second: String): Boolean {
+        if (first.trim().equals(second.trim(), ignoreCase = true)) return true
+        val left = YggCryptoEngine.normalizeIpv6Literal(first) ?: return false
+        val right = YggCryptoEngine.normalizeIpv6Literal(second) ?: return false
+        return left == right
     }
 
     private suspend fun buildCandidateExternalPeersList(): List<Triple<String, String, String>> {
@@ -1118,15 +1527,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private fun flushQueuedMessagesOverRealNetwork() {
         viewModelScope.launch {
             updateConnectivitySnapshot()
-            if (!networkEngine.isRealNetworkAvailable()) {
+            val hasInternet = networkEngine.isRealNetworkAvailable()
+            if (!hasInternet) {
                 _uiState.update {
-                    it.copy(statusBannerMessage = "Очередь S&F ожидает подключения к сети (сейчас устройство офлайн)")
+                    it.copy(statusBannerMessage = "Нет интернета: очередь S&F пробует прямые LAN-маршруты контактов")
                 }
-                return@launch
             }
             val app = getApplication<Application>()
             val queued = repository.getQueuedMessages()
             var deliveredCount = 0
+            var confirmedCount = 0
             val currentIdentity = _uiState.value.identity
             val candidateExternalPeers = buildCandidateExternalPeersList()
 
@@ -1145,44 +1555,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     null
                 }
                 if (isConversationSelfNode(conv, currentIdentity)) {
-                    val selfRelay = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
-                        chatId = conv.chatId,
-                        messageId = msg.messageId,
-                        senderNodeLabel = _uiState.value.userProfile.displayName,
-                        senderIpv6 = currentIdentity.yggIpv6Address,
-                        senderPubKeyHex = currentIdentity.yggNodePublicKeyHex,
-                        plainText = msg.plainText,
-                        cipherPayloadHex = msg.cipherPayloadHex,
-                        hashcashToken = msg.hashcashPowToken,
-                        attachmentName = msg.attachmentName,
-                        attachmentSizeBytes = msg.attachmentSizeBytes,
-                        candidatePeers = candidateExternalPeers,
-                        attachmentType = msg.attachmentType,
-                        attachmentUri = msg.attachmentUri,
-                        attachmentBase64 = attachmentBase64,
-                        voiceDurationSec = msg.voiceDurationSec,
-                        voiceWaveformCsv = msg.voiceWaveformCsv
-                    )
-                    if (selfRelay.delivered) {
-                        deliveredCount++
-                        repository.updatePeerTrafficByEndpoint(
-                            endpointUri = selfRelay.relayEndpointUri,
-                            rttMs = selfRelay.rttMs.toInt(),
-                            txDelta = selfRelay.txBytes,
-                            rxDelta = selfRelay.rxBytes
-                        )
-                    }
+                    // A node cannot address itself inside the 0200::/7 overlay, so a message
+                    // to the own node is stored as a local note. The mesh itself is verified
+                    // separately by the overlay probe.
+                    repository.markMessageLocalNote(msg.messageId)
+                    deliveredCount++
                 } else {
                     val directHint = extractDirectEndpointHint(conv)
+                    val peerIdentity = repository.resolvePeerNodeIdentity(conv)
                     val overlayRelay = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                         chatId = conv.chatId,
                         messageId = msg.messageId,
                         peerTitle = conv.title,
-                        peerIpv6 = conv.yggIpv6Address,
+                        peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address },
                         directEndpointHint = directHint,
                         senderNodeLabel = _uiState.value.userProfile.displayName,
                         senderIpv6 = currentIdentity.yggIpv6Address,
                         senderPubKeyHex = currentIdentity.yggNodePublicKeyHex,
+                        recipientNodePubKeyHex = peerIdentity.publicKeyHex,
                         plainText = msg.plainText,
                         cipherPayloadHex = msg.cipherPayloadHex,
                         hashcashToken = msg.hashcashPowToken,
@@ -1198,6 +1588,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     )
                     if (overlayRelay.delivered) {
                         deliveredCount++
+                        if (overlayRelay.endToEndConfirmed) {
+                            confirmedCount++
+                        } else {
+                            repository.markMessageSentP2P(msg.messageId)
+                        }
                         if (overlayRelay.relayEndpointUri.isNotBlank()) {
                             repository.updatePeerTrafficByEndpoint(
                                 endpointUri = overlayRelay.relayEndpointUri,
@@ -1205,22 +1600,25 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                                 txDelta = overlayRelay.txBytes,
                                 rxDelta = overlayRelay.rxBytes
                             )
-                            repository.updateConversationRouteStatus(
-                                chatId = conv.chatId,
-                                isOnline = true,
-                                routeSummary = "Yggdrasil • ${overlayRelay.relayRegionLabel} (${overlayRelay.rttMs} мс)"
-                            )
                         }
+                        repository.updateConversationRouteStatus(
+                            chatId = conv.chatId,
+                            isOnline = true,
+                            routeSummary = describeDeliveryRoute(overlayRelay)
+                        )
                     }
                 }
             }
             if (queued.isNotEmpty()) {
                 _uiState.update {
                     it.copy(
-                        statusBannerMessage = if (deliveredCount > 0) {
-                            "Доставлено $deliveredCount из ${queued.size} сообщений очереди S&F через сеть Yggdrasil"
-                        } else {
-                            "Сообщения (${queued.size} шт.) остаются в очереди S&F: внешние узлы Yggdrasil не ответили"
+                        statusBannerMessage = when {
+                            confirmedCount > 0 ->
+                                "Доставлено и подтверждено ACK: $confirmedCount из ${queued.size} сообщений очереди S&F"
+                            deliveredCount > 0 ->
+                                "Отправлено $deliveredCount из ${queued.size}, ACK пока не получен — нажмите «Повторить» в чате"
+                            else ->
+                                "Сообщения (${queued.size} шт.) остаются в очереди S&F: подтвержденного маршрута нет"
                         }
                     )
                 }
@@ -1229,9 +1627,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun describeDeliveryRoute(result: SelfYggdrasilRelayResult): String = when {
+        result.transport == "LAN_DIRECT" -> "LAN • прямое TCP, ACK ${result.rttMs} мс"
+        result.transport == "LOCAL_PROFILE" -> "Локальный профиль • ACK ${result.rttMs} мс"
+        result.endToEndConfirmed -> "Yggdrasil • оверлей, ACK ${result.rttMs} мс"
+        result.delivered -> "Yggdrasil • оверлей — ожидается ACK"
+        else -> "Очередь S&F • ${result.errorDetail ?: "нет маршрута"}"
+    }
+
+    private fun describeDeliveryBanner(result: SelfYggdrasilRelayResult, peerTitle: String): String = when {
+        result.transport == "LAN_DIRECT" -> "Доставлено напрямую по локальной сети (ACK ${result.rttMs} мс)"
+        result.transport == "LOCAL_PROFILE" -> "Доставлено локальному профилю «$peerTitle» (ACK ${result.rttMs} мс)"
+        result.endToEndConfirmed -> "Доставлено через оверлей Yggdrasil (ACK ${result.rttMs} мс)"
+        else -> "Пакет передан в оверлей Yggdrasil, но ACK от «$peerTitle» не получен — повторы идут в фоне"
+    }
+
+    private fun hasVerifiedOverlayKey(conv: ConversationEntity?): Boolean {
+        if (conv == null) return false
+        val key = conv.publicKeyHex.trim().lowercase()
+        return YggCryptoEngine.isEd25519Hex(key) &&
+            YggCryptoEngine.addressMatchesEd25519Key(conv.yggIpv6Address, key)
+    }
+
     private fun extractDirectEndpointHint(conv: ConversationEntity?): String {
         if (conv == null) return ""
-        if (!_uiState.value.privacyMatrix.allowDirectLanDiscovery) return ""
+        // An explicit lan= endpoint is part of this contact and is honoured regardless
+        // of the global LAN toggle; passive discovery remains gated by the toggle.
         val bio = conv.bioStatus.trim()
         if (bio.contains(":") && !bio.contains(" ") && !bio.startsWith("127.0.0.1:")) return bio
         val route = conv.routeTransportSummary
@@ -1242,6 +1663,66 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         return ""
     }
 
+    /**
+     * Marks incoming messages of [chatId] read and tells the peer which wire ids were
+     * displayed. Best-effort: the local state is updated first, the receipt then uses
+     * the same overlay/LAN paths as normal messages.
+     */
+    private suspend fun flushReadReceipts(chatId: String) {
+        if (chatId.isBlank() || YggRepository.isSelfChatId(chatId)) return
+        val wireIds = repository.getUnreadIncomingWireIds(chatId)
+        if (wireIds.isEmpty()) return
+        repository.markIncomingMessagesRead(chatId)
+        val conv = repository.getConversation(chatId) ?: return
+        val state = _uiState.value
+        if (conv.ownerProfileId.isNotBlank() && conv.ownerProfileId != state.currentProfileId) return
+        val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+        val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+        if (peerIpv6.isBlank()) return
+        val hint = extractDirectEndpointHint(conv)
+        networkEngine.dispatchReadReceipt(
+            chatId = chatId,
+            wireMessageIds = wireIds,
+            peerIpv6 = peerIpv6,
+            directEndpointHint = hint,
+            senderIpv6 = state.identity.yggIpv6Address,
+            senderPubKeyHex = state.identity.yggNodePublicKeyHex,
+            recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+            allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery || hint.isNotBlank()
+        )
+    }
+
+    /**
+     * Sends a reply typed in a system notification. The conversation belongs to a
+     * concrete profile, so a reply from a background profile switches the active
+     * profile first; the banner states that plainly.
+     */
+    private suspend fun deliverQuickReply(reply: YggQuickReplyBus.PendingReply) {
+        if (reply.chatId.isBlank() || reply.text.isBlank()) return
+        val targetProfileId = reply.profileId.ifBlank { _uiState.value.currentProfileId }
+        if (targetProfileId != _uiState.value.currentProfileId) {
+            val pair = repository.switchPrimaryUserProfile(targetProfileId)
+            if (pair == null) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Быстрый ответ не отправлен: профиль отправителя недоступен"
+                    )
+                }
+                return
+            }
+            networkEngine.syncConcurrentProfileListeners(repository.getAllProfilesNow())
+            applyUserProfileEntityToState(pair.first)
+            syncForegroundServiceNotification()
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Быстрый ответ из уведомления: активный профиль " +
+                        "переключён на «${pair.first.displayName}»"
+                )
+            }
+        }
+        sendMessage(reply.chatId, reply.text)
+    }
+
     fun sendMessage(
         chatId: String,
         plainText: String,
@@ -1250,7 +1731,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         attachmentType: String? = null,
         attachmentUri: String? = null,
         voiceDurationSec: Int = 0,
-        voiceWaveformCsv: String? = null
+        voiceWaveformCsv: String? = null,
+        quotedMessageId: String = "",
+        forwardedFrom: String = ""
     ) {
         if (plainText.isBlank() && attachmentName == null && attachmentType == null) return
         updateConnectivitySnapshot()
@@ -1268,6 +1751,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val targetConv = repository.getConversation(chatId) ?: conversations.value.find { it.chatId == chatId }
             val allowManualLan = currentState.privacyMatrix.allowDirectLanDiscovery
+            // An explicit lan= endpoint from the contact is real consent for a direct
+            // route, so it also works offline and with the global LAN toggle off.
+            val directHint = extractDirectEndpointHint(targetConv)
+            val offline = currentState.isOfflineStoreAndForwardMode ||
+                (!currentState.isNetworkAvailable && !allowManualLan && directHint.isBlank())
 
             // Prepare local copy and binary Base64 payload for real P2P transfer
             var resolvedLocalUri = attachmentUri
@@ -1296,12 +1784,25 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
+            // The quote must reference the id the receiver knows the quoted message by.
+            val wireQuoteId = if (quotedMessageId.isBlank()) {
+                ""
+            } else {
+                repository.getMessage(quotedMessageId)?.let { quoted ->
+                    if (quoted.isOutgoing) {
+                        quoted.messageId
+                    } else {
+                        quoted.peerMessageId.ifBlank { quoted.messageId }
+                    }
+                }.orEmpty()
+            }
+
             val savedMsg = repository.sendEncryptedMessage(
                 chatId = chatId,
                 plainText = effectiveText,
                 senderName = currentState.userProfile.displayName,
                 senderIpv6 = currentState.identity.yggIpv6Address,
-                isOfflineMode = currentState.isOfflineStoreAndForwardMode || (!currentState.isNetworkAvailable && !allowManualLan),
+                isOfflineMode = offline,
                 sealedSenderGlobal = currentState.privacyMatrix.sealedSenderGlobal,
                 powDifficultyBits = currentState.privacyMatrix.hashcashDifficultyBits,
                 attachmentName = attachmentName,
@@ -1309,10 +1810,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentType = effectiveType,
                 attachmentUri = resolvedLocalUri,
                 voiceDurationSec = voiceDurationSec,
-                voiceWaveformCsv = voiceWaveformCsv
+                voiceWaveformCsv = voiceWaveformCsv,
+                replyToMessageId = wireQuoteId,
+                forwardedFrom = forwardedFrom
             ) ?: return@launch
 
-            if (currentState.isOfflineStoreAndForwardMode || (!currentState.isNetworkAvailable && !allowManualLan)) {
+            if (offline) {
                 val reason = if (currentState.isAirplaneModeOn) "Авиарежим" else "Офлайн"
                 repository.updateConversationRouteStatus(
                     chatId = chatId,
@@ -1321,7 +1824,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
                 _uiState.update {
                     it.copy(
-                        statusBannerMessage = "Сеть Yggdrasil недоступна ($reason): доставка в обход оверлея заблокирована, сообщение в очереди S&F"
+                        statusBannerMessage = "Сеть Yggdrasil недоступна ($reason): сообщение в очереди S&F"
                     )
                 }
                 return@launch
@@ -1332,70 +1835,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
             // Check if sending to self ("Избранное • Мой узел Yggdrasil" or own IPv6/PubKey)
             if (isConversationSelfNode(targetConv, currentState.identity)) {
-                val selfRelayResult = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
-                    chatId = chatId,
-                    messageId = savedMsg.messageId,
-                    senderNodeLabel = currentState.userProfile.displayName,
-                    senderIpv6 = currentState.identity.yggIpv6Address,
-                    senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
-                    plainText = effectiveText,
-                    cipherPayloadHex = savedMsg.cipherPayloadHex,
-                    hashcashToken = savedMsg.hashcashPowToken,
-                    attachmentName = attachmentName,
-                    attachmentSizeBytes = resolvedSizeBytes,
-                    candidatePeers = candidatePeers,
-                    attachmentType = effectiveType,
-                    attachmentUri = resolvedLocalUri,
-                    attachmentBase64 = attachmentBase64,
-                    voiceDurationSec = voiceDurationSec,
-                    voiceWaveformCsv = voiceWaveformCsv
-                )
-
-                if (selfRelayResult.delivered) {
-                    repository.updatePeerTrafficByEndpoint(
-                        endpointUri = selfRelayResult.relayEndpointUri,
-                        rttMs = selfRelayResult.rttMs.toInt(),
-                        txDelta = selfRelayResult.txBytes,
-                        rxDelta = selfRelayResult.rxBytes
-                    )
-                    repository.updateConversationRouteStatus(
-                        chatId = chatId,
-                        isOnline = true,
-                        routeSummary = "Yggdrasil • ${selfRelayResult.relayRegionLabel} (${selfRelayResult.rttMs} мс)"
-                    )
-                    _uiState.update {
-                        it.copy(
-                            rxPacketsCount = it.rxPacketsCount + 1,
-                            statusBannerMessage = "Проверено через Yggdrasil (${selfRelayResult.relayEndpointUri}): RTT ${selfRelayResult.rttMs} мс"
-                        )
-                    }
-                } else {
-                    repository.updateConversationRouteStatus(
-                        chatId = chatId,
-                        isOnline = false,
-                        routeSummary = "Нет активных пиров Yggdrasil (${selfRelayResult.errorDetail ?: "офлайн"})"
-                    )
-                    _uiState.update {
-                        it.copy(
-                            statusBannerMessage = "Не удалось отправить через Yggdrasil (${selfRelayResult.errorDetail ?: "нет живых пиров"}) — сообщение в очереди S&F"
-                        )
-                    }
-                }
+                // A node cannot address itself inside the 0200::/7 overlay, so the note is
+                // stored locally and the real mesh route is confirmed by the overlay probe.
+                repository.markMessageLocalNote(savedMsg.messageId)
+                val outcome = networkEngine.probeOverlayRoundTrip(currentState.currentProfileId)
+                applyOverlayProbeOutcome(outcome, chatId)
                 syncForegroundServiceNotification()
                 return@launch
             }
 
-            // Route inter-profile and P2P messages strictly through external Yggdrasil peers (with automatic peer failover)
-            val directHint = extractDirectEndpointHint(targetConv)
+            // Route through the real Yggdrasil overlay first, then an explicit LAN
+            // endpoint as a confirmed fallback. A stale stored key is never used.
+            val peerIdentity = targetConv?.let { repository.resolvePeerNodeIdentity(it) }
+            val peerIpv6 = peerIdentity?.yggIpv6Address?.takeIf { it.isNotBlank() }
+                ?: targetConv?.yggIpv6Address
+                ?: ""
+            val peerNodeKey = peerIdentity?.publicKeyHex.orEmpty()
             val overlayResult = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                 chatId = chatId,
                 messageId = savedMsg.messageId,
                 peerTitle = targetConv?.title ?: "Узел Yggdrasil",
-                peerIpv6 = targetConv?.yggIpv6Address ?: "",
+                peerIpv6 = peerIpv6,
                 directEndpointHint = directHint,
                 senderNodeLabel = currentState.userProfile.displayName,
                 senderIpv6 = currentState.identity.yggIpv6Address,
                 senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerNodeKey,
                 plainText = effectiveText,
                 cipherPayloadHex = savedMsg.cipherPayloadHex,
                 hashcashToken = savedMsg.hashcashPowToken,
@@ -1407,11 +1872,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentUri = resolvedLocalUri,
                 attachmentBase64 = attachmentBase64,
                 voiceDurationSec = voiceDurationSec,
-                voiceWaveformCsv = voiceWaveformCsv
+                voiceWaveformCsv = voiceWaveformCsv,
+                replyToMessageId = wireQuoteId,
+                forwardedFrom = forwardedFrom
             )
 
             if (overlayResult.delivered) {
-                if (overlayResult.relayEndpointUri.isNotBlank()) {
+                if (overlayResult.relayEndpointUri.isNotBlank() && overlayResult.rttMs > 0) {
                     repository.updatePeerTrafficByEndpoint(
                         endpointUri = overlayResult.relayEndpointUri,
                         rttMs = overlayResult.rttMs.toInt(),
@@ -1419,26 +1886,31 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         rxDelta = overlayResult.rxBytes
                     )
                 }
+                if (!overlayResult.endToEndConfirmed) {
+                    repository.markMessageSentP2P(savedMsg.messageId)
+                }
                 repository.updateConversationRouteStatus(
                     chatId = chatId,
                     isOnline = true,
-                    routeSummary = "Yggdrasil • ${overlayResult.relayRegionLabel} (${overlayResult.rttMs} мс)"
+                    routeSummary = describeDeliveryRoute(overlayResult)
                 )
                 _uiState.update {
                     it.copy(
-                        rxPacketsCount = it.rxPacketsCount + 1,
-                        statusBannerMessage = "Доставлено через пир Yggdrasil ${overlayResult.relayEndpointUri} (${overlayResult.relayRegionLabel}, RTT ${overlayResult.rttMs} мс)"
+                        statusBannerMessage = describeDeliveryBanner(
+                            overlayResult,
+                            targetConv?.title ?: "Узел Yggdrasil"
+                        )
                     )
                 }
             } else {
                 repository.updateConversationRouteStatus(
                     chatId = chatId,
                     isOnline = false,
-                    routeSummary = "Очередь S&F • ${overlayResult.errorDetail ?: "Нет доступных пиров Yggdrasil"}"
+                    routeSummary = "Очередь S&F • ${overlayResult.errorDetail ?: "Нет подтвержденного маршрута"}"
                 )
                 _uiState.update {
                     it.copy(
-                        statusBannerMessage = "Маршрут Yggdrasil недоступен (${overlayResult.errorDetail ?: "нет живых пиров"}) — сообщение поставлено в очередь S&F"
+                        statusBannerMessage = "Сообщение в очереди S&F: ${overlayResult.errorDetail ?: "нет подтвержденного маршрута к получателю"}"
                     )
                 }
             }
@@ -1496,8 +1968,61 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    fun toggleMessageReaction(messageId: String, emoji: String) {
+    fun forwardMessage(messageId: String, targetChatId: String) {
         viewModelScope.launch {
+            val source = repository.getMessage(messageId) ?: return@launch
+            if (targetChatId.isBlank()) return@launch
+            val author = source.forwardedFrom.ifBlank {
+                if (source.isOutgoing) _uiState.value.userProfile.displayName else source.senderName
+            }
+            val text = source.plainText.ifBlank {
+                source.attachmentName?.let { "📎 Вложение: $it" }.orEmpty()
+            }
+            if (text.isBlank()) return@launch
+            sendMessage(
+                chatId = targetChatId,
+                plainText = text,
+                forwardedFrom = author.ifBlank { "Yggdrasil" }
+            )
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Сообщение переслано в «${repository.getConversationTitle(targetChatId) ?: "диалог"}»"
+                )
+            }
+        }
+    }
+
+    /** Throttled typing notification; it is ephemeral and never queued. */
+    fun notifyTyping(chatId: String) {
+        if (chatId.isBlank() || YggRepository.isSelfChatId(chatId)) return
+        val now = System.currentTimeMillis()
+        val last = lastTypingSentAt[chatId] ?: 0L
+        if (now - last < TYPING_THROTTLE_MS) return
+        val state = _uiState.value
+        if (state.isOfflineStoreAndForwardMode || !state.isNetworkAvailable) return
+        lastTypingSentAt[chatId] = now
+        viewModelScope.launch {
+            val conv = repository.getConversation(chatId) ?: return@launch
+            if (isConversationSelfNode(conv, state.identity)) return@launch
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+            if (peerIpv6.isBlank()) return@launch
+            val hint = extractDirectEndpointHint(conv)
+            networkEngine.dispatchTypingIndicator(
+                chatId = chatId,
+                peerIpv6 = peerIpv6,
+                directEndpointHint = hint,
+                senderIpv6 = state.identity.yggIpv6Address,
+                senderPubKeyHex = state.identity.yggNodePublicKeyHex,
+                senderNodeLabel = state.userProfile.displayName,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery || hint.isNotBlank()
+            )
+        }
+    }
+
+    fun toggleMessageReaction(messageId: String, emoji: String) {        viewModelScope.launch {
+            val targetMsg = repository.getMessage(messageId) ?: return@launch
             val updated = repository.toggleReactionOnMessage(
                 messageId = messageId,
                 emoji = emoji,
@@ -1505,15 +2030,43 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             ) ?: return@launch
 
             val conv = repository.getConversation(updated.chatId) ?: return@launch
+            // Self-chat notes never leave the device; there is no peer to notify.
+            if (YggRepository.isSelfChatId(conv.chatId)) return@launch
+
+            val addedByMe = YggRepository.parseReactionsMap(updated.reactionsJson)[emoji]?.second == true
+            // The peer must receive the id its own copy of the message uses.
+            val wireMessageId = if (targetMsg.isOutgoing) {
+                targetMsg.messageId
+            } else {
+                targetMsg.peerMessageId.ifBlank { targetMsg.messageId }
+            }
             val directHint = extractDirectEndpointHint(conv)
-            if (networkEngine.isRealNetworkAvailable() || directHint.startsWith("127.0.0.1:")) {
-                networkEngine.dispatchReactionFrame(
-                    chatId = conv.chatId,
-                    messageId = messageId,
-                    emoji = emoji,
-                    peerIpv6 = conv.yggIpv6Address,
-                    directEndpointHint = directHint,
-                    senderIpv6 = _uiState.value.identity.yggIpv6Address
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val ownerProfile = repository.getAllProfilesNow().find { it.profileId == conv.ownerProfileId }
+            val result = networkEngine.dispatchReactionFrame(
+                chatId = conv.chatId,
+                messageId = wireMessageId,
+                emoji = emoji,
+                action = if (addedByMe) "ADD" else "REMOVE",
+                peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address },
+                directEndpointHint = directHint,
+                senderIpv6 = ownerProfile?.yggIpv6Address ?: _uiState.value.identity.yggIpv6Address,
+                senderPubKeyHex = ownerProfile?.yggPublicKeyHex
+                    ?: _uiState.value.identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                candidatePeers = buildCandidateExternalPeersList(),
+                allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+            )
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = when {
+                        result.delivered && result.transport == "YGG_OVERLAY" ->
+                            "Реакция $emoji доставлена адресату через оверлей Yggdrasil (ACK)"
+                        result.delivered ->
+                            "Реакция $emoji доставлена адресату по LAN (ACK)"
+                        else -> "Реакция $emoji сохранена локально, но адресат её не подтвердил: " +
+                            (result.errorDetail ?: "нет подтвержденного маршрута")
+                    }
                 )
             }
         }
@@ -1526,24 +2079,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val newChatId = repository.createNewConversation(
                 title = parsedQr.displayName,
                 yggIpv6Input = parsedQr.rawUri,
-                isMlsGroup = false,
-                sealedSender = true,
                 disappearingSeconds = _uiState.value.privacyMatrix.defaultDisappearingSeconds,
                 directEndpointHint = parsedQr.directLanHint,
                 localIdentity = _uiState.value.identity,
-                ownerProfileId = _uiState.value.currentProfileId
+                ownerProfileId = _uiState.value.currentProfileId,
+                peerX25519PublicKeyHex = parsedQr.x25519PubKeyHex,
+                peerEd25519PublicKeyHex = parsedQr.ed25519PubKeyHex
             )
             if (parsedQr.directLanHint.isNotBlank()) {
                 networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
             }
+            val createdConv = repository.getConversation(newChatId)
+            val hasNodeKey = hasVerifiedOverlayKey(createdConv)
+            val createdLanHint = extractDirectEndpointHint(createdConv)
             _uiState.update {
                 it.copy(
                     activeTab = YggNavTab.CHATS,
                     selectedChatId = newChatId,
-                    statusBannerMessage = if (YggRepository.isSelfChatId(newChatId)) {
-                        "Распознан ваш собственный QR-код: открыт чат «Избранное • Мой узел Yggdrasil»"
-                    } else {
-                        "По QR-коду добавлен контакт «${parsedQr.displayName}» (${parsedQr.yggIpv6Address.take(18)}...)"
+                    statusBannerMessage = when {
+                        YggRepository.isSelfChatId(newChatId) ->
+                            "Распознан ваш собственный QR-код: открыт чат «Избранное • Мой узел Yggdrasil»"
+                        hasNodeKey ->
+                            "По QR-коду добавлен контакт «${parsedQr.displayName}» с проверенным Ed25519-ключом"
+                        createdLanHint.isNotBlank() ->
+                            "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint), оверлей требует полный ?pub=…"
+                        else ->
+                            "Контакт «${parsedQr.displayName}» добавлен без Ed25519-ключа: сообщения через оверлей недоставимы, нужен полный идентификатор"
                     }
                 )
             }
@@ -1551,143 +2112,718 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun startVoiceCall(chatId: String) {
-        activeCallJob?.cancel()
-        val app = getApplication<Application>()
-        val conv = conversations.value.find { it.chatId == chatId } ?: return
-        val emojiPool = listOf("🔐", "🛰️", "🐉", "⚡", "🛡️", "💎", "🔥", "🌊", "🦊", "🪐", "🎯", "🔑")
-        val hashHex = YggCryptoEngine.sha256Hex("${conv.publicKeyHex}:${_uiState.value.identity.yggNodePublicKeyHex}")
-        val emojis = (0 until 4).map { idx ->
-            val byteVal = hashHex.substring(idx * 2, idx * 2 + 2).toIntOrNull(16) ?: idx
-            emojiPool[byteVal % emojiPool.size]
-        }.joinToString(" ")
+        if (_uiState.value.activeVoiceCall != null) {
+            _uiState.update {
+                it.copy(statusBannerMessage = "Голосовой вызов уже идёт: сначала завершите текущий разговор")
+            }
+            return
+        }
+        viewModelScope.launch {
+            val conv = repository.getConversation(chatId)
+                ?: conversations.value.find { it.chatId == chatId }
+                ?: return@launch
+            val current = _uiState.value
+            if (YggRepository.isSelfChatId(conv.chatId) || isConversationSelfNode(conv, current.identity)) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Нельзя позвонить собственному узлу: выберите чат с собеседником")
+                }
+                return@launch
+            }
+            val ownerProfile = repository.getAllProfilesNow()
+                .find { it.profileId == current.currentProfileId }
+                ?: return@launch
+            val ownerWords = ownerProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+            val localPrivateKey = runCatching {
+                YggCryptoEngine.x25519PrivateKeyFromMnemonic(ownerWords, 1)
+            }.getOrNull()
+            if (ownerWords.size < 6 || localPrivateKey == null) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Звонок невозможен: у профиля нет валидной мнемоники для E2EE-ключа")
+                }
+                return@launch
+            }
+            val localPubHex = x25519PublicHex(localPrivateKey)
+            if (localPubHex.length != 64) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Звонок невозможен: не удалось вывести X25519-ключ профиля")
+                }
+                return@launch
+            }
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+            if (peerIpv6.isBlank()) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Звонок невозможен: у контакта «${conv.title}» нет адреса Yggdrasil")
+                }
+                return@launch
+            }
+            val peerXPub = repository.resolvePeerX25519PublicKeyHex(conv)
+            val hint = extractDirectEndpointHint(conv)
+            val allowLan = _uiState.value.privacyMatrix.allowDirectLanDiscovery || hint.isNotBlank()
+            val callId = UUID.randomUUID().toString()
+            val ctx = CallSessionContext(
+                chatId = conv.chatId,
+                callId = callId,
+                peerTitle = conv.title,
+                peerIpv6 = peerIpv6,
+                peerNodeKeyHex = peerIdentity.publicKeyHex,
+                peerLanHint = hint,
+                localProfileId = ownerProfile.profileId,
+                localIpv6 = ownerProfile.yggIpv6Address,
+                localName = ownerProfile.displayName,
+                localX25519PrivateKey = localPrivateKey,
+                localX25519PubHex = localPubHex,
+                peerX25519PubHex = peerXPub,
+                isIncoming = false
+            )
+            activeCallContext = ctx
+            activeCallStartedAt = System.currentTimeMillis()
+            activeCallMediaKey = if (isX25519KeyHex(peerXPub)) deriveCallKey(ctx) else null
+            pendingCallAccept?.cancel()
+            pendingCallAccept = null
+            val peerKeyKnownAtDial = isX25519KeyHex(peerXPub)
+            _uiState.update {
+                it.copy(
+                    activeVoiceCall = ActiveVoiceCallState(
+                        chatId = conv.chatId,
+                        peerTitle = conv.title,
+                        peerIpv6 = peerIpv6,
+                        callStatus = "DIALING_YGG",
+                        statusSubtext = "Отправка зашифрованного сигнала вызова через Yggdrasil...",
+                        verificationEmojis = if (peerKeyKnownAtDial) {
+                            buildCallVerificationEmojis(callId, localPubHex, peerXPub)
+                        } else {
+                            ""
+                        },
+                        isIncoming = false,
+                        callId = callId,
+                        mediaEncrypted = activeCallMediaKey != null,
+                        sasPending = !peerKeyKnownAtDial
+                    ),
+                    statusBannerMessage = "Исходящий вызов «${conv.title}»..."
+                )
+            }
+            YggAudioMediaEngine.startVoipCallAudioSession(
+                context = getApplication(),
+                isDialing = true,
+                isMuted = false,
+                isSpeakerphoneOn = true
+            )
+            val acceptDeferred = CompletableDeferred<IncomingCallSignalPacket>()
+            pendingCallAccept = acceptDeferred
+            pendingCallAcceptCallId = callId
+            activeCallJob?.cancel()
+            activeCallJob = viewModelScope.launch {
+                var deliveredTransport = ""
+                var deliveredRtt = -1L
+                var delivered = false
+                val maxAttempts = 4
+                for (attempt in 0 until maxAttempts) {
+                    if (_uiState.value.activeVoiceCall?.callId != callId) return@launch
+                    if (attempt > 0) {
+                        _uiState.update { state ->
+                            val call = state.activeVoiceCall ?: return@update state
+                            if (call.callId != callId) return@update state
+                            state.copy(
+                                activeVoiceCall = call.copy(
+                                    statusSubtext = "Повтор сигнала вызова • попытка ${attempt + 1} из $maxAttempts..."
+                                )
+                            )
+                        }
+                    }
+                    val result = networkEngine.dispatchCallControlSignal(
+                        chatId = conv.chatId,
+                        callId = callId,
+                        signalAction = "RINGING",
+                        peerIpv6 = peerIpv6,
+                        recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                        senderIpv6 = ownerProfile.yggIpv6Address,
+                        senderName = ownerProfile.displayName,
+                        senderX25519PubKeyHex = localPubHex,
+                        directEndpointHint = hint,
+                        allowLanFallback = allowLan
+                    )
+                    if (result.delivered) {
+                        delivered = true
+                        deliveredTransport = result.transport
+                        deliveredRtt = result.rttMs
+                        break
+                    }
+                    if (attempt < maxAttempts - 1) {
+                        _uiState.update { state ->
+                            val call = state.activeVoiceCall ?: return@update state
+                            if (call.callId != callId) return@update state
+                            state.copy(
+                                activeVoiceCall = call.copy(
+                                    statusSubtext = "Попытка ${attempt + 1} из $maxAttempts не удалась: " +
+                                        (result.errorDetail ?: "нет подтверждённого маршрута") + " • повтор..."
+                                )
+                            )
+                        }
+                        delay(1_500L)
+                    }
+                }
+                if (!delivered) {
+                    // The answer may have arrived while the last RINGING attempt was
+                    // still waiting for its ACK; an explicit ACCEPT proves delivery.
+                    if (!acceptDeferred.isCompleted) {
+                        finishCallWithError("Вызов «${conv.title}» не доставлен: нет подтверждённого маршрута до собеседника")
+                        return@launch
+                    }
+                }
+                _uiState.update { state ->
+                    val call = state.activeVoiceCall ?: return@update state
+                    if (call.callId != callId) return@update state
+                    state.copy(
+                        activeVoiceCall = call.copy(
+                            statusSubtext = "Сигнал вызова доставлен ($deliveredTransport) • ожидание ответа...",
+                            transport = deliveredTransport,
+                            liveRttMs = deliveredRtt.toInt()
+                        )
+                    )
+                }
+                val answer = withTimeoutOrNull(45_000L) { acceptDeferred.await() }
+                if (pendingCallAccept === acceptDeferred) pendingCallAccept = null
+                if (answer == null) {
+                    // Clear the dialing UI first: dispatching MISSED can take tens of
+                    // seconds on a lossy overlay, and the phone must not stay "ringing".
+                    finishCallWithError("Абонент «${conv.title}» не ответил за 45 секунд", "MISSED")
+                    viewModelScope.launch {
+                        networkEngine.dispatchCallControlSignal(
+                            chatId = conv.chatId,
+                            callId = callId,
+                            signalAction = "MISSED",
+                            peerIpv6 = peerIpv6,
+                            recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                            senderIpv6 = ownerProfile.yggIpv6Address,
+                            senderName = ownerProfile.displayName,
+                            senderX25519PubKeyHex = localPubHex,
+                            directEndpointHint = hint,
+                            allowLanFallback = allowLan
+                        )
+                    }
+                    return@launch
+                }
+                when (answer.signalAction.uppercase()) {
+                    "ACCEPT" -> {
+                        val peerKey = if (isX25519KeyHex(ctx.peerX25519PubHex)) {
+                            ctx.peerX25519PubHex
+                        } else {
+                            answer.senderX25519PubKeyHex
+                        }
+                        if (!isX25519KeyHex(peerKey)) {
+                            finishCallWithError("Абонент ответил, но не передал X25519-ключ для E2EE-аудио")
+                            return@launch
+                        }
+                        val acceptedCtx = ctx.copy(peerX25519PubHex = peerKey.trim().lowercase())
+                        activeCallContext = acceptedCtx
+                        val key = deriveCallKey(acceptedCtx)
+                        if (key == null) {
+                            finishCallWithError("Не удалось вывести общий E2EE-ключ звонка")
+                            return@launch
+                        }
+                        activeCallMediaKey = key
+                        repository.getConversation(conv.chatId)?.let {
+                            repository.pinConversationPeerX25519PublicKey(it, peerKey)
+                        }
+                        val media = networkEngine.openCallMediaChannel(
+                            chatId = conv.chatId,
+                            callId = callId,
+                            peerIpv6 = peerIpv6,
+                            recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                            senderIpv6 = ownerProfile.yggIpv6Address,
+                            senderName = ownerProfile.displayName,
+                            directEndpointHint = hint,
+                            allowLanFallback = allowLan
+                        )
+                        if (!media.opened) {
+                            finishCallWithError(
+                                "Абонент ответил, но голосовой канал не открылся: " +
+                                    (media.errorDetail ?: "нет маршрута")
+                            )
+                            return@launch
+                        }
+                        activateCall(
+                            ctx = acceptedCtx,
+                            transport = media.transport.ifBlank { deliveredTransport },
+                            rttMs = media.rttMs.takeIf { it > 0 } ?: deliveredRtt
+                        )
+                    }
+                    "DECLINE" -> finishCallWithError("Абонент «${conv.title}» отклонил вызов", "DECLINED")
+                    "BUSY" -> finishCallWithError("Абонент «${conv.title}» занят", "BUSY")
+                    "BYE" -> finishCallWithError("Абонент «${conv.title}» завершил вызов", "CANCELED")
+                    "MISSED" -> finishCallWithError("Вызов не принят абонентом", "MISSED")
+                    else -> finishCallWithError("Вызов прерван (${answer.signalAction})")
+                }
+            }
+        }
+    }
 
+    private suspend fun handleIncomingCallSignal(callSig: IncomingCallSignalPacket) {
+        val action = callSig.signalAction.ifBlank { "RINGING" }.uppercase()
+        if (action == "RINGING") {
+            handleIncomingRing(callSig)
+            return
+        }
+        if (action == "ACCEPT") {
+            val deferred = pendingCallAccept
+            if (deferred != null && callSig.callId == pendingCallAcceptCallId && !deferred.isCompleted) {
+                deferred.complete(callSig)
+            }
+            return
+        }
+        // DECLINE / BUSY / BYE / MISSED abort a dialing call through the accept waiter.
+        val deferred = pendingCallAccept
+        if (deferred != null && callSig.callId == pendingCallAcceptCallId && !deferred.isCompleted) {
+            deferred.complete(callSig)
+            return
+        }
+        val ctx = activeCallContext
+        if (ctx != null && ctx.callId == callSig.callId) {
+            // A repeated ACCEPT must never tear down an already active call.
+            if (action == "ACCEPT") return
+            val message = when (action) {
+                "DECLINE" -> "Абонент «${ctx.peerTitle}» отклонил вызов"
+                "BUSY" -> "Абонент «${ctx.peerTitle}» занят"
+                "BYE" -> "Собеседник «${ctx.peerTitle}» завершил вызов"
+                "MISSED" -> "Вызов не был принят"
+                else -> "Вызов завершён ($action)"
+            }
+            val outcome = when (action) {
+                "DECLINE" -> "DECLINED"
+                "BUSY" -> "BUSY"
+                "MISSED" -> "MISSED"
+                // BYE on an active call is a normal completion, on a ringing
+                // incoming call it means the caller hung up before an answer.
+                "BYE" -> if (_uiState.value.activeVoiceCall?.callStatus == "RINGING_INCOMING") {
+                    "CANCELED"
+                } else {
+                    "COMPLETED"
+                }
+                else -> "FAILED"
+            }
+            finishCallWithError(message, outcome)
+            return
+        }
+        if (action == "MISSED") {
+            // The peer's MISSED can echo back a call this device just finished itself
+            // (both sides time out at 45 s); rendering it here would fake an incoming
+            // missed call on the caller's phone.
+            if (recentlyEndedCallIds.containsKey(callSig.callId)) return
+            val target = repository.getAllProfilesNow().find {
+                it.profileId == callSig.recipientProfileId ||
+                    sameMeshAddress(it.yggIpv6Address, callSig.recipientIpv6)
+            } ?: return
+            emitPopupAndSystemNotification(
+                category = YggAlertCategory.MISSED_CALL,
+                targetProfile = target,
+                chatId = callSig.chatId,
+                senderName = callSig.callerName.ifBlank { "Узел Yggdrasil" },
+                senderIpv6 = callSig.callerIpv6.ifBlank { "0200::/7" },
+                messagePreview = "Пропущенный зашифрованный аудиозвонок Yggdrasil 0200::/7"
+            )
+        }
+    }
+
+    private fun pruneRecentlyEndedCalls() {
+        val cutoff = System.currentTimeMillis() - 120_000L
+        recentlyEndedCallIds.entries.removeAll { it.value < cutoff }
+        if (recentlyEndedCallIds.size > 32) {
+            recentlyEndedCallIds.entries
+                .sortedBy { it.value }
+                .take(recentlyEndedCallIds.size - 32)
+                .forEach { recentlyEndedCallIds.remove(it.key) }
+        }
+    }
+
+    private suspend fun handleIncomingRing(callSig: IncomingCallSignalPacket) {
+        if (callSig.callId.isBlank() || callSig.callerIpv6.isBlank()) return
+        pruneRecentlyEndedCalls()
+        if (recentlyEndedCallIds.containsKey(callSig.callId)) return
+        // A retried RINGING for the call we already know must not become BUSY:
+        // that used to tear down a call the user had just answered.
+        if (activeCallContext?.callId == callSig.callId) return
+
+        val allProfs = repository.getAllProfilesNow()
+        val targetProfile = allProfs.find {
+            it.profileId == callSig.recipientProfileId ||
+                sameMeshAddress(it.yggIpv6Address, callSig.recipientIpv6)
+        } ?: allProfs.find { it.isCurrentPrimary } ?: return
+        if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) return
+
+        val callerTitle = callSig.callerName.ifBlank { "Узел Yggdrasil" }
+        val conversationChatId = repository.createNewConversation(
+            title = callerTitle,
+            yggIpv6Input = callSig.callerIpv6,
+            disappearingSeconds = 0,
+            directEndpointHint = callSig.senderLanHint,
+            ownerProfileId = targetProfile.profileId,
+            peerX25519PublicKeyHex = callSig.senderX25519PubKeyHex,
+            peerEd25519PublicKeyHex = callSig.senderNodePubKeyHex
+        )
+        if (isX25519KeyHex(callSig.senderX25519PubKeyHex)) {
+            repository.getConversation(conversationChatId)?.let {
+                repository.pinConversationPeerX25519PublicKey(it, callSig.senderX25519PubKeyHex)
+            }
+        }
+
+        val profileWords = targetProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+        val localPrivateKey = runCatching {
+            YggCryptoEngine.x25519PrivateKeyFromMnemonic(profileWords, 1)
+        }.getOrNull() ?: return
+        val localPubHex = x25519PublicHex(localPrivateKey)
+        // The incoming LAN connection can appear as 127.0.0.1 (port-forwarded
+        // emulators) and then carries no usable reply hint. Fall back to the
+        // endpoint pinned in the contact so ACCEPT/BYE still take the direct path.
+        val replyLanHint = callSig.senderLanHint.ifBlank {
+            repository.getConversation(conversationChatId)?.let { extractDirectEndpointHint(it) }.orEmpty()
+        }
+        val ctx = CallSessionContext(
+            chatId = conversationChatId,
+            callId = callSig.callId,
+            peerTitle = callerTitle,
+            peerIpv6 = callSig.callerIpv6,
+            peerNodeKeyHex = callSig.senderNodePubKeyHex,
+            peerLanHint = replyLanHint,
+            localProfileId = targetProfile.profileId,
+            localIpv6 = targetProfile.yggIpv6Address,
+            localName = targetProfile.displayName,
+            localX25519PrivateKey = localPrivateKey,
+            localX25519PubHex = localPubHex,
+            peerX25519PubHex = callSig.senderX25519PubKeyHex.trim().lowercase(),
+            isIncoming = true
+        )
+
+        if (_uiState.value.activeVoiceCall != null || activeCallContext != null) {
+            sendCallControlSignalAsync(ctx, "BUSY")
+            logClosedCall(ctx, "BUSY", callSig.transport)
+            _uiState.update {
+                it.copy(statusBannerMessage = "Входящий вызов от «$callerTitle»: линия занята, отправлен BUSY")
+            }
+            return
+        }
+        if (!isX25519KeyHex(callSig.senderX25519PubKeyHex)) {
+            sendCallControlSignalAsync(ctx, "DECLINE")
+            logClosedCall(ctx, "DECLINED", callSig.transport)
+            _uiState.update {
+                it.copy(statusBannerMessage = "Входящий вызов от «$callerTitle» отклонён: нет X25519-ключа для E2EE-аудио")
+            }
+            return
+        }
+
+        emitPopupAndSystemNotification(
+            category = YggAlertCategory.INCOMING_CALL,
+            targetProfile = targetProfile,
+            chatId = conversationChatId,
+            senderName = callerTitle,
+            senderIpv6 = callSig.callerIpv6,
+            messagePreview = "Входящий зашифрованный голосовой вызов Yggdrasil 0200::/7",
+            callId = callSig.callId
+        )
+
+        activeCallContext = ctx
+        activeCallStartedAt = System.currentTimeMillis()
+        activeCallMediaKey = deriveCallKey(ctx)
+        pendingCallAccept?.cancel()
+        pendingCallAccept = null
+        activeCallJob?.cancel()
+        activeCallJob = null
+        val targetIsCurrent = targetProfile.profileId == _uiState.value.currentProfileId
         _uiState.update {
             it.copy(
                 activeVoiceCall = ActiveVoiceCallState(
-                    chatId = conv.chatId,
-                    peerTitle = conv.title,
-                    peerIpv6 = conv.yggIpv6Address,
-                    callStatus = "DIALING_YGG",
-                    statusSubtext = "Установка голосового канала через Yggdrasil 0200::/7...",
-                    durationSeconds = 0,
-                    isMuted = false,
-                    isSpeakerphoneOn = true,
-                    isLoopbackEchoEnabled = true,
-                    micAmplitudeLevel = 0.22f,
-                    verificationEmojis = emojis
-                )
+                    chatId = conversationChatId,
+                    peerTitle = callerTitle,
+                    peerIpv6 = callSig.callerIpv6,
+                    callStatus = "RINGING_INCOMING",
+                    statusSubtext = "Входящий зашифрованный вызов (${callSig.transport}) • примите или отклоните",
+                    verificationEmojis = buildCallVerificationEmojis(
+                        callSig.callId,
+                        localPubHex,
+                        callSig.senderX25519PubKeyHex
+                    ),
+                    isIncoming = true,
+                    callId = callSig.callId,
+                    transport = callSig.transport,
+                    mediaEncrypted = activeCallMediaKey != null
+                ),
+                selectedChatId = if (targetIsCurrent) conversationChatId else it.selectedChatId,
+                statusBannerMessage = "Входящий голосовой вызов от «$callerTitle»"
             )
         }
-
-        // Start real audible dialing ringback tone
         YggAudioMediaEngine.startVoipCallAudioSession(
-            context = app,
+            context = getApplication(),
             isDialing = true,
             isMuted = false,
             isSpeakerphoneOn = true
         )
-
-        activeCallJob = viewModelScope.launch {
-            updateConnectivitySnapshot()
-            val directHint = extractDirectEndpointHint(conv)
-            val allowManualLan = _uiState.value.privacyMatrix.allowDirectLanDiscovery
-            if (!networkEngine.isRealNetworkAvailable() && !allowManualLan) {
-                YggAudioMediaEngine.stopVoipCallAudioSession(app)
-                _uiState.update { state ->
-                    state.copy(
-                        activeVoiceCall = state.activeVoiceCall?.copy(
-                            callStatus = "OFFLINE_ERROR",
-                            statusSubtext = "Вызов невозможен: сеть Yggdrasil отключена или активен Авиарежим"
-                        )
+        YggCallAlertController.start(getApplication())
+        callTimeoutJob?.cancel()
+        callTimeoutJob = viewModelScope.launch {
+            delay(45_000L)
+            val ringingCall = _uiState.value.activeVoiceCall
+            if (ringingCall?.callId == callSig.callId && ringingCall.callStatus == "RINGING_INCOMING") {
+                val missedCtx = ctx
+                // Free the line immediately, then tell the caller asynchronously:
+                // a slow MISSED dispatch used to keep the phone "busy" for the next call.
+                viewModelScope.launch {
+                    networkEngine.dispatchCallControlSignal(
+                        chatId = missedCtx.chatId,
+                        callId = missedCtx.callId,
+                        signalAction = "MISSED",
+                        peerIpv6 = missedCtx.peerIpv6,
+                        recipientNodePubKeyHex = missedCtx.peerNodeKeyHex,
+                        senderIpv6 = missedCtx.localIpv6,
+                        senderName = missedCtx.localName,
+                        senderX25519PubKeyHex = missedCtx.localX25519PubHex,
+                        directEndpointHint = missedCtx.peerLanHint,
+                        allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
                     )
                 }
-                return@launch
+                emitPopupAndSystemNotification(
+                    category = YggAlertCategory.MISSED_CALL,
+                    targetProfile = targetProfile,
+                    chatId = conversationChatId,
+                    senderName = callerTitle,
+                    senderIpv6 = callSig.callerIpv6,
+                    messagePreview = "Пропущенный зашифрованный аудиозвонок: абонент не ответил за 45 секунд"
+                )
+                finishCallWithError("Пропущенный вызов от «$callerTitle»", "MISSED")
             }
+        }
+    }
 
-            val candidatePeers = buildCandidateExternalPeersList()
-            val (reachable, initialRtt) = networkEngine.probeVoiceCallChannel(
-                peerIpv6 = conv.yggIpv6Address,
-                directEndpointHint = directHint,
-                candidatePeers = candidatePeers,
-                senderIpv6 = _uiState.value.identity.yggIpv6Address,
-                callerName = _uiState.value.userProfile.displayName,
-                chatId = conv.chatId,
-                signalAction = "RINGING",
-                allowLanFallback = allowManualLan
-            )
-
-            if (!reachable) {
-                YggAudioMediaEngine.stopVoipCallAudioSession(app)
-                _uiState.update { state ->
-                    state.copy(
-                        activeVoiceCall = state.activeVoiceCall?.copy(
-                            callStatus = "OFFLINE_ERROR",
-                            statusSubtext = "Нет доступных внешних пиров Yggdrasil для маршрутизации звонка"
-                        )
-                    )
-                }
-                return@launch
-            }
-
-            val effectiveRtt = if (initialRtt > 0) initialRtt else 12
-            _uiState.update { state ->
-                state.copy(
-                    activeVoiceCall = state.activeVoiceCall?.copy(
-                        callStatus = "ACTIVE_ENCRYPTED",
-                        statusSubtext = "Зашифрованный аудиопоток PCM/Opus • RTT $effectiveRtt мс",
-                        liveRttMs = effectiveRtt,
-                        txAudioFrames = 1,
-                        rxAudioFrames = 1
-                    )
+    fun acceptIncomingCall() {
+        val ctx = activeCallContext ?: return
+        val call = _uiState.value.activeVoiceCall ?: return
+        if (!ctx.isIncoming || call.callStatus != "RINGING_INCOMING") return
+        if (ContextCompat.checkSelfPermission(
+                getApplication(),
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Разрешите доступ к микрофону, чтобы принять звонок от «${ctx.peerTitle}»"
                 )
             }
-
-            // Switch from dialing tone to active full-duplex VoIP audio stream
-            val currentCallSnapshot = _uiState.value.activeVoiceCall
-            YggAudioMediaEngine.updateVoipCallAudioState(
-                context = app,
-                isDialing = false,
-                isMuted = currentCallSnapshot?.isMuted ?: false,
-                isSpeakerphoneOn = currentCallSnapshot?.isSpeakerphoneOn ?: true
+            return
+        }
+        YggCallAlertController.stop()
+        YggNotificationCenter.cancelIncomingCall(getApplication(), ctx.callId)
+        callTimeoutJob?.cancel()
+        callTimeoutJob = null
+        _uiState.update { state ->
+            val active = state.activeVoiceCall ?: return@update state
+            state.copy(
+                activeVoiceCall = active.copy(statusSubtext = "Подтверждаем вызов и открываем E2EE-аудиоканал...")
             )
+        }
+        activeCallJob?.cancel()
+        activeCallJob = viewModelScope.launch {
+            var answer = networkEngine.dispatchCallControlSignal(
+                chatId = ctx.chatId,
+                callId = ctx.callId,
+                signalAction = "ACCEPT",
+                peerIpv6 = ctx.peerIpv6,
+                recipientNodePubKeyHex = ctx.peerNodeKeyHex,
+                senderIpv6 = ctx.localIpv6,
+                senderName = ctx.localName,
+                senderX25519PubKeyHex = ctx.localX25519PubHex,
+                directEndpointHint = ctx.peerLanHint,
+                allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+            )
+            if (!answer.delivered) {
+                // The caller keeps ringing while it waits for ACCEPT, so a second
+                // attempt is safe and rescues a lost datagram on a lossy overlay.
+                delay(700L)
+                answer = networkEngine.dispatchCallControlSignal(
+                    chatId = ctx.chatId,
+                    callId = ctx.callId,
+                    signalAction = "ACCEPT",
+                    peerIpv6 = ctx.peerIpv6,
+                    recipientNodePubKeyHex = ctx.peerNodeKeyHex,
+                    senderIpv6 = ctx.localIpv6,
+                    senderName = ctx.localName,
+                    senderX25519PubKeyHex = ctx.localX25519PubHex,
+                    directEndpointHint = ctx.peerLanHint,
+                    allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+                )
+            }
+            if (!answer.delivered) {
+                finishCallWithError("Не удалось подтвердить вызов: ${answer.errorDetail ?: "нет маршрута"}")
+                return@launch
+            }
+            val key = activeCallMediaKey ?: deriveCallKey(ctx)
+            if (key == null) {
+                finishCallWithError("Не удалось вывести общий E2EE-ключ звонка")
+                return@launch
+            }
+            activeCallMediaKey = key
+            val media = networkEngine.openCallMediaChannel(
+                chatId = ctx.chatId,
+                callId = ctx.callId,
+                peerIpv6 = ctx.peerIpv6,
+                recipientNodePubKeyHex = ctx.peerNodeKeyHex,
+                senderIpv6 = ctx.localIpv6,
+                senderName = ctx.localName,
+                directEndpointHint = ctx.peerLanHint,
+                allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+            )
+            if (!media.opened) {
+                finishCallWithError(
+                    "Голосовой канал не открылся: " + (media.errorDetail ?: "нет маршрута")
+                )
+                return@launch
+            }
+            activateCall(ctx, media.transport.ifBlank { answer.transport }, answer.rttMs)
+        }
+    }
 
-            var elapsed = 0
-            while (true) {
-                kotlinx.coroutines.delay(1000L)
-                val currentCall = _uiState.value.activeVoiceCall ?: break
-                if (currentCall.callStatus != "ACTIVE_ENCRYPTED") break
-                elapsed++
-                val periodicProbe = if (elapsed % 5 == 0) {
-                    networkEngine.probeVoiceCallChannel(
-                        peerIpv6 = conv.yggIpv6Address,
-                        directEndpointHint = directHint,
-                        candidatePeers = candidatePeers
-                    ).second.takeIf { it > 0 } ?: currentCall.liveRttMs
-                } else {
-                    currentCall.liveRttMs
-                }
-                val liveMicLevel = if (currentCall.isMuted) {
-                    0.05f
-                } else {
-                    (0.24f + 0.52f * kotlin.math.abs(kotlin.math.sin(elapsed * 0.85))).toFloat()
-                }
+    fun declineIncomingCall() {
+        val ctx = activeCallContext ?: return
+        val call = _uiState.value.activeVoiceCall ?: return
+        if (!ctx.isIncoming || call.callStatus != "RINGING_INCOMING") return
+        sendCallControlSignalAsync(ctx, "DECLINE")
+        finishCallWithError("Входящий вызов от «${ctx.peerTitle}» отклонён", "DECLINED")
+    }
+
+    private fun activateCall(ctx: CallSessionContext, transport: String, rttMs: Long) {
+        val app = getApplication<Application>()
+        val call = _uiState.value.activeVoiceCall ?: return
+        if (call.callId != ctx.callId) return
+        if (activeCallMediaKey == null) {
+            finishCallWithError("E2EE-ключ звонка не выведен")
+            return
+        }
+        val effectiveTransport = transport.ifBlank { "YGG_OVERLAY" }
+        val effectiveRtt = rttMs.takeIf { it > 0 } ?: 0L
+        callRxFrameCounter.set(0)
+        callLastLevelEmitAt = 0L
+        while (callMicQueue.tryReceive().isSuccess) {
+        }
+        YggAudioMediaEngine.setVoipMicFrameListener { pcm ->
+            callMicQueue.trySend(pcm)
+        }
+        YggAudioMediaEngine.setVoipLevelListener { level ->
+            val now = System.currentTimeMillis()
+            if (now - callLastLevelEmitAt >= 120L) {
+                callLastLevelEmitAt = now
                 _uiState.update { state ->
-                    val c = state.activeVoiceCall ?: return@update state
+                    val active = state.activeVoiceCall ?: return@update state
+                    if (active.callStatus != "ACTIVE_ENCRYPTED") return@update state
                     state.copy(
-                        txPacketsCount = state.txPacketsCount + (if (c.isMuted) 0 else 2),
-                        rxPacketsCount = state.rxPacketsCount + 2,
-                        activeVoiceCall = c.copy(
-                            durationSeconds = elapsed,
-                            liveRttMs = periodicProbe,
-                            micAmplitudeLevel = liveMicLevel,
-                            statusSubtext = "Зашифрованный голосовой поток • RTT $periodicProbe мс",
-                            txAudioFrames = c.txAudioFrames + (if (c.isMuted) 1 else 25),
-                            rxAudioFrames = c.rxAudioFrames + 25
+                        activeVoiceCall = active.copy(
+                            micAmplitudeLevel = level.coerceIn(0f, 1f)
                         )
                     )
                 }
             }
         }
+        YggAudioMediaEngine.clearVoipRemotePcm()
+        YggAudioMediaEngine.updateVoipCallAudioState(
+            context = app,
+            isDialing = false,
+            isMuted = call.isMuted,
+            isSpeakerphoneOn = call.isSpeakerphoneOn
+        )
+        _uiState.update { state ->
+            val active = state.activeVoiceCall ?: return@update state
+            if (active.callId != ctx.callId) return@update state
+            val sas = if (isX25519KeyHex(ctx.peerX25519PubHex)) {
+                buildCallVerificationEmojis(ctx.callId, ctx.localX25519PubHex, ctx.peerX25519PubHex)
+            } else {
+                ""
+            }
+            state.copy(
+                activeVoiceCall = active.copy(
+                    callStatus = "ACTIVE_ENCRYPTED",
+                    statusSubtext = "Зашифрованный аудиопоток AES-256-GCM • $effectiveTransport" +
+                        if (effectiveRtt > 0) " • RTT $effectiveRtt мс" else "",
+                    transport = effectiveTransport,
+                    mediaEncrypted = true,
+                    liveRttMs = effectiveRtt.toInt(),
+                    micAmplitudeLevel = 0f,
+                    // The callee's key may have arrived with ACCEPT: the emojis shown
+                    // while dialing could not be derived, so compute them now.
+                    verificationEmojis = sas.ifBlank { active.verificationEmojis },
+                    sasPending = sas.isBlank()
+                )
+            )
+        }
+        callMediaSendJob?.cancel()
+        callMediaSendJob = viewModelScope.launch(Dispatchers.Default) {
+            var sequence = 0L
+            var sinceUiUpdate = 0
+            for (pcm in callMicQueue) {
+                val currentCtx = activeCallContext ?: break
+                val key = activeCallMediaKey ?: break
+                val frame = runCatching {
+                    YggCryptoEngine.sealCallMediaFrame(key, pcm, currentCtx.callId)
+                }.getOrNull() ?: break
+                sequence++
+                val sent = networkEngine.sendCallAudioFrame(currentCtx.callId, frame.first, frame.second, sequence)
+                if (!sent) {
+                    withContext(Dispatchers.Main) {
+                        finishCallWithError("Голосовой канал прерван: аудиокадры не доставляются")
+                    }
+                    break
+                }
+                sinceUiUpdate++
+                if (sinceUiUpdate >= 12) {
+                    sinceUiUpdate = 0
+                    _uiState.update { state ->
+                        val active = state.activeVoiceCall ?: return@update state
+                        state.copy(
+                            activeVoiceCall = active.copy(txAudioFrames = active.txAudioFrames + 12),
+                            txPacketsCount = state.txPacketsCount + 12
+                        )
+                    }
+                }
+            }
+        }
+        callTickerJob?.cancel()
+        callTickerJob = viewModelScope.launch {
+            var elapsed = 0
+            var lastRx = callRxFrameCounter.get()
+            while (true) {
+                delay(1_000L)
+                val active = _uiState.value.activeVoiceCall ?: break
+                if (active.callStatus != "ACTIVE_ENCRYPTED" || active.callId != ctx.callId) break
+                elapsed++
+                val rxNow = callRxFrameCounter.get()
+                val rxDelta = (rxNow - lastRx).coerceAtLeast(0L)
+                lastRx = rxNow
+                _uiState.update { state ->
+                    val current = state.activeVoiceCall ?: return@update state
+                    if (current.callId != ctx.callId || current.callStatus != "ACTIVE_ENCRYPTED") {
+                        return@update state
+                    }
+                    state.copy(
+                        activeVoiceCall = current.copy(
+                            durationSeconds = elapsed,
+                            rxAudioFrames = current.rxAudioFrames + rxDelta.toInt()
+                        ),
+                        rxPacketsCount = state.rxPacketsCount + rxDelta.toInt()
+                    )
+                }
+            }
+        }
+    }
+
+    private fun handleIncomingCallAudioFrame(packet: IncomingCallAudioPacket) {
+        val ctx = activeCallContext ?: return
+        if (packet.callId != ctx.callId) return
+        if (_uiState.value.activeVoiceCall?.callStatus != "ACTIVE_ENCRYPTED") return
+        if (packet.recipientProfileId.isNotBlank() && packet.recipientProfileId != ctx.localProfileId) return
+        val key = activeCallMediaKey ?: return
+        if (packet.ivBase64.isBlank() || packet.cipherBase64.isBlank()) return
+        val pcm = runCatching {
+            YggCryptoEngine.openCallMediaFrame(key, packet.ivBase64, packet.cipherBase64, packet.callId)
+        }.getOrNull() ?: return
+        if (pcm.isEmpty()) return
+        YggAudioMediaEngine.enqueueVoipRemotePcm(pcm)
+        callRxFrameCounter.incrementAndGet()
     }
 
     fun toggleCallMute() {
@@ -1697,7 +2833,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val nextMute = !call.isMuted
             YggAudioMediaEngine.updateVoipCallAudioState(
                 context = app,
-                isDialing = call.callStatus == "DIALING_YGG",
+                isDialing = call.callStatus != "ACTIVE_ENCRYPTED",
                 isMuted = nextMute,
                 isSpeakerphoneOn = call.isSpeakerphoneOn
             )
@@ -1712,7 +2848,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val nextSpeaker = !call.isSpeakerphoneOn
             YggAudioMediaEngine.updateVoipCallAudioState(
                 context = app,
-                isDialing = call.callStatus == "DIALING_YGG",
+                isDialing = call.callStatus != "ACTIVE_ENCRYPTED",
                 isMuted = call.isMuted,
                 isSpeakerphoneOn = nextSpeaker
             )
@@ -1725,21 +2861,158 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun endVoiceCall() {
-        val app = getApplication<Application>()
-        val endedCall = _uiState.value.activeVoiceCall
+        val ctx = activeCallContext
+        val endedCall = _uiState.value.activeVoiceCall ?: return
         activeCallJob?.cancel()
         activeCallJob = null
-        YggAudioMediaEngine.stopVoipCallAudioSession(app)
-        _uiState.update {
-            it.copy(
-                activeVoiceCall = null,
-                statusBannerMessage = if (endedCall != null && endedCall.durationSeconds > 0) {
-                    "Голосовой вызов с «${endedCall.peerTitle}» завершен (${endedCall.durationSeconds} сек)"
-                } else {
-                    it.statusBannerMessage
-                }
+        if (ctx != null) {
+            sendCallControlSignalAsync(
+                ctx,
+                if (endedCall.callStatus == "RINGING_INCOMING") "DECLINE" else "BYE"
             )
         }
+        val banner = if (endedCall.durationSeconds > 0) {
+            "Голосовой вызов с «${endedCall.peerTitle}» завершён (${endedCall.durationSeconds} сек)"
+        } else {
+            null
+        }
+        val outcome = when (endedCall.callStatus) {
+            "RINGING_INCOMING" -> "DECLINED"
+            "DIALING_YGG" -> "CANCELED"
+            "ACTIVE_ENCRYPTED" -> "COMPLETED"
+            else -> null
+        }
+        finishCallWithError(banner, outcome)
+    }
+
+    private fun logClosedCall(ctx: CallSessionContext, outcome: String, transport: String) {
+        val entry = CallLogEntity(
+            callId = ctx.callId,
+            chatId = ctx.chatId,
+            peerName = ctx.peerTitle,
+            peerIpv6 = ctx.peerIpv6,
+            direction = if (ctx.isIncoming) "INCOMING" else "OUTGOING",
+            outcome = outcome,
+            startedAt = System.currentTimeMillis(),
+            durationSeconds = 0,
+            transport = transport,
+            ownerProfileId = ctx.localProfileId
+        )
+        viewModelScope.launch {
+            runCatching { repository.recordCallLog(entry) }
+        }
+    }
+
+    private fun sendCallControlSignalAsync(ctx: CallSessionContext, action: String) {
+        viewModelScope.launch {
+            runCatching {
+                networkEngine.dispatchCallControlSignal(
+                    chatId = ctx.chatId,
+                    callId = ctx.callId,
+                    signalAction = action,
+                    peerIpv6 = ctx.peerIpv6,
+                    recipientNodePubKeyHex = ctx.peerNodeKeyHex,
+                    senderIpv6 = ctx.localIpv6,
+                    senderName = ctx.localName,
+                    senderX25519PubKeyHex = ctx.localX25519PubHex,
+                    directEndpointHint = ctx.peerLanHint,
+                    allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery || ctx.peerLanHint.isNotBlank(),
+                    timeoutMs = 5_000L
+                )
+            }
+        }
+    }
+
+    private fun finishCallWithError(message: String?, outcome: String? = null) {
+        val app = getApplication<Application>()
+        val ctx = activeCallContext
+        val endedCall = _uiState.value.activeVoiceCall
+        val startedAt = activeCallStartedAt
+        YggCallAlertController.stop()
+        ctx?.callId?.takeIf { it.isNotBlank() }?.let { callId ->
+            YggNotificationCenter.cancelIncomingCall(app, callId)
+            recentlyEndedCallIds[callId] = System.currentTimeMillis()
+            pruneRecentlyEndedCalls()
+        }
+        callMediaSendJob?.cancel()
+        callMediaSendJob = null
+        callTickerJob?.cancel()
+        callTickerJob = null
+        callTimeoutJob?.cancel()
+        callTimeoutJob = null
+        pendingCallAccept?.cancel()
+        pendingCallAccept = null
+        YggAudioMediaEngine.setVoipMicFrameListener(null)
+        YggAudioMediaEngine.setVoipLevelListener(null)
+        YggAudioMediaEngine.clearVoipRemotePcm()
+        YggAudioMediaEngine.stopVoipCallAudioSession(app)
+        ctx?.let { networkEngine.closeCallMediaChannel(it.callId) }
+        activeCallContext = null
+        activeCallStartedAt = 0L
+        activeCallMediaKey = null
+        callRxFrameCounter.set(0)
+        callLastLevelEmitAt = 0L
+        while (callMicQueue.tryReceive().isSuccess) {
+        }
+        if (ctx != null) {
+            val resolvedOutcome = outcome ?: when {
+                endedCall?.callStatus == "ACTIVE_ENCRYPTED" -> "COMPLETED"
+                ctx.isIncoming && endedCall?.callStatus == "RINGING_INCOMING" -> "DECLINED"
+                else -> "FAILED"
+            }
+            val entry = CallLogEntity(
+                callId = ctx.callId,
+                chatId = ctx.chatId,
+                peerName = ctx.peerTitle,
+                peerIpv6 = ctx.peerIpv6,
+                direction = if (ctx.isIncoming) "INCOMING" else "OUTGOING",
+                outcome = resolvedOutcome,
+                startedAt = startedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                durationSeconds = endedCall?.durationSeconds ?: 0,
+                transport = endedCall?.transport.orEmpty(),
+                ownerProfileId = ctx.localProfileId
+            )
+            viewModelScope.launch {
+                runCatching { repository.recordCallLog(entry) }
+            }
+        }
+        _uiState.update { state ->
+            val popup = state.activePopupNotification
+            val staleCallPopup = popup != null &&
+                popup.category == YggAlertCategory.INCOMING_CALL &&
+                (ctx == null || popup.callId.isBlank() || popup.callId == ctx.callId)
+            state.copy(
+                activeVoiceCall = null,
+                activePopupNotification = if (staleCallPopup) null else state.activePopupNotification,
+                statusBannerMessage = message?.takeIf { it.isNotBlank() } ?: state.statusBannerMessage
+            )
+        }
+    }
+
+    private fun x25519PublicHex(privateKey: ByteArray): String = runCatching {
+        YggCryptoEngine.x25519PublicKeyFromPrivate(privateKey)
+            .joinToString("") { byte -> (byte.toInt() and 0xFF).toString(16).padStart(2, '0') }
+    }.getOrDefault("")
+
+    private fun isX25519KeyHex(value: String): Boolean {
+        val clean = value.trim()
+        return clean.length == 64 && clean.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+    }
+
+    private fun deriveCallKey(ctx: CallSessionContext): ByteArray? = runCatching {
+        YggCryptoEngine.deriveCallMediaKey(ctx.localX25519PrivateKey, ctx.peerX25519PubHex, ctx.callId)
+    }.getOrNull()
+
+    private fun buildCallVerificationEmojis(callId: String, localPub: String, peerPub: String): String {
+        val emojiPool = listOf("🔐", "🛰️", "🐉", "⚡", "🛡️", "💎", "🔥", "🌊", "🦊", "🪐", "🎯", "🔑")
+        // X25519 public keys have no natural order, so both sides must sort them
+        // before hashing or the caller and callee display different SAS emojis.
+        val (firstKey, secondKey) = listOf(localPub.lowercase(), peerPub.lowercase()).sorted()
+        val hashHex = YggCryptoEngine.sha256Hex("$callId:$firstKey:$secondKey")
+        return (0 until 4).map { idx ->
+            val byteVal = hashHex.substring(idx * 2, idx * 2 + 2).toIntOrNull(16) ?: idx
+            emojiPool[byteVal % emojiPool.size]
+        }.joinToString(" ")
     }
 
     /**
@@ -1754,7 +3027,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val directHint = extractDirectEndpointHint(conv)
             val allowManualLan = currentState.privacyMatrix.allowDirectLanDiscovery
 
-            if (!networkEngine.isRealNetworkAvailable() && !allowManualLan) {
+            if (!networkEngine.isRealNetworkAvailable() && !allowManualLan && directHint.isBlank()) {
                 val reason = if (_uiState.value.isAirplaneModeOn) "Включен Авиарежим" else "Нет подключения к сети Yggdrasil"
                 _uiState.update {
                     it.copy(statusBannerMessage = "Повторная отправка невозможна: $reason")
@@ -1777,49 +3050,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
             val candidatePeers = buildCandidateExternalPeersList()
             if (isConversationSelfNode(conv, currentState.identity)) {
-                val res = networkEngine.dispatchSelfMessageViaYggdrasilMesh(
-                    chatId = conv.chatId,
-                    messageId = message.messageId,
-                    senderNodeLabel = currentState.userProfile.displayName,
-                    senderIpv6 = currentState.identity.yggIpv6Address,
-                    senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
-                    plainText = message.plainText,
-                    cipherPayloadHex = message.cipherPayloadHex,
-                    hashcashToken = message.hashcashPowToken,
-                    attachmentName = message.attachmentName,
-                    attachmentSizeBytes = message.attachmentSizeBytes,
-                    candidatePeers = candidatePeers,
-                    attachmentType = message.attachmentType,
-                    attachmentUri = message.attachmentUri,
-                    attachmentBase64 = attachmentBase64,
-                    voiceDurationSec = message.voiceDurationSec,
-                    voiceWaveformCsv = message.voiceWaveformCsv
-                )
-                if (res.delivered) {
-                    repository.updatePeerTrafficByEndpoint(
-                        endpointUri = res.relayEndpointUri,
-                        rttMs = res.rttMs.toInt(),
-                        txDelta = res.txBytes,
-                        rxDelta = res.rxBytes
-                    )
-                    _uiState.update {
-                        it.copy(statusBannerMessage = "Сообщение доставлено через внешний пир ${res.relayEndpointUri} (${res.rttMs} мс)")
-                    }
-                } else {
-                    _uiState.update {
-                        it.copy(statusBannerMessage = "Повтор не удался: ${res.errorDetail ?: "нет живых пиров Yggdrasil"}")
-                    }
-                }
+                // Retrying a note to the own node means re-checking the real overlay route.
+                repository.markMessageLocalNote(message.messageId)
+                val outcome = networkEngine.probeOverlayRoundTrip(currentState.currentProfileId)
+                applyOverlayProbeOutcome(outcome, conv.chatId)
             } else {
+                val peerIdentity = repository.resolvePeerNodeIdentity(conv)
                 val overlayRes = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                     chatId = conv.chatId,
                     messageId = message.messageId,
                     peerTitle = conv.title,
-                    peerIpv6 = conv.yggIpv6Address,
+                    peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address },
                     directEndpointHint = directHint,
                     senderNodeLabel = currentState.userProfile.displayName,
                     senderIpv6 = currentState.identity.yggIpv6Address,
                     senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
+                    recipientNodePubKeyHex = peerIdentity.publicKeyHex,
                     plainText = message.plainText,
                     cipherPayloadHex = message.cipherPayloadHex,
                     hashcashToken = message.hashcashPowToken,
@@ -1834,7 +3080,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     voiceWaveformCsv = message.voiceWaveformCsv
                 )
                 if (overlayRes.delivered) {
-                    if (overlayRes.relayEndpointUri.isNotBlank()) {
+                    if (!overlayRes.endToEndConfirmed) {
+                        repository.markMessageSentP2P(message.messageId)
+                    }
+                    if (overlayRes.relayEndpointUri.isNotBlank() && overlayRes.rttMs > 0) {
                         repository.updatePeerTrafficByEndpoint(
                             endpointUri = overlayRes.relayEndpointUri,
                             rttMs = overlayRes.rttMs.toInt(),
@@ -1845,17 +3094,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     repository.updateConversationRouteStatus(
                         chatId = conv.chatId,
                         isOnline = true,
-                        routeSummary = "Yggdrasil • ${overlayRes.relayRegionLabel} (${overlayRes.rttMs} мс)"
+                        routeSummary = describeDeliveryRoute(overlayRes)
                     )
                     _uiState.update {
                         it.copy(
-                            statusBannerMessage = "Сообщение доставлено через пир Yggdrasil ${overlayRes.relayEndpointUri} (${overlayRes.rttMs} мс)"
+                            statusBannerMessage = describeDeliveryBanner(overlayRes, conv.title)
                         )
                     }
                 } else {
                     _uiState.update {
                         it.copy(
-                            statusBannerMessage = "Повтор не удался: ${overlayRes.errorDetail ?: "внешние пиры Yggdrasil не ответили"}"
+                            statusBannerMessage = "Повтор не удался: ${overlayRes.errorDetail ?: "оверлей Yggdrasil недоступен"}"
                         )
                     }
                 }
@@ -1895,20 +3144,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     repository.updateConversationRouteStatus(
                         chatId = chatId,
                         isOnline = true,
-                        routeSummary = "Yggdrasil • $region (${probe.rttMs} мс)"
+                        routeSummary = "Сеть Yggdrasil доступна • $region (${probe.rttMs} мс) • ACK ожидается от получателя"
                     )
                     _uiState.update {
                         it.copy(
-                            statusBannerMessage = "Маршрут Yggdrasil до «${conv.title}» через внешний пир $uri ($region) активен: RTT ${probe.rttMs} мс"
+                            statusBannerMessage = "Внешний пир Yggdrasil $uri ($region) отвечает: RTT ${probe.rttMs} мс. Сквозная доставка до «${conv.title}» подтверждается только ACK получателя."
                         )
                     }
                     return@launch
                 }
             }
 
-            repository.updateConversationRouteStatus(chatId, false, "Узел недоступен • Офлайн S&F")
+            repository.updateConversationRouteStatus(chatId, false, "Внешние пиры Yggdrasil недоступны • очередь S&F")
             _uiState.update {
-                it.copy(statusBannerMessage = "Ни один внешний пир Yggdrasil не ответил — маршрут в очереди S&F")
+                it.copy(statusBannerMessage = "Ни один внешний пир Yggdrasil не ответил — сообщения останутся в очереди S&F")
             }
         }
     }
@@ -2258,14 +3507,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun createNewChatOrGroup(
         title: String,
         yggIpv6Input: String,
-        isMlsGroup: Boolean,
-        sealedSender: Boolean,
         disappearingSeconds: Int
     ) {
         if (title.isBlank() && yggIpv6Input.isBlank()) return
+        val parts = yggIpv6Input.split("|", ",", " ").map { it.trim() }.filter { it.isNotEmpty() }
+        val primaryAddr = parts.firstOrNull() ?: yggIpv6Input.trim()
+        if (primaryAddr.isBlank()) {
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Укажите адрес узла (IPv6 2xx:…, Ed25519-ключ или ygggram://-ссылку) — контакт без адреса узла создать нельзя"
+                )
+            }
+            return
+        }
+        val looksLikeContact = primaryAddr.startsWith("ygggram://", ignoreCase = true) ||
+            YggCryptoEngine.isEd25519Hex(primaryAddr) ||
+            YggCryptoEngine.normalizeIpv6Literal(primaryAddr) != null ||
+            (primaryAddr.contains(".") && primaryAddr.contains(":") && !primaryAddr.startsWith("127.0.0.1"))
+        if (!looksLikeContact) {
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Некорректный идентификатор контакта: нужен ygggram://…?pub=…, Ed25519-ключ, IPv6 2xx:… или LAN-адрес host:port"
+                )
+            }
+            return
+        }
         viewModelScope.launch {
-            val parts = yggIpv6Input.split("|", ",", " ").map { it.trim() }.filter { it.isNotEmpty() }
-            val primaryAddr = parts.firstOrNull() ?: yggIpv6Input.trim()
             val directHint = parts.drop(1).firstOrNull { it.contains(":") && it.contains(".") }
                 ?: if (primaryAddr.contains(".") && primaryAddr.contains(":")) primaryAddr else ""
 
@@ -2273,8 +3540,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val newChatId = repository.createNewConversation(
                 title = effectiveTitle,
                 yggIpv6Input = primaryAddr,
-                isMlsGroup = isMlsGroup,
-                sealedSender = sealedSender,
                 disappearingSeconds = disappearingSeconds,
                 directEndpointHint = directHint,
                 localIdentity = _uiState.value.identity,
@@ -2286,13 +3551,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     networkEngine.registerDirectEndpointForPeer(conv.yggIpv6Address, directHint)
                 }
             }
+            val createdConv = repository.getConversation(newChatId)
+            val hasNodeKey = hasVerifiedOverlayKey(createdConv)
+            val createdLanHint = extractDirectEndpointHint(createdConv)
             _uiState.update {
                 it.copy(
                     selectedChatId = newChatId,
-                    statusBannerMessage = if (YggRepository.isSelfChatId(newChatId)) {
-                        "Открыт чат «Избранное • Мой узел Yggdrasil» (маршрутизация через внешние пиры)"
-                    } else {
-                        "Добавлен контакт «$effectiveTitle»"
+                    statusBannerMessage = when {
+                        YggRepository.isSelfChatId(newChatId) ->
+                            "Открыт чат «Избранное • Мой узел Yggdrasil» (маршрутизация через внешние пиры)"
+                        hasNodeKey -> "Добавлен контакт «$effectiveTitle» с проверенным Ed25519-ключом"
+                        createdLanHint.isNotBlank() ->
+                            "Контакт «$effectiveTitle» добавлен: доступен только прямой LAN-маршрут ($createdLanHint), для оверлея нужен полный идентификатор с ?pub=…"
+                        else ->
+                            "Контакт «$effectiveTitle» добавлен без Ed25519-ключа: оверлей не сможет доставить сообщения. Добавьте контакт по полной ссылке ygggram://…?pub=…"
                     }
                 )
             }
@@ -2507,36 +3779,30 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(isSeedPhraseRevealed = !it.isSeedPhraseRevealed) }
     }
 
-    fun rotatePreKeysAndMlsEpoch() {
-        val nextEpoch = _uiState.value.keyEpoch + 1
-        val newIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
-            mnemonic = _uiState.value.identity.mnemonicWords,
-            epoch = nextEpoch
-        )
-        _uiState.update {
-            it.copy(
-                identity = newIdentity,
-                keyEpoch = nextEpoch,
-                statusBannerMessage = "Ключи X25519 Signed PreKey и MLS TreeKEM ротированы (Эпоха #$nextEpoch)"
-            )
-        }
-        viewModelScope.launch {
-            repository.rotateKeysForEpoch(newIdentity, nextEpoch)
-        }
-    }
-
     fun regenerateNewSeedIdentity() {
         val freshWords = YggCryptoEngine.generateFreshMnemonic12()
         val freshIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(freshWords, epoch = 1)
-        _uiState.update {
-            it.copy(
-                identity = freshIdentity,
-                keyEpoch = 1,
-                statusBannerMessage = "Сгенерирована новая BIP-39 мнемоника и IPv6-адрес узла ${freshIdentity.yggIpv6Address.take(19)}..."
-            )
-        }
         viewModelScope.launch {
-            repository.rotateKeysForEpoch(freshIdentity, 1)
+            val updatedProfile = repository.regenerateProfileIdentity(
+                profileId = _uiState.value.currentProfileId,
+                identity = freshIdentity
+            )
+            if (updatedProfile == null) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Не удалось перегенерировать идентичность: профиль не найден"
+                    )
+                }
+                return@launch
+            }
+            applyUserProfileEntityToState(updatedProfile)
+            networkEngine.syncConcurrentProfileListeners(repository.getAllProfilesNow())
+            _uiState.update {
+                it.copy(
+                    keyEpoch = 1,
+                    statusBannerMessage = "Сгенерирована новая BIP-39 мнемоника и IPv6-адрес узла ${freshIdentity.yggIpv6Address.take(19)}..."
+                )
+            }
             syncForegroundServiceNotification()
         }
     }

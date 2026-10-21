@@ -29,7 +29,7 @@ data class ConversationEntity(
     val title: String,
     val yggIpv6Address: String,
     val publicKeyHex: String,
-    val protocolType: String, // "X3DH_DOUBLE_RATCHET" or "MLS_RFC9420"
+    val protocolType: String, // "YGG_X25519_AESGCM"
     val isVerified: Boolean,
     val sealedSenderEnabled: Boolean,
     val disappearingTtlSeconds: Int,
@@ -40,7 +40,8 @@ data class ConversationEntity(
     val avatarColorHex: String,
     val bioStatus: String,
     val routeTransportSummary: String,
-    val ownerProfileId: String = "profile_primary"
+    val ownerProfileId: String = "profile_primary",
+    val peerX25519PublicKeyHex: String = ""
 )
 
 @Entity(tableName = "messages")
@@ -53,7 +54,7 @@ data class MessageEntity(
     val plainText: String,
     val timestamp: Long,
     val isOutgoing: Boolean,
-    val deliveryState: String, // "QUEUED_OFFLINE_SF", "SENT_P2P", "DELIVERED", "READ"
+    val deliveryState: String, // "QUEUED_OFFLINE_SF", "SENT_P2P", "LOCAL_NOTE", "DELIVERED", "READ"
     val ratchetStep: Int,
     val sealedSenderFlag: Boolean,
     val hashcashPowToken: String,
@@ -65,7 +66,16 @@ data class MessageEntity(
     val attachmentUri: String? = null,
     val voiceDurationSec: Int = 0,
     val voiceWaveformCsv: String? = null,
-    val reactionsJson: String = "" // e.g. "👍:2:me|🔥:1:peer"
+    val reactionsJson: String = "", // e.g. "👍:2:me|🔥:1:peer"
+    // Wire id the sender assigned to this message. Reactions must reference the
+    // sender's id, otherwise the receiving device cannot find the message.
+    val peerMessageId: String = "",
+    // Wire id of the quoted message (empty when this message is not a reply).
+    val replyToMessageId: String = "",
+    // Display name of the original author for forwarded messages.
+    val forwardedFrom: String = "",
+    // 2 = X25519 + HKDF + AES-256-GCM; 1 = legacy envelope without confidentiality.
+    val envelopeVersion: Int = 1
 )
 
 @Entity(tableName = "p2p_file_transfers")
@@ -135,7 +145,7 @@ data class CryptoKeyRecordEntity(
     @PrimaryKey val keyId: String,
     val keyName: String,
     val derivationPath: String,
-    val algorithm: String, // "Ed25519", "X25519", "MLS-HPKE", "XChaCha20-256"
+    val algorithm: String, // "Ed25519", "X25519", "SHA-256 fingerprint"
     val publicKeyHex: String,
     val fingerprintHex: String,
     val createdAt: Long,
@@ -143,3 +153,18 @@ data class CryptoKeyRecordEntity(
     val isActive: Boolean,
     val usageScope: String
 )
+
+@Entity(tableName = "call_log")
+data class CallLogEntity(
+    @PrimaryKey val callId: String,
+    val chatId: String,
+    val peerName: String,
+    val peerIpv6: String,
+    val direction: String, // "INCOMING", "OUTGOING"
+    val outcome: String, // "MISSED", "DECLINED", "COMPLETED", "FAILED", "CANCELED"
+    val startedAt: Long,
+    val durationSeconds: Int,
+    val transport: String,
+    val ownerProfileId: String
+)
+

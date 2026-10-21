@@ -5,8 +5,11 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -59,12 +62,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -77,16 +81,28 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.UserProfileEntity
 import com.example.engine.ParsedYggContactQr
 import com.example.service.YggAlertCategory
 import com.example.service.YggForegroundServiceState
 import com.example.ui.components.QrContactModal
+import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.YggGramUiState
+
+private fun hasNotificationPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
 
 @Composable
 fun ProfilePrivacyScreen(
@@ -119,6 +135,14 @@ fun ProfilePrivacyScreen(
         hashcashDifficultyBits: Int?,
         webDavEndpointUrl: String?
     ) -> Unit,
+    onUpdateNotifications: (
+        inAppNotificationsEnabled: Boolean?,
+        systemNotificationsEnabled: Boolean?,
+        suppressNotificationsForOpenChat: Boolean?,
+        messageNotificationsEnabled: Boolean?,
+        voiceNotificationsEnabled: Boolean?,
+        callNotificationsEnabled: Boolean?
+    ) -> Unit = { _, _, _, _, _, _ -> },
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -126,10 +150,49 @@ fun ProfilePrivacyScreen(
     var showCreateProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showQrIdentityDialog by rememberSaveable { mutableStateOf(false) }
 
+    val notificationPrefs = remember(context) {
+        context.getSharedPreferences("ygggram_ui_prefs", Context.MODE_PRIVATE)
+    }
+    var notificationPermissionGranted by remember {
+        mutableStateOf(hasNotificationPermission(context))
+    }
+    var notificationPermissionAsked by remember {
+        mutableStateOf(notificationPrefs.getBoolean("notif_permission_requested", false))
+    }
+    var pendingNotificationPermissionTarget by remember { mutableStateOf("") }
+
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        onToggleBackgroundService(true)
+    ) { granted ->
+        notificationPermissionGranted = granted
+        notificationPermissionAsked = true
+        notificationPrefs.edit().putBoolean("notif_permission_requested", true).apply()
+        when (pendingNotificationPermissionTarget) {
+            "system" -> {
+                onUpdateNotifications(null, granted, null, null, null, null)
+                if (!granted) {
+                    Toast.makeText(
+                        context,
+                        "Без разрешения Android системные уведомления не появятся в шторке",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            "background_service" -> onToggleBackgroundService(true)
+        }
+        pendingNotificationPermissionTarget = ""
+    }
+
+    val permissionLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(permissionLifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                notificationPermissionGranted = hasNotificationPermission(context)
+                notificationPermissionAsked = notificationPrefs.getBoolean("notif_permission_requested", false)
+            }
+        }
+        permissionLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { permissionLifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val profile = uiState.userProfile
@@ -212,15 +275,23 @@ fun ProfilePrivacyScreen(
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
+                                    val ipv6Display = uiState.identity.yggIpv6Address
+                                        .split(':')
+                                        .chunked(4)
+                                        .joinToString("\n") { it.joinToString(":") }
                                     Text(
                                         text = "Постоянный IPv6-адрес в сети Yggdrasil (200::/7):",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                     Text(
-                                        text = uiState.identity.yggIpv6Address,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = EmeraldPrimary
+                                        text = ipv6Display,
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize = 13.sp
+                                        ),
+                                        color = EmeraldPrimary,
+                                        lineHeight = 18.sp
                                     )
                                 }
                                 IconButton(
@@ -242,7 +313,7 @@ fun ProfilePrivacyScreen(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Порт P2P: :${profile.allocatedTcpPort} • Подпись: ${profile.profileSignatureHex}",
+                                text = "P2P-порт: ${profile.allocatedTcpPort} • Подпись: ${profile.profileSignatureHex}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
@@ -265,7 +336,7 @@ fun ProfilePrivacyScreen(
                         ) {
                             Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Изменить профиль")
+                            Text("Изменить", maxLines = 1)
                         }
                         OutlinedButton(
                             onClick = { showQrIdentityDialog = true },
@@ -273,7 +344,7 @@ fun ProfilePrivacyScreen(
                         ) {
                             Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("URI / Ключ")
+                            Text("QR-визитка")
                         }
                     }
                 }
@@ -404,7 +475,7 @@ fun ProfilePrivacyScreen(
                                                 }
                                             }
                                             Text(
-                                                text = "${itemProfile.handle} • Порт :${itemProfile.allocatedTcpPort}",
+                                                text = "${itemProfile.handle} • Порт ${itemProfile.allocatedTcpPort}",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = CyberTealSecondary
                                             )
@@ -456,7 +527,7 @@ fun ProfilePrivacyScreen(
                                             color = if (itemProfile.isActiveInBackground || isPrimary) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
-                                    Switch(
+                                    YggSwitch(
                                         checked = itemProfile.isActiveInBackground || isPrimary,
                                         enabled = !isPrimary,
                                         onCheckedChange = { enabled ->
@@ -692,18 +763,16 @@ fun ProfilePrivacyScreen(
                                 )
                             }
                         }
-                        Switch(
+                        YggSwitch(
                             checked = uiState.isBackgroundServiceEnabled,
                             onCheckedChange = { enabled ->
-                                if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    val hasPerm = ContextCompat.checkSelfPermission(
-                                        context,
-                                        Manifest.permission.POST_NOTIFICATIONS
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                    if (!hasPerm) {
-                                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                        return@Switch
-                                    }
+                                if (enabled &&
+                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                    !notificationPermissionGranted
+                                ) {
+                                    pendingNotificationPermissionTarget = "background_service"
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                    return@YggSwitch
                                 }
                                 onToggleBackgroundService(enabled)
                             },
@@ -745,7 +814,172 @@ fun ProfilePrivacyScreen(
             }
         }
 
-        // 4. Flexible Privacy Settings Matrix
+        // 4. Notification preferences
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.NotificationsActive, contentDescription = null, tint = EmeraldPrimary)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Уведомления о сообщениях и звонках",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+
+                    PrivacyToggleItem(
+                        title = "Всплывающие уведомления в приложении",
+                        subtitle = "Карточка-баннер внутри YggGram при новом сообщении, голосовом или вызове",
+                        checked = uiState.privacyMatrix.inAppNotificationsEnabled,
+                        tag = "notif_in_app_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(it, null, null, null, null, null)
+                        }
+                    )
+
+                    PrivacyToggleItem(
+                        title = "Системные уведомления Android",
+                        subtitle = "Уведомления в шторке и на экране блокировки. Требуется разрешение Android 13+",
+                        checked = uiState.privacyMatrix.systemNotificationsEnabled &&
+                            (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || notificationPermissionGranted),
+                        tag = "notif_system_switch",
+                        onCheckedChange = { enabled ->
+                            if (enabled &&
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                !notificationPermissionGranted
+                            ) {
+                                pendingNotificationPermissionTarget = "system"
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                onUpdateNotifications(null, enabled, null, null, null, null)
+                            }
+                        }
+                    )
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        Surface(
+                            color = if (notificationPermissionGranted) {
+                                MaterialTheme.colorScheme.surfaceContainerLowest
+                            } else {
+                                AmberShieldTertiary.copy(alpha = 0.12f)
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("notification_permission_status")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    if (notificationPermissionGranted) Icons.Default.CheckCircle else Icons.Default.NotificationsActive,
+                                    contentDescription = null,
+                                    tint = if (notificationPermissionGranted) EmeraldPrimary else AmberShieldTertiary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = if (notificationPermissionGranted) {
+                                            "Разрешение Android выдано"
+                                        } else {
+                                            "Системные уведомления заблокированы"
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (notificationPermissionGranted) EmeraldPrimary else AmberShieldTertiary
+                                    )
+                                    Text(
+                                        text = if (notificationPermissionGranted) {
+                                            "Шторка и экран блокировки доступны, оповещения приходят при свёрнутом приложении"
+                                        } else {
+                                            "Без POST_NOTIFICATIONS шторка Android не покажет оповещения. Баннеры внутри приложения продолжат работать"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (!notificationPermissionGranted) {
+                                    TextButton(
+                                        onClick = {
+                                            if (notificationPermissionAsked) {
+                                                val intent = Intent(
+                                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                                    Uri.fromParts("package", context.packageName, null)
+                                                )
+                                                context.startActivity(intent)
+                                            } else {
+                                                pendingNotificationPermissionTarget = "system"
+                                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("request_notification_permission_button")
+                                    ) {
+                                        Text(if (notificationPermissionAsked) "Настройки" else "Разрешить")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    PrivacyToggleItem(
+                        title = "Не уведомлять об открытом чате",
+                        subtitle = "Если чат с отправителем уже открыт под активным профилем, сообщение не дублируется баннером и системным уведомлением",
+                        checked = uiState.privacyMatrix.suppressNotificationsForOpenChat,
+                        tag = "notif_suppress_open_chat_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(null, null, it, null, null, null)
+                        }
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                    PrivacyToggleItem(
+                        title = "Уведомления о текстовых сообщениях",
+                        subtitle = "Новые сообщения и файлы в чатах",
+                        checked = uiState.privacyMatrix.messageNotificationsEnabled,
+                        tag = "notif_messages_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(null, null, null, it, null, null)
+                        }
+                    )
+
+                    PrivacyToggleItem(
+                        title = "Уведомления о голосовых сообщениях",
+                        subtitle = "Отдельный переключатель для голосовых заметок",
+                        checked = uiState.privacyMatrix.voiceNotificationsEnabled,
+                        tag = "notif_voice_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(null, null, null, null, it, null)
+                        }
+                    )
+
+                    PrivacyToggleItem(
+                        title = "Уведомления о звонках",
+                        subtitle = "Входящие и пропущенные голосовые вызовы",
+                        checked = uiState.privacyMatrix.callNotificationsEnabled,
+                        tag = "notif_calls_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(null, null, null, null, null, it)
+                        }
+                    )
+                }
+            }
+        }
+
+        // 5. Flexible Privacy Settings Matrix
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -766,16 +1000,6 @@ fun ProfilePrivacyScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                     }
-
-                    PrivacyToggleItem(
-                        title = "Sealed Sender (Скрытие отправителя от релеев)",
-                        subtitle = "Шифрует сертификат отправителя внутри конверта X3DH, чтобы промежуточные и S&F узлы не видели метаданные",
-                        checked = privacy.sealedSenderGlobal,
-                        tag = "privacy_sealed_sender_switch",
-                        onCheckedChange = {
-                            onUpdatePrivacy(it, null, null, null, null, null, null, null)
-                        }
-                    )
 
                     PrivacyToggleItem(
                         title = "Удаление сетевых метаданных и EXIF при P2P-передаче",
@@ -799,7 +1023,7 @@ fun ProfilePrivacyScreen(
 
                     PrivacyToggleItem(
                         title = "Ручной переключатель LAN (Резервный обход при отсутствии пиров Yggdrasil)",
-                        subtitle = "По умолчанию ВЫКЛ: все сообщения, звонки и файлы между профилями идут строго через внешние пиры Yggdrasil 0200::/7",
+                        subtitle = "По умолчанию ВЫКЛ: пассивный поиск узлов в локальной сети отключен. Явный lan= адрес из карточки контакта считается согласием и используется для прямой доставки с ACK даже при выключенном переключателе",
                         checked = privacy.allowDirectLanDiscovery,
                         tag = "privacy_lan_discovery_switch",
                         onCheckedChange = {
@@ -892,7 +1116,7 @@ fun ProfilePrivacyScreen(
                     Text(
                         text = "• Сетевое ядро: Userspace Yggdrasil v0.5 (200::/7) + gVisor Netstack без создания системного TUN и без прав Root/Администратора.\n" +
                             "• Анти-DPI / Обход Белых списков: uTLS (Chrome/iOS), CDN WebSocket (wss://), VLESS Reality, ShadowTLS v3, QUIC UDP Padding, DHT BEP-44.\n" +
-                            "• Криптография: BIP-39 -> SLIP-0010, X3DH + Double Ratchet, MLS RFC 9420, Argon2id + XChaCha20-Poly1305.\n" +
+                            "• Криптография: BIP-39 -> HMAC-SHA512, Ed25519 для адреса узла, X25519 + HKDF-SHA256 + AES-256-GCM для сообщений и медиа звонков (статический ECDH, без прямой секретности).\n" +
                             "• Лицензия: Open-Source GPLv3 / воспроизводимая сборка.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -961,7 +1185,7 @@ private fun PrivacyToggleItem(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        Switch(
+        YggSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
             modifier = Modifier.testTag(tag)
@@ -1073,7 +1297,7 @@ private fun CreateNewDecentralizedProfileModal(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    Switch(
+                    YggSwitch(
                         checked = runInBackground,
                         onCheckedChange = { runInBackground = it },
                         modifier = Modifier.testTag("new_profile_bg_switch")
@@ -1096,7 +1320,7 @@ private fun CreateNewDecentralizedProfileModal(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    Switch(
+                    YggSwitch(
                         checked = switchImmediately,
                         onCheckedChange = { switchImmediately = it },
                         modifier = Modifier.testTag("new_profile_switch_now")

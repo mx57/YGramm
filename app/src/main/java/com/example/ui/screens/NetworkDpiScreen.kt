@@ -61,7 +61,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -85,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.YggPeerEntity
 import com.example.engine.DiscoveredYggPeer
+import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
@@ -132,6 +132,16 @@ fun NetworkDpiScreen(
     val cfg = uiState.antiDpiConfig
     val scanner = uiState.peerScanner
     val connectedPeersCount = peers.count { it.isConnected }
+    // The Go core is the authority on connectivity: the Kotlin scanner only sees
+    // TCP/TLS reachability of the peer list, the core knows the live public links.
+    val coreMesh = uiState.coreMesh
+    val liveRoutes = if (coreMesh.available) coreMesh.liveLinks else connectedPeersCount
+    val totalRoutes = if (coreMesh.available) coreMesh.totalLinks else peers.size
+    val coreStatusLine = if (coreMesh.available) {
+        "Ядро в сети: живых линков ${coreMesh.liveLinks} из ${coreMesh.totalLinks} • узлов в routing tree: ${coreMesh.knownNodes} • сессий: ${coreMesh.sessionCount}"
+    } else {
+        null
+    }
     val activeEndpointSet = remember(peers) { peers.map { it.endpointUri.lowercase() }.toSet() }
 
     val filteredScannedPeers = remember(
@@ -177,7 +187,7 @@ fun NetworkDpiScreen(
                 NetworkSubTab.entries.forEach { tab ->
                     val selected = activeSubTab == tab
                     val labelText = when (tab) {
-                        NetworkSubTab.ROUTES_AND_PEERS -> "Маршруты ($connectedPeersCount/${peers.size})"
+                        NetworkSubTab.ROUTES_AND_PEERS -> "Маршруты ($liveRoutes/$totalRoutes)"
                         NetworkSubTab.PEER_SCANNER -> "Сканер (${scanner.discoveredPeers.size})"
                         NetworkSubTab.ANTI_DPI_TSPU -> "Обход ТСПУ"
                     }
@@ -262,7 +272,7 @@ fun NetworkDpiScreen(
                                                 text = when {
                                                     uiState.isAirplaneModeOn -> "АВИАРЕЖИМ • ОФЛАЙН"
                                                     !uiState.isNetworkAvailable -> "НЕТ СЕТИ • ОФЛАЙН"
-                                                    else -> "P2P :${uiState.localUdpPort} • LAN :51920"
+                                                    else -> "P2P ${uiState.localUdpPort} • LAN 51920"
                                                 },
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
@@ -278,7 +288,7 @@ fun NetworkDpiScreen(
                                             shape = RoundedCornerShape(8.dp)
                                         ) {
                                             Text(
-                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $connectedPeersCount",
+                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $liveRoutes",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = CyberTealSecondary,
                                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -304,7 +314,7 @@ fun NetworkDpiScreen(
 
                             Column(modifier = Modifier.padding(14.dp)) {
                                 Text(
-                                    text = cfg.lastProbeReport,
+                                    text = coreStatusLine ?: cfg.lastProbeReport,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
                                         Color(0xFFEF4444)
@@ -312,6 +322,13 @@ fun NetworkDpiScreen(
                                         EmeraldPrimary
                                     }
                                 )
+                                if (coreStatusLine != null) {
+                                    Text(
+                                        text = cfg.lastProbeReport,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                                 if (cfg.isProbingRoutes) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     LinearProgressIndicator(
@@ -345,7 +362,7 @@ fun NetworkDpiScreen(
                                     ) {
                                         Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(17.dp))
                                         Spacer(modifier = Modifier.width(4.dp))
-                                        Text("Тест себе (Ygg)", maxLines = 1)
+                                        Text("Тест оверлея (Ygg)", maxLines = 1)
                                     }
                                 }
 
@@ -417,6 +434,94 @@ fun NetworkDpiScreen(
                     }
                 }
 
+                // Live state of the Go core: the only source that knows which public
+                // links are up, which nodes the routing tree reached and how many
+                // encrypted sessions are alive.
+                item {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, EmeraldPrimary.copy(alpha = 0.35f), RoundedCornerShape(18.dp)),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainer
+                        )
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    Icon(Icons.Default.Hub, contentDescription = null, tint = EmeraldPrimary)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "Состояние ядра Yggdrasil (0200::/7)",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = if (coreMesh.available) {
+                                                "Данные читаются напрямую из Go-ядра профиля"
+                                            } else {
+                                                "Ядро профиля не запущено — показаны данные TCP/TLS-сканера"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (coreMesh.available) EmeraldPrimary else AmberShieldTertiary
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    color = if (coreMesh.available && coreMesh.liveLinks > 0) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.errorContainer
+                                    },
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text(
+                                        text = if (coreMesh.available) {
+                                            if (coreMesh.liveLinks > 0) "В СЕТИ" else "НЕТ ЛИНКОВ"
+                                        } else {
+                                            "НЕТ ЯДРА"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (coreMesh.available && coreMesh.liveLinks > 0) {
+                                            EmeraldPrimary
+                                        } else {
+                                            Color(0xFFEF4444)
+                                        },
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                CoreMeshStat(
+                                    label = "Живых линков",
+                                    value = if (coreMesh.available) "${coreMesh.liveLinks}/${coreMesh.totalLinks}" else "-",
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CoreMeshStat(
+                                    label = "Узлов в дереве",
+                                    value = if (coreMesh.available) coreMesh.knownNodes.toString() else "-",
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CoreMeshStat(
+                                    label = "Сессий",
+                                    value = if (coreMesh.available) coreMesh.sessionCount.toString() else "-",
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // Active Yggdrasil Peers & Bridges Header
                 item {
                     Row(
@@ -431,9 +536,9 @@ fun NetworkDpiScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Активных внешних узлов: $connectedPeersCount",
+                                text = "Активных внешних узлов: $liveRoutes",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (connectedPeersCount > 0) EmeraldPrimary else AmberShieldTertiary
+                                color = if (liveRoutes > 0) EmeraldPrimary else AmberShieldTertiary
                             )
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -589,9 +694,9 @@ fun NetworkDpiScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 val sortOptions = listOf(
-                                    "PING_ASC" to "Быстрые (мин. мс)",
-                                    "COUNTRY" to "По стране",
-                                    "UPTIME" to "По аптайму"
+                                    "PING_ASC" to "Быстрые",
+                                    "COUNTRY" to "Страна",
+                                    "UPTIME" to "Аптайм"
                                 )
                                 sortOptions.forEach { (key, title) ->
                                     FilterChip(
@@ -616,7 +721,7 @@ fun NetworkDpiScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.weight(1f)
                                 )
-                                Switch(
+                                YggSwitch(
                                     checked = scanner.onlyWhitelistCompatible,
                                     onCheckedChange = { onToggleScannerWhitelistOnly() },
                                     modifier = Modifier.testTag("scanner_whitelist_only_switch")
@@ -631,21 +736,23 @@ fun NetworkDpiScreen(
                             ) {
                                 Button(
                                     onClick = onRunCountryPeerScan,
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                                     modifier = Modifier
                                         .weight(1f)
                                         .testTag("scan_peers_country_button")
                                 ) {
                                     Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(17.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Spacer(modifier = Modifier.width(5.dp))
                                     Text("Сканировать пинг", maxLines = 1)
                                 }
                                 OutlinedButton(
                                     onClick = onConnectTopFastestInCountry,
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                                     modifier = Modifier.testTag("connect_top3_country_button")
                                 ) {
                                     Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(17.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("+ Топ-3", maxLines = 1)
+                                    Text("Топ-3", maxLines = 1)
                                 }
                                 OutlinedButton(
                                     onClick = { showBulkImportDialog = true },
@@ -1082,6 +1189,35 @@ private fun ScannedPeerCard(
 }
 
 @Composable
+private fun CoreMeshStat(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+        shape = RoundedCornerShape(10.dp),
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleSmall.copy(fontFamily = FontFamily.Monospace),
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
 private fun DpiSwitchRow(
     title: String,
     subtitle: String,
@@ -1102,7 +1238,7 @@ private fun DpiSwitchRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        Switch(
+        YggSwitch(
             checked = checked,
             onCheckedChange = { onToggle() },
             modifier = Modifier.testTag(tag)
@@ -1227,7 +1363,7 @@ private fun PeerNodeCard(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(
+                    YggSwitch(
                         checked = peer.isConnected,
                         onCheckedChange = { onToggleConnect() },
                         modifier = Modifier.testTag("toggle_peer_${peer.peerId}")
@@ -1294,8 +1430,13 @@ private fun AddYggPeerModal(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Совместим с Белыми списками (порт 443 / WSS)", style = MaterialTheme.typography.bodyMedium)
-                    Switch(checked = whitelistCompat, onCheckedChange = { whitelistCompat = it })
+                    Text(
+                        "Совместим с Белыми списками (порт 443 / WSS)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    YggSwitch(checked = whitelistCompat, onCheckedChange = { whitelistCompat = it })
                 }
             }
         },

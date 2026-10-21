@@ -76,7 +76,6 @@ fun VaultSyncScreen(
     linkedDevices: List<LinkedDeviceEntity>,
     backupSnapshots: List<BackupSnapshotEntity>,
     onToggleSeedReveal: () -> Unit,
-    onRotatePreKeys: () -> Unit,
     onRegenerateIdentity: () -> Unit,
     onSyncDevicesNow: () -> Unit,
     onPairDevice: (String, String, String, String) -> Unit,
@@ -91,7 +90,7 @@ fun VaultSyncScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Built-in Key Manager (BIP-39 + SLIP-0010 Hierarchy)
+        // 1. Built-in Key Manager (BIP-39 hierarchy)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -106,13 +105,18 @@ fun VaultSyncScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             Icon(Icons.Default.Key, contentDescription = null, tint = EmeraldPrimary)
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text(
-                                    text = "Встроенный Менеджер Ключей (SLIP-0010)",
-                                    style = MaterialTheme.typography.titleMedium
+                                    text = "Встроенный Менеджер Ключей (BIP-39)",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
                                     text = "Root Fingerprint: ${uiState.identity.masterFingerprintHex} • Эпоха #${uiState.keyEpoch}",
@@ -121,8 +125,10 @@ fun VaultSyncScreen(
                                 )
                             }
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
                         OutlinedButton(
                             onClick = onToggleSeedReveal,
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier.testTag("toggle_seed_reveal_button")
                         ) {
                             Icon(
@@ -131,7 +137,7 @@ fun VaultSyncScreen(
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text(if (uiState.isSeedPhraseRevealed) "Скрыть BIP-39" else "Показать BIP-39")
+                            Text(if (uiState.isSeedPhraseRevealed) "Скрыть" else "Показать", maxLines = 1)
                         }
                     }
 
@@ -144,7 +150,7 @@ fun VaultSyncScreen(
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(
-                                text = "Единая мнемоническая фраза BIP-39 (12 слов -> Ed25519 + X25519 + MLS + Backup):",
+                                text = "Единая мнемоническая фраза BIP-39 (12 слов -> Ed25519 + X25519 + Backup):",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -153,7 +159,7 @@ fun VaultSyncScreen(
                                 text = if (uiState.isSeedPhraseRevealed) {
                                     uiState.identity.mnemonicWords.mapIndexed { i, w -> "${i + 1}.$w" }.joinToString("  ")
                                 } else {
-                                    "1.••••••  2.••••••  3.••••••  4.••••••  5.••••••  6.••••••  (Нажмите «Показать BIP-39»)"
+                                    "1.••••••  2.••••••  3.••••••  4.••••••  5.••••••  6.••••••  (Нажмите «Показать»)"
                                 },
                                 style = MaterialTheme.typography.titleSmall,
                                 color = if (uiState.isSeedPhraseRevealed) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
@@ -167,28 +173,20 @@ fun VaultSyncScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Button(
-                            onClick = onRotatePreKeys,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("rotate_prekeys_button")
-                        ) {
-                            Icon(Icons.Default.LockReset, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Ротировать PreKeys")
-                        }
                         OutlinedButton(
                             onClick = onRegenerateIdentity,
-                            modifier = Modifier.testTag("regenerate_seed_button")
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("regenerate_seed_button")
                         ) {
-                            Text("Новый сид")
+                            Text("Сгенерировать новый сид")
                         }
                     }
                 }
             }
         }
 
-        // Derived SLIP-0010 Keys List
+        // Derived keys
         item {
             Text(
                 text = "Дерево криптографических ключей (${cryptoKeys.size})",
@@ -240,16 +238,18 @@ fun VaultSyncScreen(
                     ) {
                         Button(
                             onClick = onSyncDevicesNow,
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("sync_devices_now_button")
                         ) {
                             Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Синхронизировать сейчас")
+                            Text("Синхронизировать", maxLines = 1)
                         }
                         OutlinedButton(
                             onClick = { showPairDeviceDialog = true },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier.testTag("open_pair_device_dialog_button")
                         ) {
                             Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -299,7 +299,7 @@ fun VaultSyncScreen(
                     OutlinedTextField(
                         value = backupPassphrase,
                         onValueChange = { backupPassphrase = it },
-                        label = { Text("Парольная фраза контейнера (или мастер-ключ SLIP-0010)") },
+                        label = { Text("Парольная фраза контейнера (или фингерпринт мастер-ключа)") },
                         placeholder = { Text("Оставьте пустым для использования 256-bit Master Key") },
                         singleLine = true,
                         modifier = Modifier
@@ -318,13 +318,14 @@ fun VaultSyncScreen(
                                 onCreateBackup(backupPassphrase, false)
                                 backupPassphrase = ""
                             },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("create_local_backup_button")
                         ) {
                             Icon(Icons.Default.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Локальный .yggbak")
+                            Text("Локально", maxLines = 1)
                         }
 
                         OutlinedButton(
@@ -332,13 +333,14 @@ fun VaultSyncScreen(
                                 onCreateBackup(backupPassphrase, true)
                                 backupPassphrase = ""
                             },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("create_webdav_backup_button")
                         ) {
                             Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("WebDAV Чанки")
+                            Text("WebDAV", maxLines = 1)
                         }
                     }
 

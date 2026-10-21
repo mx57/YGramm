@@ -5,17 +5,20 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# The Go core calls these native declarations by exact JVM name. The default
+# proguard-android-optimize.txt already keeps native method names, this is an
+# explicit guard against a future default-file change.
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# JNI callbacks: the Go core resolves these class/method names from C.
+-keep class com.example.engine.YggNativeCoreBridge { *; }
+-keep class com.example.engine.YggNativeCoreBridge$* { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Room entities are instantiated by generated code from the compiled schema.
+-keep class com.example.data.** { *; }
+
+# Kotlin metadata is needed by kotlinx.coroutines and Compose runtime lookups.
+-keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*
+-dontwarn kotlinx.coroutines.**
