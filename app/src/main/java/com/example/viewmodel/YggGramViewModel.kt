@@ -77,6 +77,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 enum class YggNavTab {
     CHATS,
+    NETWORK_MAP,
     NETWORK_DPI,
     VAULT_SYNC,
     PROFILE_PRIVACY
@@ -2147,20 +2148,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         parsedQr: com.example.engine.ParsedYggContactQr
     ) {
         viewModelScope.launch {
-            val newChatId = repository.createNewConversation(
-                title = parsedQr.displayName,
-                yggIpv6Input = parsedQr.rawUri,
-                disappearingSeconds = _uiState.value.privacyMatrix.defaultDisappearingSeconds,
-                directEndpointHint = parsedQr.directLanHint,
-                localIdentity = _uiState.value.identity,
-                ownerProfileId = _uiState.value.currentProfileId,
-                peerX25519PublicKeyHex = parsedQr.x25519PubKeyHex,
-                peerEd25519PublicKeyHex = parsedQr.ed25519PubKeyHex
-            )
-            if (parsedQr.directLanHint.isNotBlank()) {
-                networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
+            val newChatId = withContext(Dispatchers.IO) {
+                repository.createNewConversation(
+                    title = parsedQr.displayName,
+                    yggIpv6Input = parsedQr.rawUri,
+                    disappearingSeconds = _uiState.value.privacyMatrix.defaultDisappearingSeconds,
+                    directEndpointHint = parsedQr.directLanHint,
+                    localIdentity = _uiState.value.identity,
+                    ownerProfileId = _uiState.value.currentProfileId,
+                    peerX25519PublicKeyHex = parsedQr.x25519PubKeyHex,
+                    peerEd25519PublicKeyHex = parsedQr.ed25519PubKeyHex
+                )
             }
-            val createdConv = repository.getConversation(newChatId)
+            if (parsedQr.directLanHint.isNotBlank()) {
+                withContext(Dispatchers.IO) {
+                    networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
+                }
+            }
+            val createdConv = withContext(Dispatchers.IO) { repository.getConversation(newChatId) }
             val hasNodeKey = hasVerifiedOverlayKey(createdConv)
             val createdLanHint = extractDirectEndpointHint(createdConv)
             _uiState.update {
@@ -3419,21 +3424,25 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 ?: if (primaryAddr.contains(".") && primaryAddr.contains(":")) primaryAddr else ""
 
             val effectiveTitle = title.trim().ifBlank { "Узел Yggdrasil" }
-            val newChatId = repository.createNewConversation(
-                title = effectiveTitle,
-                yggIpv6Input = primaryAddr,
-                disappearingSeconds = disappearingSeconds,
-                directEndpointHint = directHint,
-                localIdentity = _uiState.value.identity,
-                ownerProfileId = _uiState.value.currentProfileId
-            )
+            val newChatId = withContext(Dispatchers.IO) {
+                repository.createNewConversation(
+                    title = effectiveTitle,
+                    yggIpv6Input = primaryAddr,
+                    disappearingSeconds = disappearingSeconds,
+                    directEndpointHint = directHint,
+                    localIdentity = _uiState.value.identity,
+                    ownerProfileId = _uiState.value.currentProfileId
+                )
+            }
             if (directHint.isNotBlank() && !YggRepository.isSelfChatId(newChatId)) {
-                val conv = repository.getConversation(newChatId)
-                if (conv != null) {
-                    networkEngine.registerDirectEndpointForPeer(conv.yggIpv6Address, directHint)
+                withContext(Dispatchers.IO) {
+                    val conv = repository.getConversation(newChatId)
+                    if (conv != null) {
+                        networkEngine.registerDirectEndpointForPeer(conv.yggIpv6Address, directHint)
+                    }
                 }
             }
-            val createdConv = repository.getConversation(newChatId)
+            val createdConv = withContext(Dispatchers.IO) { repository.getConversation(newChatId) }
             val hasNodeKey = hasVerifiedOverlayKey(createdConv)
             val createdLanHint = extractDirectEndpointHint(createdConv)
             _uiState.update {
