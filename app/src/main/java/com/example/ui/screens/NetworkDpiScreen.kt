@@ -89,7 +89,13 @@ import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.CensorshipPreset
+import com.example.viewmodel.PeerScannerState
 import com.example.viewmodel.YggGramUiState
+
+enum class NetworkViewMode(val title: String, val icon: String) {
+    SIMPLE("Умный щит", "🛡️"),
+    EXPERT("Эксперт", "⚙️")
+}
 
 private enum class NetworkSubTab(val title: String) {
     ROUTES_AND_PEERS("Маршруты"),
@@ -123,6 +129,7 @@ fun NetworkDpiScreen(
     onClearPacketLogs: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    var viewMode by rememberSaveable { mutableStateOf(NetworkViewMode.SIMPLE) }
     var activeSubTab by rememberSaveable { mutableStateOf(NetworkSubTab.ROUTES_AND_PEERS) }
     var showAddPeerDialog by rememberSaveable { mutableStateOf(false) }
     var showBulkImportDialog by rememberSaveable { mutableStateOf(false) }
@@ -173,11 +180,87 @@ fun NetworkDpiScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Top Segmented Sub-Tab Selector
+        // Top Mode Switcher Bar (Simple vs Expert)
         Surface(
-            color = MaterialTheme.colorScheme.surfaceContainer,
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
             modifier = Modifier.fillMaxWidth()
         ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Shield,
+                        contentDescription = null,
+                        tint = EmeraldPrimary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "Сеть и Обход ТСПУ",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainer,
+                    shape = RoundedCornerShape(20.dp)
+                ) {
+                    Row(modifier = Modifier.padding(3.dp)) {
+                        NetworkViewMode.entries.forEach { mode ->
+                            val isSelected = viewMode == mode
+                            Surface(
+                                color = if (isSelected) EmeraldPrimary else Color.Transparent,
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable { viewMode = mode }
+                                    .testTag("network_mode_${mode.name}")
+                            ) {
+                                Text(
+                                    text = "${mode.icon} ${mode.title}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (isSelected) Color.Black else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (viewMode == NetworkViewMode.SIMPLE) {
+            SimpleNetworkShieldContent(
+                uiState = uiState,
+                peers = peers,
+                scanner = scanner,
+                liveRoutes = liveRoutes,
+                totalRoutes = totalRoutes,
+                onRunProbe = onRunProbe,
+                onConnectTopFastestInCountry = onConnectTopFastestInCountry,
+                onSelectScanCountry = onSelectScanCountry,
+                onRunCountryPeerScan = onRunCountryPeerScan,
+                onConnectScannedPeer = onConnectScannedPeer,
+                onToggleAntiDpiFlag = onToggleAntiDpiFlag,
+                onSelectPreset = onSelectPreset,
+                onSwitchToExpertMode = { viewMode = NetworkViewMode.EXPERT }
+            )
+        } else {
+            // Top Segmented Sub-Tab Selector
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                modifier = Modifier.fillMaxWidth()
+            ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1028,6 +1111,7 @@ fun NetworkDpiScreen(
             }
         }
     }
+}
 
     if (showAddPeerDialog) {
         AddYggPeerModal(
@@ -1529,3 +1613,421 @@ private fun BulkImportPeersDialog(
         }
     )
 }
+
+@Composable
+private fun SimpleNetworkShieldContent(
+    uiState: YggGramUiState,
+    peers: List<YggPeerEntity>,
+    scanner: PeerScannerState,
+    liveRoutes: Int,
+    totalRoutes: Int,
+    onRunProbe: () -> Unit,
+    onConnectTopFastestInCountry: () -> Unit,
+    onSelectScanCountry: (String) -> Unit,
+    onRunCountryPeerScan: () -> Unit,
+    onConnectScannedPeer: (DiscoveredYggPeer) -> Unit,
+    onToggleAntiDpiFlag: (String) -> Unit,
+    onSelectPreset: (CensorshipPreset) -> Unit,
+    onSwitchToExpertMode: () -> Unit
+) {
+    val cfg = uiState.antiDpiConfig
+    val isOnline = uiState.isNetworkAvailable && !uiState.isAirplaneModeOn
+    val isProtected = isOnline && liveRoutes > 0
+    val activePeer = peers.firstOrNull { it.isConnected }
+    val bestLatency = peers.filter { it.isConnected && it.latencyMs > 0 }.minOfOrNull { it.latencyMs }
+        ?: activePeer?.latencyMs?.takeIf { it > 0 } ?: -1
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // --- 1. HERO SHIELD CARD ---
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("simple_smart_shield_card"),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                ),
+                border = androidx.compose.foundation.BorderStroke(
+                    width = 1.5.dp,
+                    color = if (isProtected) EmeraldPrimary.copy(alpha = 0.5f)
+                    else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.4f)
+                    else CyberTealSecondary.copy(alpha = 0.4f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (isProtected) EmeraldPrimary.copy(alpha = 0.15f)
+                                        else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.15f)
+                                        else CyberTealSecondary.copy(alpha = 0.15f)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = if (isProtected) Icons.Default.Shield else Icons.Default.Radar,
+                                    contentDescription = null,
+                                    tint = if (isProtected) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else CyberTealSecondary,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+                            Column {
+                                Text(
+                                    text = "Умный щит Yggdrasil",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (isProtected) "ТСПУ и цензура заблокированы"
+                                    else if (!isOnline) "Сеть недоступна или Авиарежим"
+                                    else "Поиск стабильного узла 0200::/7",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isProtected) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        // Status Badge
+                        Surface(
+                            color = if (isProtected) EmeraldPrimary.copy(alpha = 0.2f)
+                            else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.2f)
+                            else MaterialTheme.colorScheme.surfaceContainerHigh,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text(
+                                text = if (isProtected) "● ЗАЩИЩЕНО"
+                                else if (!isOnline) "ОФЛАЙН"
+                                else "ПОИСК",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isProtected) EmeraldPrimary
+                                else if (!isOnline) AmberShieldTertiary
+                                else CyberTealSecondary,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+
+                    // Key telemetry metrics in 3 columns
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text(
+                                text = "УЗЕЛ ВЫХОДА",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = activePeer?.regionLabel ?: "Авто-выбор",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "ЗАДЕРЖКА",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = if (bestLatency > 0) "$bestLatency мс" else "—",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (bestLatency in 1..120) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "МАСКИРОВКА",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = cfg.activePreset.badge,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = CyberTealSecondary
+                            )
+                        }
+                    }
+
+                    // Diagnostic report or probe summary
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.NetworkCheck,
+                                contentDescription = null,
+                                tint = CyberTealSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = cfg.lastProbeReport,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    // Quick Action Buttons
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onRunProbe,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("simple_run_probe_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Bolt,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Проверить", maxLines = 1)
+                        }
+                        Button(
+                            onClick = onConnectTopFastestInCountry,
+                            modifier = Modifier
+                                .weight(1.2f)
+                                .testTag("simple_connect_fastest_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Лучший узел", maxLines = 1)
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 2. QUICK COUNTRY LOCATION SELECTOR ---
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Public,
+                                contentDescription = null,
+                                tint = CyberTealSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "Быстрый выбор региона (16 стран)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        Text(
+                            text = "1 клик для связи",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // Horizontal list of top countries
+                    val topCountries = listOf(
+                        "RU" to "🇷🇺 Россия (Белый список)",
+                        "NL" to "🇳🇱 Нидерланды",
+                        "DE" to "🇩🇪 Германия",
+                        "FI" to "🇫🇮 Финляндия",
+                        "SE" to "🇸🇪 Швеция",
+                        "US" to "🇺🇸 США",
+                        "CH" to "🇨🇭 Швейцария",
+                        "PL" to "🇵🇱 Польша",
+                        "FR" to "🇫🇷 Франция",
+                        "GB" to "🇬🇧 Великобритания",
+                        "EE" to "🇪🇪 Эстония",
+                        "CZ" to "🇨🇿 Чехия",
+                        "KZ" to "🇰🇿 Казахстан"
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        topCountries.forEach { (code, label) ->
+                            val isSelected = scanner.selectedCountryCode == code
+                            Surface(
+                                color = if (isSelected) EmeraldPrimary.copy(alpha = 0.2f)
+                                else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                shape = RoundedCornerShape(10.dp),
+                                border = if (isSelected) androidx.compose.foundation.BorderStroke(1.dp, EmeraldPrimary) else null,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable {
+                                        onSelectScanCountry(code)
+                                        onRunCountryPeerScan()
+                                        onConnectTopFastestInCountry()
+                                    }
+                                    .testTag("simple_country_chip_$code")
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 3. SMART PROTECTION SWITCHES ---
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Параметры скрытности и защиты",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    DpiSwitchRow(
+                        title = "Маскировка под HTTPS CDN (RU SNI)",
+                        subtitle = "Трафик выглядит для ТСПУ как обращение к разрешенным сайтам (Яндекс, Госуслуги)",
+                        checked = cfg.whitelistCdnWssEnabled,
+                        tag = "simple_switch_whitelist_mode",
+                        onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
+                    )
+
+                    DpiSwitchRow(
+                        title = "Защита от активного пробинга (VLESS Reality)",
+                        subtitle = "Отклоняет зондирующие пакеты цензурных сканеров с отпечатком uTLS Chrome 128",
+                        checked = cfg.vlessRealityEnabled,
+                        tag = "simple_switch_vless_mode",
+                        onToggle = { onToggleAntiDpiFlag("VLESS") }
+                    )
+
+                    DpiSwitchRow(
+                        title = "Анти-сигнатурный Padding (MTU ${cfg.quicPaddingMTU})",
+                        subtitle = "Скрывает длины сообщений и голосовых пакетов от DPI-сигнатур",
+                        checked = cfg.quicPaddingEnabled,
+                        tag = "simple_switch_quic_padding",
+                        onToggle = { onToggleAntiDpiFlag("QUIC_PAD") }
+                    )
+                }
+            }
+        }
+
+        // --- 4. EXPERT MODE INVITATION CARD ---
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                )
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Нужна детальная настройка?",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = "Кастомные SNI, uTLS профили, ShadowTLS v3, живой терминал пакетов и ручные маршруты",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onSwitchToExpertMode,
+                        modifier = Modifier.testTag("switch_to_expert_mode_button")
+                    ) {
+                        Text("Эксперт")
+                    }
+                }
+            }
+        }
+    }
+}
+

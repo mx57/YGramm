@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan to enforce strict Yggdrasil overlay routing (via external public Yggdrasil peers) for all inter-profile and P2P messages, voice notes, files, and calls by default, with automatic external peer failover, S&F queueing when offline, and an explicit manual LAN toggle (disabled by default).",
-  "updatedAt": "2026-10-18T21:46:46.677154236Z",
-  "requestFeedback": true,
-  "userFacing": true
+  "summary":  "План архитектурного обновления YggGram: усиление устойчивости сети и обхода блокировок ТСПУ, двухуровневый интерфейс (Simple vs Expert Mode) на экране «Сеть и ТСПУ», и декомпозиция монолитного ViewModel на модульные доменные контроллеры.",
+  "updatedAt":  "2026-10-21T18:43:58.947059513Z",
+  "requestFeedback":  true,
+  "userFacing":  true
 }

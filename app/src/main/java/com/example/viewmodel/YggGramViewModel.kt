@@ -39,6 +39,10 @@ import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
+import com.example.viewmodel.controllers.ChatConversationController
+import com.example.viewmodel.controllers.NetworkDpiController
+import com.example.viewmodel.controllers.VaultIdentityController
+import com.example.viewmodel.controllers.VoiceCallController
 import com.example.service.YggAlertCategory
 import com.example.service.YggCallAlertController
 import com.example.service.YggForegroundServiceState
@@ -558,7 +562,70 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         msgs.count { it.deliveryState == "QUEUED_OFFLINE_SF" && it.chatId in ownerChatIds }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
+    val networkDpiController = NetworkDpiController(
+        application = application,
+        repository = repository,
+        networkEngine = networkEngine,
+        scope = viewModelScope,
+        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } },
+        onSyncForegroundNotification = { syncForegroundServiceNotification() }
+    )
+
+    val chatConversationController = ChatConversationController(
+        application = application,
+        repository = repository,
+        networkEngine = networkEngine,
+        scope = viewModelScope,
+        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } },
+        onIncrementTx = { _uiState.update { it.copy(txPacketsCount = it.txPacketsCount + 1) } },
+        onIncrementRx = { _uiState.update { it.copy(rxPacketsCount = it.rxPacketsCount + 1) } }
+    )
+
+    val voiceCallController = VoiceCallController(
+        application = application,
+        repository = repository,
+        networkEngine = networkEngine,
+        scope = viewModelScope,
+        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } }
+    )
+
+    val vaultIdentityController = VaultIdentityController(
+        application = application,
+        repository = repository,
+        networkEngine = networkEngine,
+        scope = viewModelScope,
+        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } },
+        onProfileUpdated = { applyUserProfileEntityToState(it) },
+        onSyncForegroundNotification = { syncForegroundServiceNotification() }
+    )
+
     init {
+        viewModelScope.launch {
+            networkDpiController.antiDpiConfig.collect { cfg ->
+                _uiState.update { it.copy(antiDpiConfig = cfg) }
+            }
+        }
+        viewModelScope.launch {
+            networkDpiController.peerScanner.collect { scanner ->
+                _uiState.update { it.copy(peerScanner = scanner) }
+            }
+        }
+        viewModelScope.launch {
+            networkDpiController.packetLogs.collect { logs ->
+                _uiState.update { it.copy(packetLogs = logs) }
+            }
+        }
+        viewModelScope.launch {
+            chatConversationController.typingPeers.collect { typing ->
+                _uiState.update { it.copy(typingPeers = typing) }
+            }
+        }
+        viewModelScope.launch {
+            vaultIdentityController.isSeedPhraseRevealed.collect { revealed ->
+                _uiState.update { it.copy(isSeedPhraseRevealed = revealed) }
+            }
+        }
+
         _uiState.update { state ->
             state.copy(
                 privacyMatrix = state.privacyMatrix.copy(
@@ -1363,12 +1430,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             airplaneReceiver?.let { getApplication<Application>().unregisterReceiver(it) }
         } catch (_: Exception) {
         }
+        networkDpiController.stop()
+        chatConversationController.cleanup()
+        voiceCallController.stopCallAudio()
         YggAudioMediaEngine.stopVoipCallAudioSession(getApplication())
         YggAudioMediaEngine.stopVoiceNotePlayback()
         networkEngine.stop()
     }
 
     fun clearPacketLogs() {
+        networkDpiController.clearPacketLogs()
         _uiState.update { it.copy(packetLogs = emptyList()) }
     }
 
@@ -3209,6 +3280,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     // --- Real Yggdrasil Public Peer Scanner by Country, Search, Sort & Bulk Import ---
 
     fun selectScanCountry(countryCode: String) {
+        networkDpiController.selectScanCountry(countryCode)
         _uiState.update { state ->
             val countryObj = state.peerScanner.countries.find { it.code == countryCode }
             val filteredCount = state.peerScanner.discoveredPeers.count {
@@ -3225,30 +3297,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun updateScannerSearchQuery(query: String) {
-        _uiState.update { state ->
-            state.copy(
-                peerScanner = state.peerScanner.copy(searchQuery = query)
-            )
-        }
+        networkDpiController.updateScannerSearchQuery(query)
     }
 
     fun updateScannerSortMode(sortMode: String) {
-        _uiState.update { state ->
-            state.copy(
-                peerScanner = state.peerScanner.copy(sortMode = sortMode)
-            )
-        }
+        networkDpiController.updateScannerSortMode(sortMode)
     }
 
     fun toggleScannerWhitelistOnly() {
-        _uiState.update { state ->
-            val next = !state.peerScanner.onlyWhitelistCompatible
-            state.copy(
-                peerScanner = state.peerScanner.copy(
-                    onlyWhitelistCompatible = next
-                )
-            )
-        }
+        networkDpiController.toggleScannerWhitelistOnly()
     }
 
     /**
@@ -3318,190 +3375,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
      * with the 46 built-in real peers) and performs REAL TCP/TLS socket handshakes to measure genuine RTT.
      */
     fun scanYggdrasilPeersByCountry() {
-        if (_uiState.value.peerScanner.isScanning) return
-        viewModelScope.launch {
-            updateConnectivitySnapshot()
-            if (!networkEngine.isRealNetworkAvailable()) {
-                val reason = if (_uiState.value.isAirplaneModeOn) "Активен Авиарежим" else "Отсутствует подключение к Интернету"
-                _uiState.update { state ->
-                    val resetPeers = state.peerScanner.discoveredPeers.map { it.copy(latencyMs = -1) }
-                    state.copy(
-                        peerScanner = state.peerScanner.copy(
-                            isScanning = false,
-                            discoveredPeers = resetPeers,
-                            lastScanSummary = "Сканирование невозможно: $reason"
-                        ),
-                        statusBannerMessage = "Ошибка сканирования пиров: $reason"
-                    )
-                }
-                return@launch
-            }
-
-            val selectedCountry = _uiState.value.peerScanner.selectedCountryCode
-            _uiState.update { state ->
-                state.copy(
-                    peerScanner = state.peerScanner.copy(
-                        isScanning = true,
-                        lastScanSummary = "Загрузка каталога publicnodes.json и реальный TCP/TLS замер пинга..."
-                    )
-                )
-            }
-
-            val candidateCatalog = withContext(Dispatchers.IO) {
-                val liveFetched = try {
-                    YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                if (liveFetched.isNotEmpty()) {
-                    (_uiState.value.peerScanner.discoveredPeers + liveFetched).distinctBy { it.endpointUri }
-                } else {
-                    _uiState.value.peerScanner.discoveredPeers
-                }
-            }
-
-            val toProbe = candidateCatalog.filter {
-                (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
-                    (!_uiState.value.peerScanner.onlyWhitelistCompatible || it.whitelistCompatible)
-            }
-
-            val probedMap = withContext(Dispatchers.IO) {
-                toProbe.chunked(16).flatMap { batch ->
-                    batch.map { peer ->
-                        async {
-                            val res = networkEngine.probeRealYggdrasilPeer(
-                                endpointUri = peer.endpointUri,
-                                sniOverride = peer.sniDomain,
-                                timeoutMs = 2600
-                            )
-                            peer.endpointUri to res
-                        }
-                    }.awaitAll()
-                }.toMap()
-            }
-
-            val updatedCatalog = candidateCatalog.map { peer ->
-                val probe = probedMap[peer.endpointUri]
-                if (probe != null) {
-                    peer.copy(latencyMs = if (probe.reachable) probe.rttMs else -1)
-                } else {
-                    peer
-                }
-            }.sortedWith(
-                compareBy<DiscoveredYggPeer> { if (it.latencyMs > 0) 0 else 1 }
-                    .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
-            )
-
-            val reachableInSelection = updatedCatalog.filter {
-                (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
-                    (!_uiState.value.peerScanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
-                    it.latencyMs > 0
-            }
-            val bestRtt = reachableInSelection.minOfOrNull { it.latencyMs }
-
-            _uiState.update { state ->
-                val summary = if (reachableInSelection.isNotEmpty()) {
-                    "Живой замер завершен: ответили ${reachableInSelection.size} из ${toProbe.size} узлов • Лучший пинг: $bestRtt мс"
-                } else {
-                    "Проверено ${toProbe.size} узлов: ни один не ответил на прямое TCP/TLS соединение"
-                }
-                state.copy(
-                    txPacketsCount = state.txPacketsCount + toProbe.size,
-                    rxPacketsCount = state.rxPacketsCount + reachableInSelection.size,
-                    peerScanner = state.peerScanner.copy(
-                        isScanning = false,
-                        discoveredPeers = updatedCatalog,
-                        lastScanSummary = summary
-                    ),
-                    statusBannerMessage = summary
-                )
-            }
-            syncForegroundServiceNotification()
-        }
+        networkDpiController.scanYggdrasilPeersByCountry()
     }
 
     fun connectScannedPeer(scanned: DiscoveredYggPeer) {
-        viewModelScope.launch {
-            updateConnectivitySnapshot()
-            if (!networkEngine.isRealNetworkAvailable()) {
-                _uiState.update {
-                    it.copy(statusBannerMessage = "Невозможно подключить пир: устройство в авиарежиме или без сети")
-                }
-                return@launch
-            }
-            val probe = networkEngine.probeRealYggdrasilPeer(
-                endpointUri = scanned.endpointUri,
-                sniOverride = scanned.sniDomain,
-                timeoutMs = 3200
-            )
-            repository.addOrUpdatePeer(
-                peerId = "peer_${scanned.id}",
-                endpointUri = scanned.endpointUri,
-                transportType = scanned.transportType,
-                sniDomain = scanned.sniDomain,
-                utlsFingerprint = scanned.utlsFingerprint,
-                regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
-                latencyMs = if (probe.reachable) probe.rttMs else -1,
-                isConnected = probe.reachable,
-                whitelistCompatible = scanned.whitelistCompatible
-            )
-            _uiState.update { state ->
-                val updatedDiscovered = state.peerScanner.discoveredPeers.map {
-                    if (it.endpointUri == scanned.endpointUri) {
-                        it.copy(latencyMs = if (probe.reachable) probe.rttMs else -1)
-                    } else it
-                }
-                state.copy(
-                    peerScanner = state.peerScanner.copy(discoveredPeers = updatedDiscovered),
-                    statusBannerMessage = if (probe.reachable) {
-                        "Узел ${scanned.countryFlag} ${scanned.cityRu} подключен (реальный RTT: ${probe.rttMs} мс)"
-                    } else {
-                        "Узел ${scanned.cityRu} добавлен в маршруты, но сейчас не отвечает (${probe.errorDetail ?: "Timeout"})"
-                    }
-                )
-            }
-            syncForegroundServiceNotification()
-        }
+        networkDpiController.connectScannedPeer(scanned)
     }
 
     fun connectTopFastestPeersInSelectedCountry() {
-        val scanner = _uiState.value.peerScanner
-        val matching = scanner.discoveredPeers
-            .filter {
-                (scanner.selectedCountryCode == "ALL" || it.countryCode == scanner.selectedCountryCode) &&
-                    (!scanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
-                    it.latencyMs > 0
-            }
-            .sortedBy { it.latencyMs }
-            .take(3)
-
-        if (matching.isEmpty()) {
-            _uiState.update {
-                it.copy(statusBannerMessage = "Сначала нажмите «Сканировать пинг», чтобы найти реально доступные узлы")
-            }
-            return
-        }
-        viewModelScope.launch {
-            matching.forEach { scanned ->
-                repository.addOrUpdatePeer(
-                    peerId = "peer_${scanned.id}",
-                    endpointUri = scanned.endpointUri,
-                    transportType = scanned.transportType,
-                    sniDomain = scanned.sniDomain,
-                    utlsFingerprint = scanned.utlsFingerprint,
-                    regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
-                    latencyMs = scanned.latencyMs,
-                    isConnected = true,
-                    whitelistCompatible = scanned.whitelistCompatible
-                )
-            }
-            _uiState.update {
-                it.copy(
-                    statusBannerMessage = "Подключены ${matching.size} быстрых пира (лучший: ${matching.first().cityRu}, ${matching.first().latencyMs} мс)"
-                )
-            }
-            syncForegroundServiceNotification()
-        }
+        networkDpiController.connectTopFastestPeersInSelectedCountry()
     }
 
     fun createNewChatOrGroup(
@@ -3578,107 +3460,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {
-        val current = _uiState.value.antiDpiConfig
-        val updatedConfig = when (preset) {
-            CensorshipPreset.RU_WHITELIST_CDN -> current.copy(
-                activePreset = preset,
-                whitelistCdnWssEnabled = true,
-                vlessRealityEnabled = true,
-                shadowTlsV3Enabled = false,
-                quicPaddingEnabled = true,
-                utlsProfile = "HelloChrome_128_Auto",
-                lastProbeReport = "Выбран профиль обхода Белых списков (SNI: ${current.whitelistSniDomain})"
-            )
-            CensorshipPreset.TSPU_VLESS_SHADOWTLS -> current.copy(
-                activePreset = preset,
-                whitelistCdnWssEnabled = true,
-                vlessRealityEnabled = true,
-                shadowTlsV3Enabled = true,
-                quicPaddingEnabled = true,
-                utlsProfile = "HelloIOS_18_Auto",
-                lastProbeReport = "Выбран профиль VLESS Reality + ShadowTLS v3 (uTLS iOS 18)"
-            )
-            CensorshipPreset.QUIC_UDP_OBFUSCATION -> current.copy(
-                activePreset = preset,
-                quicPaddingEnabled = true,
-                quicPaddingMTU = 1400,
-                utlsProfile = "QUIC_v1_Padded_Jitter",
-                lastProbeReport = "Выбрана обфускация QUIC UDP (выравнивание пакетов до 1400 байт)"
-            )
-            CensorshipPreset.AUTONOMOUS_DHT_DOH -> current.copy(
-                activePreset = preset,
-                dhtBep44BootstrapEnabled = true,
-                whitelistCdnWssEnabled = true,
-                lastProbeReport = "Выбран автономный поиск входных узлов через DHT BEP-44 и DoH"
-            )
-        }
-        _uiState.update {
-            it.copy(
-                antiDpiConfig = updatedConfig,
-                statusBannerMessage = "Применен профиль: ${preset.title}"
-            )
-        }
+        networkDpiController.applyCensorshipPreset(preset)
         viewModelScope.launch {
-            repository.updatePeersTransportProfile(
-                whitelistMode = updatedConfig.whitelistCdnWssEnabled,
-                preferredSni = updatedConfig.whitelistSniDomain,
-                utlsProfile = updatedConfig.utlsProfile
-            )
             refreshRealPeerConnectivity()
         }
     }
 
     fun selectWhitelistSniDomain(domain: String) {
-        _uiState.update { state ->
-            state.copy(
-                antiDpiConfig = state.antiDpiConfig.copy(
-                    whitelistSniDomain = domain,
-                    lastProbeReport = "Установлен SNI-домен: $domain"
-                )
-            )
-        }
-        viewModelScope.launch {
-            val cfg = _uiState.value.antiDpiConfig
-            repository.updatePeersTransportProfile(
-                whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = domain,
-                utlsProfile = cfg.utlsProfile
-            )
-        }
+        networkDpiController.selectWhitelistSniDomain(domain)
     }
 
     fun selectUtlsFingerprint(fingerprint: String) {
-        _uiState.update { state ->
-            state.copy(
-                antiDpiConfig = state.antiDpiConfig.copy(
-                    utlsProfile = fingerprint,
-                    lastProbeReport = "Установлен профиль uTLS: $fingerprint"
-                )
-            )
-        }
-        viewModelScope.launch {
-            val cfg = _uiState.value.antiDpiConfig
-            repository.updatePeersTransportProfile(
-                whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = cfg.whitelistSniDomain,
-                utlsProfile = fingerprint
-            )
-        }
+        networkDpiController.selectUtlsFingerprint(fingerprint)
     }
 
     fun toggleAntiDpiFlag(flagName: String) {
-        _uiState.update { state ->
-            val c = state.antiDpiConfig
-            val next = when (flagName) {
-                "WHITELIST_WSS" -> c.copy(whitelistCdnWssEnabled = !c.whitelistCdnWssEnabled)
-                "SHADOWTLS" -> c.copy(shadowTlsV3Enabled = !c.shadowTlsV3Enabled)
-                "VLESS" -> c.copy(vlessRealityEnabled = !c.vlessRealityEnabled)
-                "QUIC_PAD" -> c.copy(quicPaddingEnabled = !c.quicPaddingEnabled)
-                "DHT_BEP44" -> c.copy(dhtBep44BootstrapEnabled = !c.dhtBep44BootstrapEnabled)
-                else -> c
-            }
-            state.copy(antiDpiConfig = next)
-        }
+        networkDpiController.toggleAntiDpiFlag(flagName)
     }
 
     fun runAntiDpiDiagnosticProbe() {
@@ -3776,7 +3573,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun toggleRevealSeedPhrase() {
-        _uiState.update { it.copy(isSeedPhraseRevealed = !it.isSeedPhraseRevealed) }
+        vaultIdentityController.toggleRevealSeedPhrase()
     }
 
     fun regenerateNewSeedIdentity() {
