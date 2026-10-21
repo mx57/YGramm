@@ -361,7 +361,7 @@ class YggTwinP2PBridge(
         val host = clean.substringBeforeLast(":").removeSurrounding("[", "]")
         val port = clean.substringAfterLast(":").toIntOrNull() ?: 51921
         if (host.isNotBlank() && port in 1..65535) {
-            directEndpointTable[yggIpv6OrKey.lowercase()] = InetSocketAddress(host, port)
+            directEndpointTable[yggIpv6OrKey.lowercase()] = InetSocketAddress.createUnresolved(host, port)
         }
     }
 
@@ -1267,7 +1267,7 @@ class YggTwinP2PBridge(
                     }
                     val senderPort = map["senderTcpPort"]?.toIntOrNull() ?: 51921
                     if (allowDirectLanRouting && senderIpv6.isNotBlank() && remoteIp != "unknown" && remoteIp != "127.0.0.1") {
-                        directEndpointTable[senderIpv6.lowercase()] = InetSocketAddress(remoteIp, senderPort)
+                        directEndpointTable[senderIpv6.lowercase()] = InetSocketAddress.createUnresolved(remoteIp, senderPort)
                     }
                     pruneRecentIncomingOverlayMessages()
                     val alreadySeen = msgId.isNotBlank() &&
@@ -1543,7 +1543,7 @@ class YggTwinP2PBridge(
             val pubKey = map["pubKey"] ?: ""
             val name = map["displayName"] ?: "Узел YggGram ($senderIp)"
             val port = map["tcpPort"]?.toIntOrNull() ?: 51921
-            directEndpointTable[yggIpv6.lowercase()] = InetSocketAddress(senderIp, port)
+            directEndpointTable[yggIpv6.lowercase()] = InetSocketAddress.createUnresolved(senderIp, port)
             val node = DiscoveredLanNode(
                 displayName = name,
                 yggIpv6 = yggIpv6,
@@ -3108,7 +3108,7 @@ class YggTwinP2PBridge(
         // If the peer belongs to an active local profile, its loopback listener is a real route.
         val localProfileId = ipv6ToProfileIdMap[peer.lowercase()]
         if (localProfileId != null && !isSameIdentity) {
-            activeProfilePortMap[localProfileId]?.let { return InetSocketAddress("127.0.0.1", it) }
+            activeProfilePortMap[localProfileId]?.let { return InetSocketAddress.createUnresolved("127.0.0.1", it) }
         }
 
         val cleanHint = directHint.trim()
@@ -3117,7 +3117,7 @@ class YggTwinP2PBridge(
             val p = cleanHint.substringAfterLast(":").toIntOrNull()
             val isOwnLoopback = isSameIdentity && (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
             if (h.isNotBlank() && !isOwnLoopback && p != null && p in 1..65535) {
-                return InetSocketAddress(h, p)
+                return InetSocketAddress.createUnresolved(h, p)
             }
         }
 
@@ -3134,7 +3134,7 @@ class YggTwinP2PBridge(
             val p = literal.substringAfterLast(":").toIntOrNull() ?: 51921
             val isOwnLoopback = isSameIdentity && (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
             if (h.isNotBlank() && !isOwnLoopback && p in 1..65535) {
-                return InetSocketAddress(h, p)
+                return InetSocketAddress.createUnresolved(h, p)
             }
         }
         return null

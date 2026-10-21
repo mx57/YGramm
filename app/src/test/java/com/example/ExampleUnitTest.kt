@@ -113,6 +113,20 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun registerDirectEndpointForPeer_doesNotTriggerNetworkOnMainThreadException() {
+        val bridge = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        bridge.registerDirectEndpointForPeer("200:1234::1", "192.168.1.100:51921")
+        bridge.registerDirectEndpointForPeer("200:5678::2", "example.com:51921")
+        bridge.registerDirectEndpointForPeer("200:9999::3", "127.0.0.1:51922")
+    }
+
+    @Test
     fun qrUriParser_extractsContactFields() {
         val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
             listOf(

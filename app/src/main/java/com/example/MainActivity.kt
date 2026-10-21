@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Shield
@@ -92,6 +93,7 @@ import com.example.ui.components.YggInAppNotificationBannerOverlay
 import com.example.ui.components.YggNetworkStatus
 import com.example.ui.screens.ChatsScreen
 import com.example.ui.screens.NetworkDpiScreen
+import com.example.ui.screens.NetworkMapScreen
 import com.example.ui.screens.ProfilePrivacyScreen
 import com.example.ui.screens.VaultSyncScreen
 import com.example.ui.theme.AmberShieldTertiary
@@ -528,6 +530,16 @@ fun YggGramRootApp(
                         )
 
                         NavigationBarItem(
+                            selected = uiState.activeTab == YggNavTab.NETWORK_MAP,
+                            onClick = { viewModel.selectTab(YggNavTab.NETWORK_MAP) },
+                            icon = {
+                                Icon(Icons.Default.Map, contentDescription = "Карта сети")
+                            },
+                            label = { Text("Карта") },
+                            modifier = Modifier.testTag("nav_tab_network_map")
+                        )
+
+                        NavigationBarItem(
                             selected = uiState.activeTab == YggNavTab.NETWORK_DPI,
                             onClick = { viewModel.selectTab(YggNavTab.NETWORK_DPI) },
                             icon = {
@@ -594,6 +606,13 @@ fun YggGramRootApp(
                             icon = { Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = "Чаты") },
                             label = { Text(stringResource(R.string.nav_chats)) },
                             modifier = Modifier.testTag("rail_tab_chats")
+                        )
+                        NavigationRailItem(
+                            selected = uiState.activeTab == YggNavTab.NETWORK_MAP,
+                            onClick = { viewModel.selectTab(YggNavTab.NETWORK_MAP) },
+                            icon = { Icon(Icons.Default.Map, contentDescription = "Карта сети") },
+                            label = { Text("Карта") },
+                            modifier = Modifier.testTag("rail_tab_network_map")
                         )
                         NavigationRailItem(
                             selected = uiState.activeTab == YggNavTab.NETWORK_DPI,
@@ -709,6 +728,16 @@ fun YggGramRootApp(
                                     }
                                 },
                                 onRetryMessage = viewModel::retrySendMessage,
+                                onPingChatRoute = viewModel::pingConversationRoute
+                            )
+
+                            YggNavTab.NETWORK_MAP -> NetworkMapScreen(
+                                uiState = uiState,
+                                conversations = conversations,
+                                allMessages = allMessages,
+                                peers = peers,
+                                onRunProbe = viewModel::runAntiDpiDiagnosticProbe,
+                                onRunSendReceiveTest = { viewModel.runLiveMessageSendReceiveTest(null) },
                                 onPingChatRoute = viewModel::pingConversationRoute
                             )
 
