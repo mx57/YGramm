@@ -1,12 +1,19 @@
 // File: app/src/main/java/com/example/MainActivity.kt
 package com.example
 
+import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -53,6 +60,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -62,17 +70,24 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.engine.YggQrCodeCodec
 import com.example.service.YggNotificationCenter
 import com.example.ui.components.NetworkStatusIndicator
 import com.example.ui.components.ProfileSwitchConfirmationDialog
 import com.example.ui.components.QrContactModal
+import com.example.ui.components.VoiceCallOverlaySheet
 import com.example.ui.components.YggInAppNotificationBannerOverlay
 import com.example.ui.components.YggNetworkStatus
 import com.example.ui.screens.ChatsScreen
@@ -85,6 +100,7 @@ import com.example.ui.theme.EmeraldPrimary
 import com.example.ui.theme.YggGramTheme
 import com.example.viewmodel.YggGramViewModel
 import com.example.viewmodel.YggNavTab
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -126,30 +142,151 @@ fun YggGramRootApp(
     val foregroundServiceState by viewModel.foregroundServiceState.collectAsStateWithLifecycle()
     val conversations by viewModel.conversations.collectAsStateWithLifecycle()
     val allMessages by viewModel.allMessages.collectAsStateWithLifecycle()
-    val fileTransfers by viewModel.fileTransfers.collectAsStateWithLifecycle()
+    val callLog by viewModel.callLog.collectAsStateWithLifecycle()
+    val messageSearchResults by viewModel.messageSearchResults.collectAsStateWithLifecycle()
     val peers by viewModel.peers.collectAsStateWithLifecycle()
     val linkedDevices by viewModel.linkedDevices.collectAsStateWithLifecycle()
     val backupSnapshots by viewModel.backupSnapshots.collectAsStateWithLifecycle()
     val cryptoKeys by viewModel.cryptoKeys.collectAsStateWithLifecycle()
     val queuedOfflineCount by viewModel.queuedOfflineMessagesCount.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { }
+    var pendingAcceptCallId by rememberSaveable { mutableStateOf("") }
+    val callMicPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val targetCallId = pendingAcceptCallId
+        pendingAcceptCallId = ""
+        if (granted) {
+            viewModel.acceptIncomingCall()
+        } else {
+            Toast.makeText(
+                context,
+                "Без доступа к микрофону принять звонок невозможно",
+                Toast.LENGTH_LONG
+            ).show()
+            if (targetCallId.isNotBlank()) {
+                viewModel.declineIncomingCall()
+            }
+        }
+    }
+    val acceptCallWithPermission: () -> Unit = {
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.acceptIncomingCall()
+        } else {
+            pendingAcceptCallId = uiState.activeVoiceCall?.callId.orEmpty()
+            callMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            val prefs = context.getSharedPreferences("ygggram_ui_prefs", Context.MODE_PRIVATE)
+            if (!prefs.getBoolean("notif_permission_requested", false)) {
+                prefs.edit().putBoolean("notif_permission_requested", true).apply()
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
 
     var showGlobalQrModal by rememberSaveable { mutableStateOf(false) }
     var showProfileQuickMenu by rememberSaveable { mutableStateOf(false) }
 
+    // Show the ring screen over the lock screen, like a system phone call.
+    val incomingRinging = uiState.activeVoiceCall?.isIncoming == true &&
+        uiState.activeVoiceCall?.callStatus == "RINGING_INCOMING"
+    LaunchedEffect(incomingRinging) {
+        val activity = context.findHostActivity() ?: return@LaunchedEffect
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            activity.setShowWhenLocked(incomingRinging)
+            activity.setTurnScreenOn(incomingRinging)
+        } else {
+            @Suppress("DEPRECATION")
+            if (incomingRinging) {
+                activity.window.addFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                        android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                )
+            } else {
+                activity.window.clearFlags(
+                    android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                        android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                )
+            }
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> viewModel.setAppForeground(true)
+                Lifecycle.Event.ON_PAUSE -> viewModel.setAppForeground(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        viewModel.setAppForeground(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(notificationIntent) {
         val intent = notificationIntent ?: return@LaunchedEffect
+        val deepLink = intent.dataString
+        if (intent.action == Intent.ACTION_VIEW &&
+            !deepLink.isNullOrBlank() &&
+            deepLink.startsWith("ygggram://", ignoreCase = true)
+        ) {
+            val parsed = YggQrCodeCodec.parseContactString(deepLink)
+            if (parsed != null) {
+                viewModel.addContactFromQrPayload(parsed)
+            } else {
+                Toast.makeText(
+                    context,
+                    "Ссылка ygggram:// не содержит корректной визитки контакта",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            onNotificationIntentConsumed()
+            return@LaunchedEffect
+        }
         val targetProfId = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_PROFILE_ID).orEmpty()
         val targetChatId = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CHAT_ID).orEmpty()
         val categoryName = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CATEGORY).orEmpty()
+        val notifAction = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_ACTION).orEmpty()
+        val notifCallId = intent.getStringExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CALL_ID).orEmpty()
         if (targetProfId.isNotBlank() || targetChatId.isNotBlank()) {
-            viewModel.handleSystemNotificationIntent(
-                targetProfileId = targetProfId,
-                chatId = targetChatId,
-                categoryName = categoryName
-            )
+            if (notifAction == YggNotificationCenter.ACTION_ANSWER_CALL &&
+                uiState.activeVoiceCall?.callStatus == "RINGING_INCOMING"
+            ) {
+                acceptCallWithPermission()
+            } else {
+                viewModel.handleSystemNotificationIntent(
+                    targetProfileId = targetProfId,
+                    chatId = targetChatId,
+                    categoryName = categoryName,
+                    action = notifAction,
+                    callId = notifCallId
+                )
+            }
             intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_PROFILE_ID)
             intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CHAT_ID)
             intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CATEGORY)
+            intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_CALL_ID)
+            intent.removeExtra(YggNotificationCenter.EXTRA_NOTIFICATION_ACTION)
             onNotificationIntentConsumed()
         }
     }
@@ -298,7 +435,7 @@ fun YggGramRootApp(
                                                     color = if (isCurrent) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
                                                 )
                                                 Text(
-                                                    text = "$roleBadge • Порт :${prof.allocatedTcpPort} • ${prof.yggIpv6Address.take(16)}...",
+                                                    text = "$roleBadge • Порт ${prof.allocatedTcpPort} • ${prof.yggIpv6Address.take(16)}...",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
@@ -492,8 +629,15 @@ fun YggGramRootApp(
                         onDismiss = viewModel::dismissPopupNotification
                     )
 
-                    AnimatedVisibility(visible = uiState.statusBannerMessage != null) {
-                        uiState.statusBannerMessage?.let { msg ->
+                    val statusBannerMessage = uiState.statusBannerMessage
+                    LaunchedEffect(statusBannerMessage) {
+                        if (statusBannerMessage != null) {
+                            delay(8_000)
+                            viewModel.dismissBanner()
+                        }
+                    }
+                    AnimatedVisibility(visible = statusBannerMessage != null) {
+                        statusBannerMessage?.let { msg ->
                             Surface(
                                 color = MaterialTheme.colorScheme.primaryContainer,
                                 modifier = Modifier
@@ -536,7 +680,8 @@ fun YggGramRootApp(
                                 uiState = uiState,
                                 conversations = conversations,
                                 allMessages = allMessages,
-                                fileTransfers = fileTransfers,
+                                callLog = callLog,
+                                messageSearchResults = messageSearchResults,
                                 queuedOfflineCount = queuedOfflineCount,
                                 onSelectChat = viewModel::selectChat,
                                 onSearchQueryChange = viewModel::updateSearchQuery,
@@ -545,18 +690,24 @@ fun YggGramRootApp(
                                 onSendMessage = viewModel::sendMessage,
                                 onSendVoiceMessage = viewModel::sendVoiceMessage,
                                 onSendMediaOrFile = viewModel::sendMediaOrDocumentAttachment,
+                                onSendReply = { chatId, text, quotedId ->
+                                    viewModel.sendMessage(chatId, text, quotedMessageId = quotedId)
+                                },
+                                onForwardMessage = viewModel::forwardMessage,
+                                onTyping = viewModel::notifyTyping,
                                 onToggleReaction = viewModel::toggleMessageReaction,
                                 onStartVoiceCall = viewModel::startVoiceCall,
-                                onToggleCallMute = viewModel::toggleCallMute,
-                                onToggleCallSpeaker = viewModel::toggleCallSpeakerphone,
-                                onTriggerCallTestAudioTone = viewModel::triggerCallTestAudioTone,
-                                onEndVoiceCall = viewModel::endVoiceCall,
                                 onAddContactFromQr = viewModel::addContactFromQrPayload,
                                 onCreateNewChat = viewModel::createNewChatOrGroup,
                                 onDeleteChat = viewModel::deleteChat,
-                                onToggleTransferState = viewModel::toggleFileTransferState,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
-                                onOpenSelfYggdrasilChat = viewModel::openSelfYggdrasilTestChat,
+                                onOpenSelfYggdrasilChat = { runOverlayProbe ->
+                                    if (runOverlayProbe) {
+                                        viewModel.runYggdrasilOverlaySelfTest()
+                                    } else {
+                                        viewModel.openSelfYggdrasilTestChat()
+                                    }
+                                },
                                 onRetryMessage = viewModel::retrySendMessage,
                                 onPingChatRoute = viewModel::pingConversationRoute
                             )
@@ -579,7 +730,7 @@ fun YggGramRootApp(
                                 onConnectTopFastestInCountry = viewModel::connectTopFastestPeersInSelectedCountry,
                                 onPingTwinNode = viewModel::pingTwinNodeNow,
                                 onRunSendReceiveTest = { viewModel.runLiveMessageSendReceiveTest(null) },
-                                onOpenSelfYggdrasilTest = { viewModel.openSelfYggdrasilTestChat(true) },
+                                onOpenSelfYggdrasilTest = { viewModel.runYggdrasilOverlaySelfTest() },
                                 onUpdateScannerSearch = viewModel::updateScannerSearchQuery,
                                 onUpdateScannerSort = viewModel::updateScannerSortMode,
                                 onImportCustomPeers = viewModel::importCustomPeersFromText,
@@ -592,7 +743,6 @@ fun YggGramRootApp(
                                 linkedDevices = linkedDevices,
                                 backupSnapshots = backupSnapshots,
                                 onToggleSeedReveal = viewModel::toggleRevealSeedPhrase,
-                                onRotatePreKeys = viewModel::rotatePreKeysAndMlsEpoch,
                                 onRegenerateIdentity = viewModel::regenerateNewSeedIdentity,
                                 onSyncDevicesNow = viewModel::triggerCrossPlatformSyncNow,
                                 onPairDevice = viewModel::pairNewDevice,
@@ -614,6 +764,7 @@ fun YggGramRootApp(
                                 onOpenChatWithProfile = viewModel::openChatWithSecondaryProfile,
                                 onToggleBackgroundService = viewModel::setBackgroundServiceEnabled,
                                 onUpdatePrivacy = viewModel::updatePrivacySetting,
+                                onUpdateNotifications = viewModel::updateNotificationPreferences,
                                 onAddContactFromQr = { payload ->
                                     viewModel.addContactFromQrPayload(payload)
                                     viewModel.selectTab(YggNavTab.CHATS)
@@ -634,10 +785,22 @@ fun YggGramRootApp(
             )
         }
 
+        uiState.activeVoiceCall?.let { callState ->
+            VoiceCallOverlaySheet(
+                callState = callState,
+                onToggleMute = viewModel::toggleCallMute,
+                onToggleSpeaker = viewModel::toggleCallSpeakerphone,
+                onEndCall = viewModel::endVoiceCall,
+                onTriggerTestAudioTone = viewModel::triggerCallTestAudioTone,
+                onAcceptCall = acceptCallWithPermission,
+                onDeclineCall = viewModel::declineIncomingCall
+            )
+        }
+
         if (showGlobalQrModal) {
             QrContactModal(
                 uiState = uiState,
-                initialTab = 0,
+                initialTab = 1,
                 onDismiss = { showGlobalQrModal = false },
                 onContactScanned = { payload ->
                     showGlobalQrModal = false
@@ -647,4 +810,13 @@ fun YggGramRootApp(
             )
         }
     }
+}
+
+private fun Context.findHostActivity(): android.app.Activity? {
+    var current: Context? = this
+    while (current is android.content.ContextWrapper) {
+        if (current is android.app.Activity) return current
+        current = current.baseContext
+    }
+    return current as? android.app.Activity
 }

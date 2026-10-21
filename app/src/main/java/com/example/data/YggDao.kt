@@ -64,8 +64,54 @@ interface YggDao {
     @Query("SELECT * FROM messages WHERE messageId = :messageId LIMIT 1")
     suspend fun getMessageById(messageId: String): MessageEntity?
 
+    @Query(
+        "SELECT * FROM messages WHERE messageId = :wireMessageId " +
+            "OR (peerMessageId != '' AND peerMessageId = :wireMessageId) " +
+            "ORDER BY CASE WHEN messageId = :wireMessageId THEN 0 ELSE 1 END LIMIT 1"
+    )
+    suspend fun getMessageByWireId(wireMessageId: String): MessageEntity?
+
     @Query("UPDATE messages SET deliveryState = :newState WHERE messageId = :messageId")
     suspend fun updateMessageDeliveryState(messageId: String, newState: String)
+
+    @Query(
+        "UPDATE messages SET deliveryState = 'READ' " +
+            "WHERE isOutgoing = 1 AND (messageId = :wireMessageId OR peerMessageId = :wireMessageId)"
+    )
+    suspend fun markOutgoingMessageRead(wireMessageId: String)
+
+    @Query(
+        "SELECT peerMessageId FROM messages " +
+            "WHERE chatId = :chatId AND isOutgoing = 0 AND deliveryState != 'READ' AND peerMessageId != ''"
+    )
+    suspend fun getUnreadIncomingPeerIds(chatId: String): List<String>
+
+    @Query(
+        "UPDATE messages SET deliveryState = 'READ' " +
+            "WHERE chatId = :chatId AND isOutgoing = 0 AND deliveryState != 'READ'"
+    )
+    suspend fun markIncomingMessagesRead(chatId: String)
+
+    @Query(
+        "SELECT messages.* FROM messages INNER JOIN conversations ON messages.chatId = conversations.chatId " +
+            "WHERE conversations.ownerProfileId = :ownerProfileId " +
+            "AND messages.plainText LIKE '%' || :query || '%' " +
+            "ORDER BY messages.timestamp DESC LIMIT :limit"
+    )
+    fun searchMessages(
+        ownerProfileId: String,
+        query: String,
+        limit: Int
+    ): Flow<List<MessageEntity>>
+
+    @Query(
+        "SELECT * FROM call_log WHERE ownerProfileId = :ownerProfileId " +
+            "ORDER BY startedAt DESC LIMIT :limit"
+    )
+    fun observeCallLog(ownerProfileId: String, limit: Int): Flow<List<CallLogEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCallLog(entry: CallLogEntity)
 
     @Query("UPDATE messages SET reactionsJson = :reactionsJson WHERE messageId = :messageId")
     suspend fun updateMessageReactions(messageId: String, reactionsJson: String)
@@ -132,6 +178,9 @@ interface YggDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertCryptoKey(key: CryptoKeyRecordEntity)
+
+    @Query("DELETE FROM crypto_keys WHERE keyId IN ('key_x25519_spk', 'key_mls_hpke')")
+    suspend fun deleteLegacyCryptoClaims()
 
     @Query("SELECT COUNT(*) FROM conversations")
     suspend fun countConversations(): Int

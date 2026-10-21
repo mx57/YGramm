@@ -15,6 +15,7 @@ navigationCompose = "2.8.9"
 roomRuntime = "2.7.0"
 roomKtx = "2.7.0"
 roomCompiler = "2.7.0"
+sqlcipherAndroid = "4.19.1"
 kotlinxCoroutinesTest = "1.10.2"
 core = "1.6.1"
 runner = "1.6.2"
@@ -29,6 +30,7 @@ cameraCamera2 = "1.5.0"
 cameraLifecycle = "1.5.0"
 cameraView = "1.5.0"
 cameraCore = "1.5.0"
+zxingCore = "3.5.3"
 loggingInterceptor = "4.10.0"
 okhttp = "4.10.0"
 moshiKotlin = "1.15.2"
@@ -62,6 +64,7 @@ androidx-navigation-compose = { group = "androidx.navigation", name = "navigatio
 androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "roomRuntime" }
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "roomKtx" }
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "roomCompiler" }
+sqlcipher-android = { group = "net.zetetic", name = "sqlcipher-android", version.ref = "sqlcipherAndroid" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlinxCoroutinesTest" }
 androidx-core = { group = "androidx.test", name = "core", version.ref = "core" }
 androidx-runner = { group = "androidx.test", name = "runner", version.ref = "runner" }
@@ -79,6 +82,7 @@ androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", 
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "cameraLifecycle" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "cameraView" }
 androidx-camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraCore" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 logging-interceptor = { group = "com.squareup.okhttp3", name = "logging-interceptor", version.ref = "loggingInterceptor" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 moshi-kotlin = { group = "com.squareup.moshi", name = "moshi-kotlin", version.ref = "moshiKotlin" }

@@ -57,6 +57,24 @@ object YggPeerScannerCatalog {
      * Note: latencyMs starts at -1 (unprobed) until a real TCP/TLS/WSS socket probe is executed.
      */
     val initialCatalog: List<DiscoveredYggPeer> = listOf(
+        // Verified-live first: this endpoint completed a real Yggdrasil TLS+tree
+        // handshake from the developer network, unlike most CDN-fronted entries.
+        DiscoveredYggPeer(
+            id = "real_fr_par_1",
+            countryCode = "FR",
+            countryFlag = "🇫🇷",
+            countryNameRu = "Франция",
+            cityRu = "Париж (Scaleway FR #1)",
+            endpointUri = "tls://51.15.204.214:54321",
+            transportType = "TLS_YGGDRASIL",
+            sniDomain = "51.15.204.214",
+            utlsFingerprint = "HelloChrome_128_Auto",
+            latencyMs = -1,
+            uptimePercent = 99.5,
+            whitelistCompatible = false,
+            ed25519PubKeyShort = "key:48c2f901a6...",
+            bandwidthMbps = 1500
+        ),
         // --- RUSSIA (RU) ---
         DiscoveredYggPeer(
             id = "real_ru_msk_zbin_tls",
@@ -386,22 +404,6 @@ object YggPeerScannerCatalog {
         ),
 
         // --- FRANCE (FR) ---
-        DiscoveredYggPeer(
-            id = "real_fr_par_1",
-            countryCode = "FR",
-            countryFlag = "🇫🇷",
-            countryNameRu = "Франция",
-            cityRu = "Париж (Scaleway FR #1)",
-            endpointUri = "tls://51.15.204.214:54321",
-            transportType = "TLS_YGGDRASIL",
-            sniDomain = "51.15.204.214",
-            utlsFingerprint = "HelloChrome_128_Auto",
-            latencyMs = -1,
-            uptimePercent = 99.5,
-            whitelistCompatible = false,
-            ed25519PubKeyShort = "key:48c2f901a6...",
-            bandwidthMbps = 1500
-        ),
         DiscoveredYggPeer(
             id = "real_fr_rbx_ovh",
             countryCode = "FR",

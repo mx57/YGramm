@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Lock
@@ -56,8 +57,11 @@ fun VoiceCallOverlaySheet(
     onToggleMute: () -> Unit,
     onToggleSpeaker: () -> Unit,
     onEndCall: () -> Unit,
-    onTriggerTestAudioTone: () -> Unit = {}
+    onTriggerTestAudioTone: () -> Unit = {},
+    onAcceptCall: () -> Unit = {},
+    onDeclineCall: () -> Unit = {}
 ) {
+    val isIncomingRing = callState.isIncoming && callState.callStatus == "RINGING_INCOMING"
     val minutes = callState.durationSeconds / 60
     val seconds = callState.durationSeconds % 60
     val durationFormatted = String.format(Locale.US, "%02d:%02d", minutes, seconds)
@@ -154,6 +158,7 @@ fun VoiceCallOverlaySheet(
                     text = when (callState.callStatus) {
                         "ACTIVE_ENCRYPTED" -> durationFormatted
                         "OFFLINE_ERROR" -> "Ошибка маршрута"
+                        "RINGING_INCOMING" -> "Входящий вызов"
                         else -> "Гудок вызова..."
                     },
                     style = MaterialTheme.typography.headlineMedium.copy(fontFamily = FontFamily.Monospace),
@@ -179,12 +184,16 @@ fun VoiceCallOverlaySheet(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "Ключ сверки шифрования звонка (SAS 4 эмодзи):",
+                            text = if (callState.sasPending) {
+                                "Ключ сверки (SAS) появится после ответа собеседника"
+                            } else {
+                                "Ключ сверки шифрования звонка (SAS 4 эмодзи):"
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Text(
-                            text = callState.verificationEmojis,
+                            text = callState.verificationEmojis.ifBlank { "🔒 → 🔓" },
                             style = MaterialTheme.typography.headlineSmall
                         )
                         Row(
@@ -226,7 +235,7 @@ fun VoiceCallOverlaySheet(
                             }
                             LinearProgressIndicator(
                                 progress = {
-                                    if (callState.isMuted) 0.02f else callState.micAmplitudeLevel.coerceIn(0.05f, 1.0f)
+                                    if (callState.isMuted) 0f else callState.micAmplitudeLevel.coerceIn(0f, 1f)
                                 },
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -260,7 +269,63 @@ fun VoiceCallOverlaySheet(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                // Call Controls Row (Mute, End Call, Speaker)
+                // Call Controls Row (incoming accept/decline or live call controls)
+                if (isIncomingRing) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            IconButton(
+                                onClick = onDeclineCall,
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFEF4444))
+                                    .testTag("call_decline_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CallEnd,
+                                    contentDescription = "Отклонить вызов",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Отклонить",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFFEF4444),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            IconButton(
+                                onClick = onAcceptCall,
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(EmeraldPrimary)
+                                    .testTag("call_accept_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Call,
+                                    contentDescription = "Принять вызов",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Принять",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldPrimary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly,
@@ -351,6 +416,7 @@ fun VoiceCallOverlaySheet(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
                 }
             }
         }

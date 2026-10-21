@@ -29,38 +29,46 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.CallMade
+import androidx.compose.material.icons.automirrored.filled.CallMissed
+import androidx.compose.material.icons.automirrored.filled.CallReceived
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddReaction
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Call
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CallEnd
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NetworkCheck
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Radar
@@ -81,16 +89,14 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -103,15 +109,17 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
 import com.example.data.MessageEntity
-import com.example.data.P2PFileTransferEntity
 import com.example.data.YggRepository
 import com.example.engine.ParsedYggContactQr
 import com.example.ui.components.FileAttachmentBubbleCard
@@ -120,15 +128,16 @@ import com.example.ui.components.MessageReactionsRow
 import com.example.ui.components.QrContactModal
 import com.example.ui.components.ReactionQuickPickerBar
 import com.example.ui.components.RichAttachmentSheetDialog
-import com.example.ui.components.VoiceCallOverlaySheet
 import com.example.ui.components.VoiceMessagePlayerCard
 import com.example.ui.components.VoiceRecordingComposerBar
+import com.example.ui.components.YggSwitch
 import com.example.ui.components.resolveUriFileMetadata
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.YggGramUiState
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -137,7 +146,8 @@ fun ChatsScreen(
     uiState: YggGramUiState,
     conversations: List<ConversationEntity>,
     allMessages: List<MessageEntity>,
-    fileTransfers: List<P2PFileTransferEntity>,
+    callLog: List<CallLogEntity> = emptyList(),
+    messageSearchResults: List<MessageEntity> = emptyList(),
     queuedOfflineCount: Int,
     onSelectChat: (String?) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -148,16 +158,14 @@ fun ChatsScreen(
     onSendMediaOrFile: (String, String, Long, String, String?, String) -> Unit = { chatId, name, size, _, _, caption ->
         onSendMessage(chatId, caption, name, size)
     },
+    onSendReply: (String, String, String) -> Unit = { _, _, _ -> },
+    onForwardMessage: (String, String) -> Unit = { _, _ -> },
+    onTyping: (String) -> Unit = {},
     onToggleReaction: (String, String) -> Unit = { _, _ -> },
     onStartVoiceCall: (String) -> Unit = {},
-    onToggleCallMute: () -> Unit = {},
-    onToggleCallSpeaker: () -> Unit = {},
-    onTriggerCallTestAudioTone: () -> Unit = {},
-    onEndVoiceCall: () -> Unit = {},
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
-    onCreateNewChat: (String, String, Boolean, Boolean, Int) -> Unit,
+    onCreateNewChat: (String, String, Int) -> Unit,
     onDeleteChat: (String) -> Unit = {},
-    onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
     onRetryMessage: (MessageEntity) -> Unit = {},
@@ -177,8 +185,7 @@ fun ChatsScreen(
                 conv.publicKeyHex.contains(uiState.searchQuery, ignoreCase = true)
 
             val matchesFilter = when (uiState.selectedChatFilter) {
-                "DIRECT" -> conv.protocolType == "X3DH_DOUBLE_RATCHET"
-                "MLS" -> conv.protocolType == "MLS_RFC9420"
+                "DIRECT" -> !conv.chatId.startsWith("chat_self_ygg_node")
                 "OFFLINE_SF" -> !conv.isOnlineInMesh || uiState.isOfflineStoreAndForwardMode
                 else -> true
             }
@@ -194,8 +201,8 @@ fun ChatsScreen(
         allMessages.filter { it.chatId == uiState.selectedChatId }.sortedBy { it.timestamp }
     }
 
-    val activeChatTransfers = remember(fileTransfers, uiState.selectedChatId) {
-        fileTransfers.filter { it.chatId == uiState.selectedChatId }
+    val conversationTitles = remember(conversations) {
+        conversations.associate { it.chatId to it.title }
     }
 
     // System Photo Picker for sending Images directly in chat
@@ -257,14 +264,16 @@ fun ChatsScreen(
                     ChatListPane(
                         uiState = uiState,
                         conversations = filteredConversations,
-                        fileTransfers = fileTransfers,
+                        callLog = callLog,
+                        searchResults = messageSearchResults,
+                        conversationTitles = conversationTitles,
                         queuedOfflineCount = queuedOfflineCount,
                         onSelectChat = onSelectChat,
                         onSearchQueryChange = onSearchQueryChange,
                         onFilterChange = onFilterChange,
                         onToggleOfflineMode = onToggleOfflineMode,
                         onDeleteChat = onDeleteChat,
-                        onToggleTransferState = onToggleTransferState,
+                        onStartVoiceCall = onStartVoiceCall,
                         onOpenNewChatDialog = { showNewChatDialog = true },
                         onOpenQrModal = { tab ->
                             qrModalInitialTab = tab
@@ -283,7 +292,6 @@ fun ChatsScreen(
                         ChatDetailPane(
                             conversation = activeConversation,
                             messages = activeChatMessages,
-                            transfers = activeChatTransfers,
                             isOfflineMode = uiState.isOfflineStoreAndForwardMode || !uiState.isNetworkAvailable,
                             showBackButton = false,
                             onBack = {},
@@ -302,12 +310,18 @@ fun ChatsScreen(
                             onToggleReaction = onToggleReaction,
                             onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                             onDeleteChat = { onDeleteChat(activeConversation.chatId) },
-                            onToggleTransferState = onToggleTransferState,
                             onPingRoute = { onPingChatRoute(activeConversation.chatId) },
+                            typingLabel = uiState.typingPeers[activeConversation.chatId],
+                            forwardTargets = conversations,
+                            onSendReply = { text, quotedId ->
+                                onSendReply(activeConversation.chatId, text, quotedId)
+                            },
+                            onForwardMessage = onForwardMessage,
+                            onTyping = { onTyping(activeConversation.chatId) },
                             onSendSelfEchoTest = {
                                 onSendMessage(
                                     activeConversation.chatId,
-                                    "Проверка маршрута Yggdrasil через внешний публичный пир (${activeConversation.yggIpv6Address})",
+                                    "Проверка маршрута Yggdrasil через оверлей 0200::/7 (${activeConversation.yggIpv6Address})",
                                     null,
                                     0L
                                 )
@@ -331,7 +345,6 @@ fun ChatsScreen(
                 ChatDetailPane(
                     conversation = activeConversation,
                     messages = activeChatMessages,
-                    transfers = activeChatTransfers,
                     isOfflineMode = uiState.isOfflineStoreAndForwardMode || !uiState.isNetworkAvailable,
                     showBackButton = true,
                     onBack = { onSelectChat(null) },
@@ -350,12 +363,18 @@ fun ChatsScreen(
                     onToggleReaction = onToggleReaction,
                     onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                     onDeleteChat = { onDeleteChat(activeConversation.chatId) },
-                    onToggleTransferState = onToggleTransferState,
                     onPingRoute = { onPingChatRoute(activeConversation.chatId) },
+                    typingLabel = uiState.typingPeers[activeConversation.chatId],
+                    forwardTargets = conversations,
+                    onSendReply = { text, quotedId ->
+                        onSendReply(activeConversation.chatId, text, quotedId)
+                    },
+                    onForwardMessage = onForwardMessage,
+                    onTyping = { onTyping(activeConversation.chatId) },
                     onSendSelfEchoTest = {
                         onSendMessage(
                             activeConversation.chatId,
-                            "Проверка маршрута Yggdrasil через внешний публичный пир (${activeConversation.yggIpv6Address})",
+                            "Проверка маршрута Yggdrasil через оверлей 0200::/7 (${activeConversation.yggIpv6Address})",
                             null,
                             0L
                         )
@@ -366,14 +385,16 @@ fun ChatsScreen(
                 ChatListPane(
                     uiState = uiState,
                     conversations = filteredConversations,
-                    fileTransfers = fileTransfers,
+                    callLog = callLog,
+                    searchResults = messageSearchResults,
+                    conversationTitles = conversationTitles,
                     queuedOfflineCount = queuedOfflineCount,
                     onSelectChat = onSelectChat,
                     onSearchQueryChange = onSearchQueryChange,
                     onFilterChange = onFilterChange,
                     onToggleOfflineMode = onToggleOfflineMode,
                     onDeleteChat = onDeleteChat,
-                    onToggleTransferState = onToggleTransferState,
+                    onStartVoiceCall = onStartVoiceCall,
                     onOpenNewChatDialog = { showNewChatDialog = true },
                     onOpenQrModal = { tab ->
                         qrModalInitialTab = tab
@@ -387,7 +408,7 @@ fun ChatsScreen(
     }
 
     if (showNewChatDialog) {
-        NewChatOrMlsGroupDialog(
+        NewChatDialog(
             myIpv6Address = uiState.identity.yggIpv6Address,
             onDismiss = { showNewChatDialog = false },
             onOpenQrScanner = {
@@ -395,8 +416,8 @@ fun ChatsScreen(
                 qrModalInitialTab = 1
                 showQrModal = true
             },
-            onConfirm = { title, ipv6, isMls, sealed, ttl ->
-                onCreateNewChat(title, ipv6, isMls, sealed, ttl)
+            onConfirm = { title, ipv6, ttl ->
+                onCreateNewChat(title, ipv6, ttl)
                 showNewChatDialog = false
             }
         )
@@ -440,29 +461,22 @@ fun ChatsScreen(
         )
     }
 
-    uiState.activeVoiceCall?.let { callState ->
-        VoiceCallOverlaySheet(
-            callState = callState,
-            onToggleMute = onToggleCallMute,
-            onToggleSpeaker = onToggleCallSpeaker,
-            onEndCall = onEndVoiceCall,
-            onTriggerTestAudioTone = onTriggerCallTestAudioTone
-        )
-    }
 }
 
 @Composable
 private fun ChatListPane(
     uiState: YggGramUiState,
     conversations: List<ConversationEntity>,
-    fileTransfers: List<P2PFileTransferEntity>,
+    callLog: List<CallLogEntity>,
+    searchResults: List<MessageEntity>,
+    conversationTitles: Map<String, String>,
     queuedOfflineCount: Int,
     onSelectChat: (String?) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onFilterChange: (String) -> Unit,
     onToggleOfflineMode: () -> Unit,
     onDeleteChat: (String) -> Unit,
-    onToggleTransferState: (P2PFileTransferEntity) -> Unit,
+    onStartVoiceCall: (String) -> Unit,
     onOpenNewChatDialog: () -> Unit,
     onOpenQrModal: (Int) -> Unit,
     onRunSendReceiveTest: () -> Unit,
@@ -499,7 +513,7 @@ private fun ChatListPane(
                                 .testTag("search_chats_input"),
                             placeholder = {
                                 Text(
-                                    "Поиск по имени, 200:... или ключу",
+                                    "Поиск по имени, IPv6 или ключу",
                                     style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
@@ -536,9 +550,8 @@ private fun ChatListPane(
                     ) {
                         val filters = listOf(
                             "ALL" to "Все (${conversations.size})",
-                            "DIRECT" to "X3DH Личные",
-                            "MLS" to "Группы MLS",
-                            "OFFLINE_SF" to "Очередь S&F ($queuedOfflineCount)"
+                            "DIRECT" to "Личные",
+                            "OFFLINE_SF" to "Очередь ($queuedOfflineCount)"
                         )
                         filters.forEach { (key, label) ->
                             FilterChip(
@@ -556,11 +569,45 @@ private fun ChatListPane(
                 }
             }
 
-            if (fileTransfers.isNotEmpty()) {
-                item {
-                    P2PFileTransfersStrip(
-                        transfers = fileTransfers.take(3),
-                        onToggleTransferState = onToggleTransferState
+            if (uiState.searchQuery.isNotBlank()) {
+                item(key = "message_search_header") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Search,
+                            contentDescription = null,
+                            tint = CyberTealSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "В сообщениях: ${searchResults.size}",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                items(searchResults.take(20), key = { "hit_${it.messageId}" }) { msg ->
+                    MessageSearchHitRow(
+                        message = msg,
+                        chatTitle = conversationTitles[msg.chatId] ?: "Диалог",
+                        query = uiState.searchQuery,
+                        onClick = { onSelectChat(msg.chatId) }
+                    )
+                }
+            }
+
+            if (callLog.isNotEmpty()) {
+                item(key = "call_log_section") {
+                    CallLogSection(
+                        entries = callLog.take(8),
+                        onOpenChat = { onSelectChat(it) },
+                        onRedial = onStartVoiceCall
                     )
                 }
             }
@@ -587,33 +634,266 @@ private fun ChatListPane(
             }
         }
 
-        // Dual Action FABs: QR Scanner + New Contact
-        Column(
+        FloatingActionButton(
+            onClick = onOpenNewChatDialog,
+            containerColor = MaterialTheme.colorScheme.primary,
+            contentColor = MaterialTheme.colorScheme.onPrimary,
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(16.dp),
-            horizontalAlignment = Alignment.End,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(16.dp)
+                .testTag("new_chat_fab")
         ) {
-            SmallFloatingActionButton(
-                onClick = { onOpenQrModal(1) },
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.testTag("qr_scan_fab")
-            ) {
-                Icon(Icons.Default.QrCodeScanner, contentDescription = "Добавить по QR-коду")
-            }
+            Icon(Icons.Default.Add, contentDescription = "Новый чат Yggdrasil")
+        }
+    }
+}
 
-            FloatingActionButton(
-                onClick = onOpenNewChatDialog,
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.testTag("new_chat_fab")
+@Composable
+private fun MessageSearchHitRow(
+    message: MessageEntity,
+    chatTitle: String,
+    query: String,
+    onClick: () -> Unit
+) {
+    val timeFormatter = remember { SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()) }
+    val snippet = remember(message.plainText, message.attachmentName, query) {
+        buildSearchSnippet(message.plainText, query)
+            .ifBlank { message.attachmentName?.let { "📎 $it" } ?: "Сообщение без текста" }
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 3.dp)
+            .clickable(onClick = onClick)
+            .testTag("message_search_hit_${message.messageId}"),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        )
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = chatTitle,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = CyberTealSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = timeFormatter.format(Date(message.timestamp)),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Text(
+                text = snippet,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+private fun buildSearchSnippet(text: String, query: String, radius: Int = 48): String {
+    if (text.isBlank()) return ""
+    val idx = text.indexOf(query, ignoreCase = true)
+    if (idx < 0 || query.isBlank()) return text.take(120)
+    val start = (idx - radius).coerceAtLeast(0)
+    val end = (idx + query.length + radius).coerceAtMost(text.length)
+    return (if (start > 0) "…" else "") + text.substring(start, end) + (if (end < text.length) "…" else "")
+}
+
+@Composable
+private fun CallLogSection(
+    entries: List<CallLogEntity>,
+    onOpenChat: (String) -> Unit,
+    onRedial: (String) -> Unit
+) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .testTag("call_log_section"),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        )
+    ) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Новый P2P чат или группа MLS")
+                Icon(
+                    Icons.Default.Call,
+                    contentDescription = null,
+                    tint = EmeraldPrimary,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Журнал вызовов",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "${entries.size}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Icon(
+                    imageVector = if (expanded) {
+                        Icons.Default.KeyboardArrowUp
+                    } else {
+                        Icons.Default.KeyboardArrowDown
+                    },
+                    contentDescription = if (expanded) {
+                        "Свернуть журнал вызовов"
+                    } else {
+                        "Развернуть журнал вызовов"
+                    },
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (expanded) {
+                entries.forEachIndexed { index, entry ->
+                    CallLogRow(entry = entry, onOpenChat = onOpenChat, onRedial = onRedial)
+                    if (index != entries.lastIndex) {
+                        HorizontalDivider(
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                        )
+                    }
+                }
             }
         }
     }
+}
+
+@Composable
+private fun CallLogRow(
+    entry: CallLogEntity,
+    onOpenChat: (String) -> Unit,
+    onRedial: (String) -> Unit
+) {
+    val incoming = entry.direction == "INCOMING"
+    val missed = entry.outcome == "MISSED"
+    val failed = entry.outcome == "FAILED"
+    val icon = when {
+        entry.outcome == "COMPLETED" && incoming -> Icons.AutoMirrored.Filled.CallReceived
+        entry.outcome == "COMPLETED" -> Icons.AutoMirrored.Filled.CallMade
+        entry.outcome == "CANCELED" || failed -> Icons.Default.CallEnd
+        else -> Icons.AutoMirrored.Filled.CallMissed
+    }
+    val tint = when {
+        missed || failed -> MaterialTheme.colorScheme.error
+        entry.outcome == "COMPLETED" -> EmeraldPrimary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val outcomeLabel = when (entry.outcome) {
+        "COMPLETED" -> "завершён"
+        "MISSED" -> "пропущен"
+        "DECLINED" -> "отклонён"
+        "BUSY" -> "занято"
+        "CANCELED" -> "отменён"
+        "FAILED" -> "не доставлен"
+        else -> entry.outcome.lowercase(Locale.getDefault())
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = entry.chatId.isNotBlank()) { onOpenChat(entry.chatId) }
+            .padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = tint,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = entry.peerName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = formatCallLogTime(entry.startedAt),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            val details = buildString {
+                append(if (incoming) "Входящий" else "Исходящий")
+                append(" • ")
+                append(outcomeLabel)
+                if (entry.durationSeconds > 0) {
+                    append(" • ")
+                    append(formatCallLogDuration(entry.durationSeconds))
+                }
+                if (entry.transport.isNotBlank()) {
+                    append(" • ")
+                    append(compactCallTransport(entry.transport))
+                }
+            }
+            Text(
+                text = details,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (missed || failed) tint else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (entry.chatId.isNotBlank()) {
+            IconButton(
+                onClick = { onRedial(entry.chatId) },
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    Icons.Default.Call,
+                    contentDescription = "Перезвонить ${entry.peerName}",
+                    tint = EmeraldPrimary,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+private fun formatCallLogTime(timestamp: Long): String {
+    val now = Calendar.getInstance()
+    val then = Calendar.getInstance().apply { timeInMillis = timestamp }
+    val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
+        now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
+    return SimpleDateFormat(
+        if (sameDay) "HH:mm" else "dd.MM HH:mm",
+        Locale.getDefault()
+    ).format(Date(timestamp))
+}
+
+private fun formatCallLogDuration(seconds: Int): String =
+    if (seconds >= 60) "%d:%02d".format(Locale.US, seconds / 60, seconds % 60) else "$seconds с"
+
+private fun compactCallTransport(transport: String): String = when (transport.uppercase(Locale.US)) {
+    "LAN_DIRECT" -> "LAN"
+    "YGG_OVERLAY" -> "Yggdrasil"
+    "LOCAL_PROFILE" -> "локально"
+    else -> transport
 }
 
 @Composable
@@ -734,7 +1014,7 @@ private fun CleanStartZeroStateCard(
             ) {
                 Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Проверить сеть: отправить сообщение себе через Yggdrasil")
+                Text("Проверить сеть: круговой маршрут через Yggdrasil (0200::/7)")
             }
 
             Row(
@@ -865,7 +1145,7 @@ private fun MeshStatusTopCard(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Switch(
+                    YggSwitch(
                         checked = uiState.isOfflineStoreAndForwardMode,
                         onCheckedChange = { onToggleOfflineMode() },
                         modifier = Modifier.testTag("offline_mode_switch")
@@ -939,98 +1219,6 @@ private fun MeshStatusTopCard(
 }
 
 @Composable
-private fun P2PFileTransfersStrip(
-    transfers: List<P2PFileTransferEntity>,
-    onToggleTransferState: (P2PFileTransferEntity) -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 4.dp)
-    ) {
-        Text(
-            text = "Потоки файлов P2P (FastCDC + Merkle SHA-256)",
-            style = MaterialTheme.typography.labelMedium,
-            color = CyberTealSecondary
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        transfers.forEach { tx ->
-            val progress = if (tx.chunkCount > 0) {
-                tx.completedChunks.toFloat() / tx.chunkCount.toFloat()
-            } else 0f
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-                )
-            ) {
-                Column(modifier = Modifier.padding(10.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(
-                                Icons.Default.FolderZip,
-                                contentDescription = null,
-                                tint = CyberTealSecondary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = tx.fileName,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "${tx.protocol} • ${tx.completedChunks}/${tx.chunkCount} чанков • Merkle: ${tx.merkleRootSha256.take(10)}...",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                        IconButton(
-                            onClick = { onToggleTransferState(tx) },
-                            modifier = Modifier.testTag("toggle_transfer_${tx.transferId}")
-                        ) {
-                            Icon(
-                                imageVector = when (tx.status) {
-                                    "ACTIVE_STREAMING" -> Icons.Default.Pause
-                                    "VERIFIED_COMPLETE" -> Icons.Default.CheckCircle
-                                    else -> Icons.Default.PlayArrow
-                                },
-                                contentDescription = "Управление P2P передачей",
-                                tint = if (tx.status == "VERIFIED_COMPLETE") EmeraldPrimary else CyberTealSecondary
-                            )
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(5.dp)
-                            .clip(RoundedCornerShape(4.dp)),
-                        color = if (tx.status == "VERIFIED_COMPLETE") EmeraldPrimary else CyberTealSecondary
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun ConversationRowCard(
     conversation: ConversationEntity,
     isSelected: Boolean,
@@ -1068,12 +1256,12 @@ private fun ConversationRowCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(horizontal = 10.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 modifier = Modifier
-                    .size(46.dp)
+                    .size(42.dp)
                     .clip(CircleShape)
                     .background(MaterialTheme.colorScheme.primaryContainer),
                 contentAlignment = Alignment.Center
@@ -1084,11 +1272,6 @@ private fun ConversationRowCard(
                         contentDescription = "Избранное Yggdrasil",
                         tint = EmeraldPrimary
                     )
-                    conversation.protocolType == "MLS_RFC9420" -> Icon(
-                        Icons.Default.Groups,
-                        contentDescription = "Группа MLS",
-                        tint = CyberTealSecondary
-                    )
                     else -> Text(
                         text = conversation.title.take(2).uppercase(),
                         style = MaterialTheme.typography.titleMedium,
@@ -1097,7 +1280,7 @@ private fun ConversationRowCard(
                 }
             }
 
-            Spacer(modifier = Modifier.width(12.dp))
+            Spacer(modifier = Modifier.width(10.dp))
 
             Column(modifier = Modifier.weight(1f)) {
                 Row(
@@ -1109,6 +1292,20 @@ private fun ConversationRowCard(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.weight(1f)
                     ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (conversation.isOnlineInMesh) {
+                                        EmeraldPrimary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                                    }
+                                )
+                                .testTag("conversation_online_dot_${conversation.chatId}")
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = conversation.title,
                             style = MaterialTheme.typography.titleSmall,
@@ -1135,16 +1332,6 @@ private fun ConversationRowCard(
                 }
 
                 Spacer(modifier = Modifier.height(3.dp))
-
-                Text(
-                    text = "${conversation.yggIpv6Address} • ${conversation.routeTransportSummary}",
-                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                    color = CyberTealSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1221,7 +1408,6 @@ private fun ConversationRowCard(
 private fun ChatDetailPane(
     conversation: ConversationEntity,
     messages: List<MessageEntity>,
-    transfers: List<P2PFileTransferEntity>,
     isOfflineMode: Boolean,
     showBackButton: Boolean,
     onBack: () -> Unit,
@@ -1232,23 +1418,77 @@ private fun ChatDetailPane(
     onToggleReaction: (String, String) -> Unit,
     onStartVoiceCall: () -> Unit,
     onDeleteChat: () -> Unit = {},
-    onToggleTransferState: (P2PFileTransferEntity) -> Unit,
     onPingRoute: () -> Unit = {},
     onSendSelfEchoTest: () -> Unit = {},
-    onRetryMessage: (MessageEntity) -> Unit = {}
+    onRetryMessage: (MessageEntity) -> Unit = {},
+    typingLabel: String? = null,
+    forwardTargets: List<ConversationEntity> = emptyList(),
+    onSendReply: (String, String) -> Unit = { _, _ -> },
+    onForwardMessage: (String, String) -> Unit = { _, _ -> },
+    onTyping: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
     var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
+    var replyTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
+    var forwardTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     val isSelfChat = YggRepository.isSelfChatId(conversation.chatId)
+    val wireIdIndex = remember(messages) {
+        buildMap {
+            messages.forEach { msg ->
+                put(msg.messageId, msg)
+                if (msg.peerMessageId.isNotBlank()) put(msg.peerMessageId, msg)
+            }
+        }
+    }
+
+    val messageListState = rememberLazyListState()
+    var anchoredChatId by remember { mutableStateOf<String?>(null) }
+    val lastMessageId = messages.lastOrNull()?.messageId
+
+    // On chat open the newest message is shown instantly; when the conversation grows
+    // the list glides to the bottom instead of snapping.
+    LaunchedEffect(conversation.chatId, lastMessageId, messages.size) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        val targetIndex = messages.lastIndex.coerceAtLeast(0)
+        if (anchoredChatId != conversation.chatId) {
+            anchoredChatId = conversation.chatId
+            messageListState.scrollToItem(targetIndex)
+        } else {
+            messageListState.animateScrollToItem(targetIndex)
+        }
+    }
 
     val audioPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        // Proceed with voice recording whether granted or in cloud emulator fallback mode
-        isRecordingVoice = true
+    ) { granted ->
+        if (granted) {
+            isRecordingVoice = true
+        } else {
+            Toast.makeText(
+                context,
+                "Нет доступа к микрофону: запись голосового невозможна",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    val callAudioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            onStartVoiceCall()
+        } else {
+            Toast.makeText(
+                context,
+                "Звонок невозможен: нет доступа к микрофону",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     Column(
@@ -1288,13 +1528,24 @@ private fun ChatDetailPane(
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f, fill = false)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                Icons.Default.Lock,
-                                contentDescription = "Сквозное шифрование активно",
-                                tint = EmeraldPrimary,
-                                modifier = Modifier.size(15.dp)
-                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            IconButton(
+                                onClick = { showCipherInspector = !showCipherInspector },
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .testTag("toggle_cipher_inspector_button")
+                            ) {
+                                Icon(
+                                    Icons.Default.Lock,
+                                    contentDescription = if (showCipherInspector) {
+                                        "Скрыть крипто-лог"
+                                    } else {
+                                        "Показать крипто-лог"
+                                    },
+                                    tint = if (showCipherInspector) AmberShieldTertiary else EmeraldPrimary,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
                         }
                         Text(
                             text = conversation.routeTransportSummary,
@@ -1303,26 +1554,80 @@ private fun ChatDetailPane(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (typingLabel != null) {
+                            Text(
+                                text = "$typingLabel печатает…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CyberTealSecondary,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("typing_indicator")
+                            )
+                        }
                     }
 
-                    // Voice Call Button
                     IconButton(
-                        onClick = onStartVoiceCall,
+                        onClick = onPingRoute,
                         modifier = Modifier
-                            .size(38.dp)
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primaryContainer)
-                            .testTag("start_voice_call_button")
+                            .size(36.dp)
+                            .testTag("ping_chat_route_button")
                     ) {
                         Icon(
-                            Icons.Default.Call,
-                            contentDescription = "Голосовой звонок через Yggdrasil",
-                            tint = EmeraldPrimary,
+                            Icons.Default.NetworkCheck,
+                            contentDescription = "Пинг Yggdrasil",
+                            tint = CyberTealSecondary,
                             modifier = Modifier.size(18.dp)
                         )
                     }
 
-                    Spacer(modifier = Modifier.width(4.dp))
+                    if (isSelfChat) {
+                        IconButton(
+                            onClick = onSendSelfEchoTest,
+                            modifier = Modifier
+                                .size(36.dp)
+                                .testTag("send_self_echo_test_button")
+                        ) {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = "Тест оверлея",
+                                tint = EmeraldPrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    // Voice Call Button (недоступен для чата со своим узлом)
+                    if (!isSelfChat) {
+                        IconButton(
+                            onClick = {
+                                if (
+                                    ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.RECORD_AUDIO
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                ) {
+                                    onStartVoiceCall()
+                                } else {
+                                    callAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            },
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.primaryContainer)
+                                .testTag("start_voice_call_button")
+                        ) {
+                            Icon(
+                                Icons.Default.Call,
+                                contentDescription = "Голосовой звонок через Yggdrasil",
+                                tint = EmeraldPrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(4.dp))
+                    }
 
                     IconButton(
                         onClick = {
@@ -1355,66 +1660,6 @@ private fun ChatDetailPane(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Action Bar inside Chat Header
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedButton(
-                        onClick = onPingRoute,
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(34.dp)
-                            .testTag("ping_chat_route_button")
-                    ) {
-                        Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(15.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Пинг Yggdrasil",
-                            style = MaterialTheme.typography.labelSmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    if (isSelfChat) {
-                        Button(
-                            onClick = onSendSelfEchoTest,
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(34.dp)
-                                .testTag("send_self_echo_test_button")
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Эхо-тест сети",
-                                style = MaterialTheme.typography.labelSmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-
-                    TextButton(
-                        onClick = { showCipherInspector = !showCipherInspector },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        modifier = Modifier
-                            .height(34.dp)
-                            .testTag("toggle_cipher_inspector_button")
-                    ) {
-                        Text(
-                            text = if (showCipherInspector) "Скрыть крипто" else "Крипто-лог",
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
-                }
-
                 AnimatedVisibility(visible = showCipherInspector) {
                     Card(
                         modifier = Modifier
@@ -1436,7 +1681,7 @@ private fun ChatDetailPane(
                                 color = CyberTealSecondary
                             )
                             Text(
-                                text = "Маршрут: ${conversation.routeTransportSummary} • Sealed Sender: ${if (conversation.sealedSenderEnabled) "ВКЛ" else "ВЫКЛ"}",
+                                text = "Маршрут: ${conversation.routeTransportSummary} • Сообщения: X25519 + AES-256-GCM",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1449,6 +1694,7 @@ private fun ChatDetailPane(
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
         LazyColumn(
+            state = messageListState,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
@@ -1456,15 +1702,6 @@ private fun ChatDetailPane(
             contentPadding = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            if (transfers.isNotEmpty()) {
-                item {
-                    P2PFileTransfersStrip(
-                        transfers = transfers,
-                        onToggleTransferState = onToggleTransferState
-                    )
-                }
-            }
-
             if (messages.isEmpty()) {
                 item {
                     Surface(
@@ -1506,8 +1743,11 @@ private fun ChatDetailPane(
             items(messages, key = { it.messageId }) { msg ->
                 EncryptedMessageBubble(
                     message = msg,
+                    quotedMessage = wireIdIndex[msg.replyToMessageId],
                     showCipherHex = showCipherInspector,
                     onToggleReaction = { emoji -> onToggleReaction(msg.messageId, emoji) },
+                    onReply = { replyTarget = msg },
+                    onForward = { forwardTarget = msg },
                     onRetry = { onRetryMessage(msg) }
                 )
             }
@@ -1547,6 +1787,58 @@ private fun ChatDetailPane(
                 }
             )
         } else {
+            Column {
+                val quoted = replyTarget
+                if (quoted != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Reply,
+                                contentDescription = null,
+                                tint = CyberTealSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Ответ ${quoted.senderName}",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = CyberTealSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = quoted.plainText.ifBlank {
+                                        quoted.attachmentName ?: "Вложение"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            IconButton(
+                                onClick = { replyTarget = null },
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .testTag("cancel_reply_button")
+                            ) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Отменить ответ",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+                }
             Surface(
                 color = MaterialTheme.colorScheme.surfaceContainer,
                 tonalElevation = 3.dp,
@@ -1588,7 +1880,10 @@ private fun ChatDetailPane(
 
                     OutlinedTextField(
                         value = messageInput,
-                        onValueChange = { messageInput = it },
+                        onValueChange = { updated ->
+                            messageInput = updated
+                            if (updated.isNotBlank()) onTyping()
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("chat_message_input"),
@@ -1596,7 +1891,7 @@ private fun ChatDetailPane(
                             Text(
                                 when {
                                     isOfflineMode -> "Офлайн S&F: в очередь..."
-                                    isSelfChat -> "Сообщение себе через Yggdrasil..."
+                                    isSelfChat -> "Локальная заметка своему узлу..."
                                     else -> "Сообщение..."
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
@@ -1639,8 +1934,16 @@ private fun ChatDetailPane(
                         IconButton(
                             onClick = {
                                 if (messageInput.isNotBlank()) {
-                                    onSendMessage(messageInput)
+                                    val activeReply = replyTarget
+                                    if (activeReply != null) {
+                                        onSendReply(messageInput, activeReply.messageId)
+                                    } else {
+                                        onSendMessage(messageInput)
+                                    }
+                                    replyTarget = null
                                     messageInput = ""
+                                    focusManager.clearFocus()
+                                    keyboardController?.hide()
                                 }
                             },
                             modifier = Modifier
@@ -1658,7 +1961,52 @@ private fun ChatDetailPane(
                     }
                 }
             }
+            }
         }
+    }
+
+    val pendingForward = forwardTarget
+    if (pendingForward != null) {
+        val targets = forwardTargets.filter { it.chatId != conversation.chatId }
+        AlertDialog(
+            onDismissRequest = { forwardTarget = null },
+            title = { Text("Переслать сообщение") },
+            text = {
+                if (targets.isEmpty()) {
+                    Text("Нет других диалогов: создайте чат, чтобы переслать сообщение.")
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        targets.forEach { target ->
+                            TextButton(
+                                onClick = {
+                                    forwardTarget = null
+                                    onForwardMessage(pendingForward.messageId, target.chatId)
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("forward_target_${target.chatId}")
+                            ) {
+                                Text(
+                                    text = target.title,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { forwardTarget = null }) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 }
 
@@ -1666,19 +2014,23 @@ private fun ChatDetailPane(
 @Composable
 private fun EncryptedMessageBubble(
     message: MessageEntity,
+    quotedMessage: MessageEntity?,
     showCipherHex: Boolean,
     onToggleReaction: (String) -> Unit,
+    onReply: () -> Unit,
+    onForward: () -> Unit,
     onRetry: () -> Unit
 ) {
     var showReactionPicker by rememberSaveable(message.messageId) { mutableStateOf(false) }
-    val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val alignment = if (message.isOutgoing) Alignment.End else Alignment.Start
     val bubbleColor = if (message.isOutgoing) {
         MaterialTheme.colorScheme.primaryContainer
     } else {
         MaterialTheme.colorScheme.surfaceContainerHigh
     }
-    val isQueued = message.deliveryState == "QUEUED_OFFLINE_SF"
+    // Both an offline queue item and an unconfirmed overlay send can be retried by tapping.
+    val canRetry = message.deliveryState == "QUEUED_OFFLINE_SF" || message.deliveryState == "SENT_P2P"
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -1688,7 +2040,15 @@ private fun EncryptedMessageBubble(
             ReactionQuickPickerBar(
                 messageId = message.messageId,
                 onSelectEmoji = onToggleReaction,
-                onDismiss = { showReactionPicker = false }
+                onDismiss = { showReactionPicker = false },
+                onReply = {
+                    showReactionPicker = false
+                    onReply()
+                },
+                onForward = {
+                    showReactionPicker = false
+                    onForward()
+                }
             )
         }
 
@@ -1704,7 +2064,7 @@ private fun EncryptedMessageBubble(
                 .fillMaxWidth(0.88f)
                 .combinedClickable(
                     onClick = {
-                        if (isQueued) {
+                        if (canRetry) {
                             onRetry()
                         } else {
                             showReactionPicker = !showReactionPicker
@@ -1716,40 +2076,77 @@ private fun EncryptedMessageBubble(
                 )
                 .testTag("message_bubble_${message.messageId}")
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                if (!message.isOutgoing) {
                     Text(
                         text = message.senderName,
                         style = MaterialTheme.typography.labelMedium,
-                        color = if (message.isOutgoing) EmeraldPrimary else CyberTealSecondary,
+                        color = CyberTealSecondary,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = message.senderIpv6.take(18),
-                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    IconButton(
-                        onClick = { showReactionPicker = !showReactionPicker },
-                        modifier = Modifier
-                            .size(22.dp)
-                            .testTag("open_reactions_button_${message.messageId}")
+                }
+
+                if (message.forwardedFrom.isNotBlank()) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 3.dp)
                     ) {
                         Icon(
-                            Icons.Default.AddReaction,
-                            contentDescription = "Поставить реакцию",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
-                            modifier = Modifier.size(15.dp)
+                            Icons.AutoMirrored.Filled.Forward,
+                            contentDescription = "Переслано",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(12.dp)
                         )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Переслано от ${message.forwardedFrom}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                if (message.replyToMessageId.isNotBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.08f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
+                    ) {
+                        Row(modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .width(3.dp)
+                                    .height(30.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(CyberTealSecondary)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = quotedMessage?.senderName ?: "Цитата",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = CyberTealSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = quotedMessage?.let { quoted ->
+                                        quoted.plainText.ifBlank { quoted.attachmentName ?: "Вложение" }
+                                    } ?: "Исходное сообщение недоступно",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -1771,8 +2168,7 @@ private fun EncryptedMessageBubble(
                             messageId = message.messageId,
                             imageName = message.attachmentName ?: "image.jpg",
                             imageUri = message.attachmentUri,
-                            sizeBytes = message.attachmentSizeBytes,
-                            merkleRootHex = message.merkleRootHex
+                            sizeBytes = message.attachmentSizeBytes
                         )
                     }
                     else -> {
@@ -1782,8 +2178,7 @@ private fun EncryptedMessageBubble(
                                 messageId = message.messageId,
                                 fileName = message.attachmentName,
                                 fileUri = message.attachmentUri,
-                                sizeBytes = message.attachmentSizeBytes,
-                                merkleRootHex = message.merkleRootHex
+                                sizeBytes = message.attachmentSizeBytes
                             )
                         }
                     }
@@ -1808,13 +2203,13 @@ private fun EncryptedMessageBubble(
                 if (showCipherHex) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}",
+                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}\nEnvelope: v${message.envelopeVersion} • HKDF step #${message.ratchetStep}",
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                         color = AmberShieldTertiary
                     )
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1822,40 +2217,73 @@ private fun EncryptedMessageBubble(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (message.sealedSenderFlag) {
+                        if (message.envelopeVersion >= 2) {
                             Icon(
-                                Icons.Default.VisibilityOff,
-                                contentDescription = "Sealed Sender",
+                                Icons.Default.Lock,
+                                contentDescription = "Сквозное шифрование X25519 + AES-256-GCM",
                                 tint = EmeraldPrimary,
                                 modifier = Modifier.size(12.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                         }
                         Text(
-                            text = "#${message.ratchetStep} • ${timeFormatter.format(Date(message.timestamp))}",
+                            text = timeFormatter.format(Date(message.timestamp)),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+
+                        if (message.isOutgoing) {
+                            val (statusIcon, statusText, statusTint) = when (message.deliveryState) {
+                                "QUEUED_OFFLINE_SF" -> Triple(Icons.Default.Schedule, "В очереди", AmberShieldTertiary)
+                                "SENT_P2P" -> Triple(Icons.Default.Schedule, "Ожидает доставки", AmberShieldTertiary)
+                                "LOCAL_NOTE" -> Triple(Icons.Default.Bookmark, "Заметка", CyberTealSecondary)
+                                "DELIVERED" -> Triple(Icons.Default.DoneAll, "Доставлено", EmeraldPrimary)
+                                "READ" -> Triple(Icons.Default.DoneAll, "Прочитано", CyberTealSecondary)
+                                else -> Triple(Icons.Default.Schedule, "Не подтверждено", MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = statusIcon,
+                                contentDescription = statusText,
+                                tint = statusTint,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = statusText,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Medium,
+                                color = statusTint
+                            )
+                            if (canRetry) {
+                                IconButton(
+                                    onClick = onRetry,
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .testTag("retry_message_${message.messageId}")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Refresh,
+                                        contentDescription = "Повторить отправку",
+                                        tint = AmberShieldTertiary,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
                     }
 
-                    val (statusIcon, statusText, statusTint) = when (message.deliveryState) {
-                        "QUEUED_OFFLINE_SF" -> Triple(Icons.Default.Schedule, "В очереди S&F • Повторить", AmberShieldTertiary)
-                        "SENT_P2P" -> Triple(Icons.Default.DoneAll, "В оверлее Yggdrasil", CyberTealSecondary)
-                        else -> Triple(Icons.Default.DoneAll, "Доставлено • ACK", EmeraldPrimary)
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = { showReactionPicker = !showReactionPicker },
+                        modifier = Modifier
+                            .size(20.dp)
+                            .testTag("open_reactions_button_${message.messageId}")
+                    ) {
                         Icon(
-                            imageVector = statusIcon,
-                            contentDescription = statusText,
-                            tint = statusTint,
+                            Icons.Default.AddReaction,
+                            contentDescription = "Поставить реакцию",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                             modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = statusText,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Medium,
-                            color = statusTint
                         )
                     }
                 }
@@ -1912,17 +2340,15 @@ private fun EmptyChatSelectionPlaceholder(
 }
 
 @Composable
-private fun NewChatOrMlsGroupDialog(
+private fun NewChatDialog(
     myIpv6Address: String,
     onDismiss: () -> Unit,
     onOpenQrScanner: () -> Unit,
-    onConfirm: (String, String, Boolean, Boolean, Int) -> Unit
+    onConfirm: (String, String, Int) -> Unit
 ) {
     var title by rememberSaveable { mutableStateOf("") }
     var ipv6Input by rememberSaveable { mutableStateOf("") }
     var directHostPort by rememberSaveable { mutableStateOf("") }
-    var isMlsGroup by rememberSaveable { mutableStateOf(false) }
-    var sealedSender by rememberSaveable { mutableStateOf(true) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1960,14 +2386,14 @@ private fun NewChatOrMlsGroupDialog(
                     ) {
                         Icon(Icons.Default.Bookmark, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Тест себе", style = MaterialTheme.typography.labelMedium)
+                        Text("Мой узел", style = MaterialTheme.typography.labelMedium)
                     }
                 }
 
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
-                    label = { Text("Имя собеседника или название группы") },
+                    label = { Text("Имя собеседника") },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1993,22 +2419,6 @@ private fun NewChatOrMlsGroupDialog(
                         .fillMaxWidth()
                         .testTag("new_chat_direct_endpoint_input")
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Группа MLS (RFC 9420 TreeKEM)", style = MaterialTheme.typography.bodyMedium)
-                    Switch(checked = isMlsGroup, onCheckedChange = { isMlsGroup = it })
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Sealed Sender (скрыть отправителя)", style = MaterialTheme.typography.bodyMedium)
-                    Switch(checked = sealedSender, onCheckedChange = { sealedSender = it })
-                }
             }
         },
         confirmButton = {
@@ -2020,7 +2430,7 @@ private fun NewChatOrMlsGroupDialog(
                         } else {
                             ipv6Input.trim()
                         }
-                        onConfirm(title.ifBlank { "Контакт Yggdrasil" }, combined, isMlsGroup, sealedSender, 0)
+                        onConfirm(title.ifBlank { "Контакт Yggdrasil" }, combined, 0)
                     }
                 },
                 modifier = Modifier.testTag("confirm_new_chat_button")

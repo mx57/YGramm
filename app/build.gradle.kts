@@ -22,11 +22,17 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 4
-    versionName = "1.3.0-arm64-v8a"
+    versionCode = 5
+    versionName = "1.4.0-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
+      // x86_64 AVDs cannot execute the arm64 Go core (ndk_translation SIGILLs on the
+      // ID_AA64PFR0_EL1 read in Go's arm64 init), so emulator builds pull the native
+      // x86_64 libygggram.so via: gradlew assembleDebug -PemuX86
+      if (providers.gradleProperty("emuX86").isPresent) {
+        abiFilters += listOf("x86_64")
+      }
     }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -53,7 +59,8 @@ android {
   buildTypes {
     release {
       isCrunchPngs = false
-      isMinifyEnabled = false
+      isMinifyEnabled = true
+      isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
@@ -90,7 +97,7 @@ googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.W
 
 abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
   @get:Internal
-  abstract val debugApkPath: Property<String>
+  abstract val releaseApkPath: Property<String>
 
   @get:Internal
   abstract val rootDirPath: Property<String>
@@ -111,27 +118,23 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
       }
     }
 
-    val candidates = listOf(
-      File(debugApkPath.get()),
-      File(root, "app/build/outputs/apk/debug/app-debug.apk"),
-      File(root, ".build-outputs/app-debug.apk")
-    ).filter { it.exists() && it.length() > 0L }
-
-    val newestApk = candidates.maxByOrNull { it.lastModified() }
-    if (newestApk != null) {
+    val signedRelease = File(releaseApkPath.get())
+    if (signedRelease.exists() && signedRelease.length() > 0L) {
       val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
-      newestApk.copyTo(targetFile, overwrite = true)
-      println("Exported latest APK (${newestApk.length()} bytes) -> ${targetFile.absolutePath}")
+      signedRelease.copyTo(targetFile, overwrite = true)
+      println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
+    } else {
+      throw GradleException("Signed release APK not found at ${signedRelease.absolutePath}")
     }
   }
 }
 
 val exportSingleArm64ReleaseApk = tasks.register<ExportSingleArm64ReleaseApkTask>("exportSingleArm64ReleaseApk") {
-  debugApkPath.set(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").map { it.asFile.absolutePath })
+  releaseApkPath.set(layout.buildDirectory.file("outputs/apk/release/app-release.apk").map { it.asFile.absolutePath })
   rootDirPath.set(rootDir.absolutePath)
 }
 
-tasks.matching { it.name == "assembleDebug" || it.name == "packageDebug" }.configureEach {
+tasks.matching { it.name == "assembleRelease" || it.name == "packageRelease" }.configureEach {
   finalizedBy(exportSingleArm64ReleaseApk)
 }
 
@@ -144,6 +147,7 @@ dependencies {
   implementation(libs.androidx.camera.core)
   implementation(libs.androidx.camera.lifecycle)
   implementation(libs.androidx.camera.view)
+  implementation(libs.zxing.core)
   implementation(libs.androidx.compose.material.icons.core)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)
@@ -158,6 +162,7 @@ dependencies {
   // implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
+  implementation(libs.sqlcipher.android)
   implementation(libs.coil.compose)
   // implementation(libs.converter.moshi)
   // implementation(libs.firebase.ai)

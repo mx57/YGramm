@@ -6,6 +6,7 @@ import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
@@ -50,7 +51,9 @@ object YggCryptoEngine {
         .mod(fieldP)
     private val basePointX = BigInteger("15112221349535400772501151409588531511454012693041857206046113283949847762202")
     private val basePointY = BigInteger("46316835694926478169428394003475163141307993866256225615783033603165251855960")
-    private const val X25519_BASE_U_HEX = "09"
+    // RFC 7748 base point u=9 as 32 little-endian bytes.
+    private const val X25519_BASE_U_HEX =
+        "0900000000000000000000000000000000000000000000000000000000000000"
 
     private val hierarchyCache = object : LinkedHashMap<String, DerivedIdentityHierarchy>(8, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, DerivedIdentityHierarchy>): Boolean = size > 8
@@ -325,6 +328,39 @@ object YggCryptoEngine {
     fun computeYggdrasilIpv6(ed25519PubKey: ByteArray): String =
         formatIpv6Compressed(computeYggdrasilIpv6Raw(normalizeKeyBytes(ed25519PubKey)))
 
+    fun isEd25519Hex(value: String): Boolean {
+        val clean = value.trim()
+        return clean.length == 64 && clean.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+    }
+
+    /**
+     * Canonical text form of an IPv6 literal, or null when [value] is not one.
+     * Requires at least two colons so "host:port" is never treated as an address.
+     */
+    fun normalizeIpv6Literal(value: String): String? {
+        val literal = value.trim().removeSurrounding("[", "]").substringBefore("%")
+        if (literal.count { it == ':' } < 2 || literal.contains("/")) return null
+        return try {
+            val parsed = java.net.InetAddress.getByName(literal)
+            if (parsed is java.net.Inet6Address) parsed.hostAddress?.substringBefore("%")?.lowercase() else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * A Yggdrasil address is derived from the node's Ed25519 key, so a key that does
+     * not reproduce the stored address cannot send anything through the overlay.
+     */
+    fun addressMatchesEd25519Key(address: String, keyHex: String): Boolean {
+        val key = keyHex.trim().lowercase()
+        if (!isEd25519Hex(key)) return false
+        val expected = normalizeIpv6Literal(address) ?: return false
+        val keyBytes = key.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val derived = normalizeIpv6Literal(computeYggdrasilIpv6(keyBytes)) ?: return false
+        return expected == derived
+    }
+
     /** Real Yggdrasil v0.5 subnet: address bytes with the prefix bit 0x01 set, first 8 bytes. */
     fun computeYggdrasilSubnetPrefix(ed25519PubKey: ByteArray): String {
         val addr = computeYggdrasilIpv6Raw(normalizeKeyBytes(ed25519PubKey))
@@ -514,8 +550,18 @@ object YggCryptoEngine {
 
     data class OpenedConversationEnvelope(
         val plainText: String,
-        val senderX25519PublicKeyHex: String
+        val senderX25519PublicKeyHex: String,
+        val version: Int
     )
+
+    /**
+     * v2 needs a usable peer X25519 key; otherwise [sealConversationEnvelope] falls back
+     * to the legacy v1 envelope, which provides no confidentiality.
+     */
+    fun envelopeVersionFor(peerX25519PublicKeyHex: String?): Int {
+        val peerXPub = peerX25519PublicKeyHex?.trim()?.lowercase() ?: return 1
+        return if (peerXPub.length == 64 && peerXPub.all { it.isDigit() || it in 'a'..'f' }) 2 else 1
+    }
 
     /**
      * Opens a v2 or v1 envelope produced by [sealConversationEnvelope].
@@ -533,24 +579,25 @@ object YggCryptoEngine {
         if (!trimmed.startsWith("{")) {
             throw SecurityException("Unsupported cipher envelope format")
         }
-        val version = extractJsonNumber(trimmed, "v") ?: throw SecurityException("Envelope missing version")
-        val senderEdHex = (extractJsonString(trimmed, "sp") ?: "").lowercase()
-        if (!senderEdHex.isNullOrBlank() && !senderEd25519PublicKeyHex.isNullOrBlank() &&
+        val fields = EnvelopeFields(trimmed)
+        val version = fields.int("v") ?: throw SecurityException("Envelope missing version")
+        val senderEdHex = fields.string("sp").orEmpty().lowercase()
+        if (senderEdHex.isNotBlank() && !senderEd25519PublicKeyHex.isNullOrBlank() &&
             !senderEd25519PublicKeyHex.lowercase().equals(senderEdHex, ignoreCase = true)
         ) {
             throw SecurityException("Envelope sender key does not match the wire frame sender")
         }
 
-        val ivHex = extractJsonString(trimmed, "iv") ?: throw SecurityException("Envelope missing IV")
-        val ctHex = extractJsonString(trimmed, "ct") ?: throw SecurityException("Envelope missing ciphertext")
+        val ivHex = fields.string("iv") ?: throw SecurityException("Envelope missing IV")
+        val ctHex = fields.string("ct") ?: throw SecurityException("Envelope missing ciphertext")
         val iv = ivHex.hexToBytes()
         val encrypted = ctHex.hexToBytes()
 
         val key = when (version) {
             2 -> {
-                val senderXPub = (extractJsonString(trimmed, "sx") ?: "").lowercase()
+                val senderXPub = fields.string("sx").orEmpty().lowercase()
                 if (senderXPub.length != 64) throw SecurityException("Envelope missing sender X25519 key")
-                val epoch = extractJsonNumber(trimmed, "ep") ?: 1
+                val epoch = fields.int("ep") ?: 1
                 val shared = x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
                 hkdfSha256(
                     ikm = shared,
@@ -560,8 +607,11 @@ object YggCryptoEngine {
                 )
             }
             1 -> {
-                val step = extractJsonNumber(trimmed, "step") ?: 0
-                val sealed = extractJsonString(trimmed, "sd") == "true"
+                val step = fields.int("step") ?: 0
+                // "sd" is serialised as a bare JSON boolean (true/false); older
+                // readers looked only for the quoted form and silently derived a
+                // different v1 key, so every legacy envelope failed to open.
+                val sealed = fields.boolean("sd") ?: (fields.string("sd") == "true")
                 MessageDigest.getInstance("SHA-256")
                     .digest("$senderEdHex:step=$step:sealed=$sealed".toByteArray(StandardCharsets.UTF_8))
             }
@@ -571,32 +621,206 @@ object YggCryptoEngine {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
         if (version == 2) {
-            val envelopeEpoch = extractJsonNumber(trimmed, "ep") ?: 1
+            val envelopeEpoch = fields.int("ep") ?: 1
             cipher.updateAAD("ygggram-v2:$senderEdHex:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8))
         }
         val plain = cipher.doFinal(encrypted)
         return OpenedConversationEnvelope(
             plainText = String(plain, StandardCharsets.UTF_8),
             senderX25519PublicKeyHex = when (version) {
-                2 -> (extractJsonString(trimmed, "sx") ?: "").lowercase()
+                2 -> fields.string("sx").orEmpty().lowercase()
                 else -> ""
-            }
+            },
+            version = version
         )
     }
 
-    private fun extractJsonString(json: String, key: String): String? {
-        val marker = "\"$key\":\""
-        val start = json.indexOf(marker)
-        if (start < 0) return null
-        val valueStart = start + marker.length
-        val end = json.indexOf('"', valueStart)
-        if (end < 0) return null
-        return json.substring(valueStart, end)
+    // ── Voice-call media encryption ──────────────────────────────────────────
+    // One AES-256-GCM key per call: the X25519 identity DH shared with the peer,
+    // bound to the call id through HKDF so captured audio frames cannot be replayed
+    // into a different call.
+
+    fun deriveCallMediaKeyFromMnemonic(
+        mnemonic: List<String>,
+        peerX25519PublicKeyHex: String,
+        callId: String
+    ): ByteArray = deriveCallMediaKey(
+        x25519PrivateKeyFromMnemonic(mnemonic),
+        peerX25519PublicKeyHex,
+        callId
+    )
+
+    fun deriveCallMediaKey(
+        localX25519PrivateKey: ByteArray,
+        peerX25519PublicKeyHex: String,
+        callId: String
+    ): ByteArray {
+        val peer = peerX25519PublicKeyHex.trim().lowercase()
+        require(peer.length == 64 && peer.all { it.isDigit() || it in 'a'..'f' }) {
+            "Peer X25519 key must be 32 bytes hex"
+        }
+        val shared = x25519(localX25519PrivateKey, peer.hexToBytes())
+        return hkdfSha256(
+            ikm = shared,
+            salt = sha256Hex("ygggram-call-v1").hexToBytes(),
+            info = "ygggram-call-media-v1:$callId".toByteArray(StandardCharsets.UTF_8),
+            outputLength = 32
+        )
     }
 
-    private fun extractJsonNumber(json: String, key: String): Int? {
-        val match = Regex("\"$key\":(-?\\d+)").find(json) ?: return null
-        return match.groupValues[1].toIntOrNull()
+    /**
+     * Returns (ivBase64, cipherBase64) for one PCM frame of the call media stream.
+     * Base64 is used instead of hex so the wire frame stays ~25% smaller.
+     */
+    fun sealCallMediaFrame(key: ByteArray, pcm: ByteArray, callId: String): Pair<String, String> {
+        val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD("ygggram-call:$callId".toByteArray(StandardCharsets.UTF_8))
+        val encrypted = cipher.doFinal(pcm)
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        return encoder.encodeToString(iv) to encoder.encodeToString(encrypted)
+    }
+
+    fun openCallMediaFrame(key: ByteArray, ivBase64: String, cipherBase64: String, callId: String): ByteArray {
+        val decoder = Base64.getUrlDecoder()
+        val iv = decoder.decode(ivBase64)
+        val encrypted = decoder.decode(cipherBase64)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD("ygggram-call:$callId".toByteArray(StandardCharsets.UTF_8))
+        return cipher.doFinal(encrypted)
+    }
+
+    /**
+     * Strict reader for the flat JSON object used by conversation envelopes. A regex
+     * lookup could match a key inside another value (e.g. plaintext echoed into a
+     * field) or silently accept malformed JSON; this parser validates the whole
+     * document and rejects anything outside the envelope schema.
+     */
+    private class EnvelopeFields(json: String) {
+        private val values: Map<String, Any?> = EnvelopeJsonParser(json).parse()
+
+        fun string(key: String): String? = values[key] as? String
+        fun int(key: String): Int? = (values[key] as? Long)?.toInt()
+        fun boolean(key: String): Boolean? = values[key] as? Boolean
+    }
+
+    private class EnvelopeJsonParser(private val src: String) {
+        private var pos = 0
+
+        fun parse(): Map<String, Any?> {
+            skipWhitespace()
+            expect('{')
+            val result = LinkedHashMap<String, Any?>()
+            skipWhitespace()
+            if (peek() == '}') {
+                pos++
+                skipWhitespace()
+                requireEnd()
+                return result
+            }
+            while (true) {
+                skipWhitespace()
+                val key = readString()
+                skipWhitespace()
+                expect(':')
+                skipWhitespace()
+                result[key] = readValue()
+                skipWhitespace()
+                when (peek()) {
+                    ',' -> pos++
+                    '}' -> {
+                        pos++
+                        break
+                    }
+                    else -> fail("Expected ',' or '}'")
+                }
+            }
+            skipWhitespace()
+            requireEnd()
+            return result
+        }
+
+        private fun readValue(): Any? = when (val c = peek()) {
+            '"' -> readString()
+            't' -> readLiteral("true", true)
+            'f' -> readLiteral("false", false)
+            'n' -> readLiteral("null", null)
+            '-', in '0'..'9' -> readNumber()
+            else -> fail("Unsupported value")
+        }
+
+        private fun readString(): String {
+            expect('"')
+            val out = StringBuilder()
+            while (true) {
+                if (pos >= src.length) fail("Unterminated string")
+                when (val c = src[pos++]) {
+                    '"' -> return out.toString()
+                    '\\' -> {
+                        if (pos >= src.length) fail("Unterminated escape")
+                        when (val escape = src[pos++]) {
+                            '"', '\\', '/' -> out.append(escape)
+                            'b' -> out.append('\b')
+                            'f' -> out.append('\u000C')
+                            'n' -> out.append('\n')
+                            'r' -> out.append('\r')
+                            't' -> out.append('\t')
+                            'u' -> {
+                                if (pos + 4 > src.length) fail("Bad unicode escape")
+                                val code = src.substring(pos, pos + 4).toIntOrNull(16)
+                                    ?: fail("Bad unicode escape")
+                                out.append(code.toChar())
+                                pos += 4
+                            }
+                            else -> fail("Invalid escape")
+                        }
+                    }
+                    else -> {
+                        if (c < ' ') fail("Control character in string")
+                        out.append(c)
+                    }
+                }
+            }
+        }
+
+        private fun readNumber(): Long {
+            val start = pos
+            if (peek() == '-') pos++
+            val digitsStart = pos
+            while (pos < src.length && src[pos].isDigit()) pos++
+            if (pos == digitsStart) fail("Malformed number")
+            val text = src.substring(start, pos)
+            if (pos < src.length && (src[pos] == '.' || src[pos] == 'e' || src[pos] == 'E')) {
+                fail("Envelope numbers must be integers")
+            }
+            return text.toLongOrNull() ?: fail("Malformed number")
+        }
+
+        private fun readLiteral(text: String, value: Any?): Any? {
+            if (!src.startsWith(text, pos)) fail("Malformed literal")
+            pos += text.length
+            return value
+        }
+
+        private fun skipWhitespace() {
+            while (pos < src.length && src[pos].isWhitespace()) pos++
+        }
+
+        private fun peek(): Char = if (pos < src.length) src[pos] else fail("Unexpected end")
+
+        private fun expect(expected: Char) {
+            if (peek() != expected) fail("Expected '$expected'")
+            pos++
+        }
+
+        private fun requireEnd() {
+            if (pos != src.length) fail("Trailing data")
+        }
+
+        private fun fail(message: String): Nothing =
+            throw SecurityException("$message at offset $pos in envelope")
     }
 
     private fun String.hexToBytes(): ByteArray {

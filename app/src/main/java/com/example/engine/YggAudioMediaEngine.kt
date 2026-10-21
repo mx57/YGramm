@@ -10,6 +10,8 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Shader
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -17,6 +19,7 @@ import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -64,7 +67,10 @@ data class RecordedVoiceNoteResult(
 object YggAudioMediaEngine {
 
     private const val SAMPLE_RATE = 16000
-    private const val MAX_P2P_INLINE_BYTES = 384 * 1024 // 384 KB inline P2P frame cap
+    // The overlay transport now splits large attachments into ACKed chunks, so the
+    // old 384 KB ceiling (which silently truncated photos and long voice notes) can
+    // be raised. 4 MB covers phone photos and multi-minute WAV recordings.
+    private const val MAX_P2P_INLINE_BYTES = 4 * 1024 * 1024
 
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -85,9 +91,15 @@ object YggAudioMediaEngine {
     // Active VoIP Call Audio state
     private val isVoipCallActive = AtomicBoolean(false)
     private var voipCallJob: Job? = null
-    private var voipIsDialing = true
-    private var voipIsMuted = false
+    @Volatile private var voipIsDialing = true
+    @Volatile private var voipIsMuted = false
     private var voipIsSpeakerOn = true
+    private var voipAudioFocusRequest: AudioFocusRequest? = null
+    private val voipAudioFocusListener = AudioManager.OnAudioFocusChangeListener { }
+    // Mic PCM is handed to the call layer for AEAD encryption and transmission.
+    @Volatile private var voipMicFrameListener: ((ByteArray) -> Unit)? = null
+    @Volatile private var voipLevelListener: ((Float) -> Unit)? = null
+    private val voipRemotePcmQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
 
     /**
      * Starts real microphone capture using AudioRecord (16kHz, 16-bit PCM Mono).
@@ -458,6 +470,7 @@ object YggAudioMediaEngine {
         voipIsSpeakerOn = isSpeakerphoneOn
         isVoipCallActive.set(true)
 
+        requestVoipAudioFocus(context)
         applyAudioManagerVoipRouting(context, isSpeakerphoneOn, isMuted)
 
         voipCallJob = engineScope.launch {
@@ -529,34 +542,40 @@ object YggAudioMediaEngine {
                         outTrack.write(outBytes, 0, outBytes.size)
                         sampleCursor += frameSamples
                     } else {
-                        // Active encrypted call: read mic if not muted and provide gentle comfort/sidetone feedback
-                        var micHasSignal = false
+                        // Active encrypted call: real mic -> listener -> network, and
+                        // network -> decrypted remote PCM -> AudioTrack. No synthesized
+                        // sidetone or fake comfort carrier is injected.
                         if (!voipIsMuted && inRecord != null) {
                             val read = inRecord.read(micShorts, 0, frameSamples)
                             if (read > 0) {
-                                var peak = 0
+                                val micBytes = ByteArray(read * 2)
+                                val micBb = ByteBuffer.wrap(micBytes).order(ByteOrder.LITTLE_ENDIAN)
+                                var sumSq = 0.0
                                 for (i in 0 until read) {
-                                    val a = abs(micShorts[i].toInt())
-                                    if (a > peak) peak = a
+                                    val s = micShorts[i]
+                                    micBb.putShort(s)
+                                    sumSq += (s.toInt() * s.toInt()).toDouble()
                                 }
-                                micHasSignal = peak > 80
+                                voipMicFrameListener?.invoke(micBytes)
+                                val rms = sqrt(sumSq / read)
+                                val level = (rms / 5200.0).toFloat().coerceIn(0.02f, 0.98f)
+                                voipLevelListener?.invoke(level)
                             }
+                        } else {
+                            // Muted calls still emit an encrypted silent frame: it keeps the
+                            // persistent media socket alive instead of letting the peer's
+                            // read timeout tear the channel down mid-call.
+                            voipMicFrameListener?.invoke(ByteArray(frameSamples * 2))
+                            voipLevelListener?.invoke(0.02f)
+                            delay(40L)
                         }
-                        val bb = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN)
-                        for (i in 0 until frameSamples) {
-                            val t = (sampleCursor + i).toDouble() / SAMPLE_RATE.toDouble()
-                            val comfortSample = if (micHasSignal) {
-                                // Subtle sidetone + encrypted channel presence
-                                (micShorts[i].toInt() * 0.25 + sin(2.0 * PI * 280.0 * t) * 180.0).toInt()
-                                    .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                            } else {
-                                // Very soft comfort carrier when connected
-                                val env = 0.5 + 0.5 * sin(2.0 * PI * 1.5 * t)
-                                (sin(2.0 * PI * 320.0 * t) * 140.0 * env).toInt().toShort()
-                            }
-                            bb.putShort(comfortSample)
+                        val remoteFrame = voipRemotePcmQueue.poll()
+                        if (remoteFrame != null && remoteFrame.isNotEmpty()) {
+                            outTrack.write(remoteFrame, 0, remoteFrame.size)
+                        } else {
+                            java.util.Arrays.fill(outBytes, 0)
+                            outTrack.write(outBytes, 0, outBytes.size)
                         }
-                        outTrack.write(outBytes, 0, outBytes.size)
                         sampleCursor += frameSamples
                     }
                 }
@@ -582,6 +601,25 @@ object YggAudioMediaEngine {
         }
     }
 
+    /** Registers the callback that receives raw 40 ms mic PCM frames during a call. */
+    fun setVoipMicFrameListener(listener: ((ByteArray) -> Unit)?) {
+        voipMicFrameListener = listener
+    }
+
+    /** Registers a throttled microphone level callback for the in-call UI. */
+    fun setVoipLevelListener(listener: ((Float) -> Unit)?) {
+        voipLevelListener = listener
+    }
+
+    /** Queues a decrypted remote PCM frame for playback through the call AudioTrack. */
+    fun enqueueVoipRemotePcm(pcm: ByteArray) {
+        if (pcm.isNotEmpty()) voipRemotePcmQueue.add(pcm)
+    }
+
+    fun clearVoipRemotePcm() {
+        voipRemotePcmQueue.clear()
+    }
+
     fun updateVoipCallAudioState(
         context: Context,
         isDialing: Boolean,
@@ -598,10 +636,63 @@ object YggAudioMediaEngine {
         isVoipCallActive.set(false)
         voipCallJob?.cancel()
         voipCallJob = null
+        voipRemotePcmQueue.clear()
+        abandonVoipAudioFocus(context)
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             am?.isMicrophoneMute = false
+            @Suppress("DEPRECATION")
+            am?.stopBluetoothSco()
+            @Suppress("DEPRECATION")
+            am?.isBluetoothScoOn = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                am?.clearCommunicationDevice()
+            }
+            @Suppress("DEPRECATION")
+            am?.isSpeakerphoneOn = false
             am?.mode = AudioManager.MODE_NORMAL
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun requestVoipAudioFocus(context: Context) {
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (voipAudioFocusRequest != null) return
+                val attributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attributes)
+                    .setWillPauseWhenDucked(true)
+                    .setOnAudioFocusChangeListener(voipAudioFocusListener)
+                    .build()
+                voipAudioFocusRequest = request
+                am.requestAudioFocus(request)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(
+                    voipAudioFocusListener,
+                    AudioManager.STREAM_VOICE_CALL,
+                    AudioManager.AUDIOFOCUS_GAIN
+                )
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun abandonVoipAudioFocus(context: Context) {
+        try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                voipAudioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+                voipAudioFocusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(voipAudioFocusListener)
+            }
         } catch (_: Throwable) {
         }
     }
@@ -614,8 +705,29 @@ object YggAudioMediaEngine {
     ) {
         try {
             val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-            am.isSpeakerphoneOn = isSpeakerphoneOn
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
             am.isMicrophoneMute = isMuted
+            val bluetoothScoAvailable = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val desiredType = when {
+                    isSpeakerphoneOn -> AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                    bluetoothScoAvailable -> AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    else -> AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                }
+                am.availableCommunicationDevices
+                    .firstOrNull { it.type == desiredType }
+                    ?.let { am.setCommunicationDevice(it) }
+            } else {
+                if (bluetoothScoAvailable && !isSpeakerphoneOn) {
+                    if (!am.isBluetoothScoOn) am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                } else {
+                    if (am.isBluetoothScoOn) am.stopBluetoothSco()
+                    am.isBluetoothScoOn = false
+                }
+                am.isSpeakerphoneOn = isSpeakerphoneOn
+            }
         } catch (_: Throwable) {
         }
     }

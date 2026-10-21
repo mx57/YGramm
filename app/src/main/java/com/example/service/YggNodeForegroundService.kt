@@ -126,6 +126,11 @@ class YggNodeForegroundService : Service() {
         heartbeatJob = serviceScope.launch {
             while (isActive) {
                 delay(5000L)
+                // Doze defers the long 6-hour wake lock; re-acquiring a short lease
+                // from the still-running foreground service keeps mesh sockets alive.
+                if (wakeLock?.isHeld != true) {
+                    runCatching { wakeLock?.acquire(10 * 60 * 1000L) }
+                }
                 val upSec = ((System.currentTimeMillis() - startedTimestampMs) / 1000L).coerceAtLeast(0L)
                 _serviceState.update { it.copy(uptimeSeconds = upSec) }
                 if (upSec > 0 && upSec % 25L == 0L) {
@@ -180,7 +185,8 @@ class YggNodeForegroundService : Service() {
         val body = "IPv6: ${state.primaryIpv6.take(20)} • Порты ${state.activePortsSummary} • TX:${state.txPackets} RX:${state.rxPackets}"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(0xFF10B981.toInt())
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
@@ -188,6 +194,7 @@ class YggNodeForegroundService : Service() {
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(contentPendingIntent)
             .addAction(
                 android.R.drawable.ic_popup_sync,
@@ -222,7 +229,7 @@ class YggNodeForegroundService : Service() {
             val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
             wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "YggGram::MeshNodeWakeLock")?.apply {
                 setReferenceCounted(false)
-                acquire(6 * 60 * 60 * 1000L)
+                acquire(10 * 60 * 1000L)
             }
         } catch (_: Throwable) {
         }

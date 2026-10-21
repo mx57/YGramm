@@ -39,23 +39,30 @@ class ExampleRobolectricTest {
 
     @Test
     fun `qr codec generates and decodes ygggram contact bitmap and uri`() {
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
         val uri = YggQrCodeCodec.buildContactUri(
             displayName = "Узел Альфа",
-            yggIpv6Address = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
-            ed25519PubKeyHex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            yggIpv6Address = identity.yggIpv6Address,
+            ed25519PubKeyHex = identity.yggNodePublicKeyHex,
             localLanIp = "192.168.1.42",
             localPort = 51921
         )
         val parsedFromText = YggQrCodeCodec.parseContactString(uri)
         assertNotNull(parsedFromText)
         assertEquals("Узел Альфа", parsedFromText?.displayName)
-        assertEquals("0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8", parsedFromText?.yggIpv6Address)
+        assertEquals(identity.yggIpv6Address, parsedFromText?.yggIpv6Address)
         assertEquals("192.168.1.42:51921", parsedFromText?.directLanHint)
 
         val qrBitmap = YggQrCodeCodec.renderQrBitmap(uri, sizePx = 560)
         val decodedFromBitmap = YggQrCodeCodec.decodeQrBitmap(qrBitmap)
         assertNotNull("QR Bitmap must decode back to contact payload", decodedFromBitmap)
-        assertEquals("0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8", decodedFromBitmap?.yggIpv6Address)
+        assertEquals(identity.yggIpv6Address, decodedFromBitmap?.yggIpv6Address)
         assertEquals("Узел Альфа", decodedFromBitmap?.displayName)
     }
 
@@ -125,8 +132,6 @@ class ExampleRobolectricTest {
             val chatId = repo.createNewConversation(
                 title = "Mimir Peer Node",
                 yggIpv6Input = peerIpv6,
-                isMlsGroup = false,
-                sealedSender = true,
                 disappearingSeconds = 0,
                 directEndpointHint = receiverEndpoint
             )
@@ -180,20 +185,23 @@ class ExampleRobolectricTest {
             assertEquals(outgoingMsg.messageId, ackId)
 
             val rxPacket = withTimeout(3000L) { incomingMessageReceived.await() }
-            assertEquals("Голосовое сообщение Opus/AEAD (5 сек)", rxPacket.plainText)
+            // Wire frames carry only cipherPayloadHex; the receiving repository re-derives
+            // plainText, so the bridge-level packet is asserted by its AEAD payload.
+            assertEquals(outgoingMsg.cipherPayloadHex, rxPacket.cipherPayloadHex)
             assertEquals("VOICE", rxPacket.attachmentType)
             assertEquals(5, rxPacket.voiceDurationSec)
 
             // 7. Dispatch live reaction frame over TCP P2P
-            val reactionSent = senderNode.dispatchReactionFrame(
+            val reactionResult = senderNode.dispatchReactionFrame(
                 chatId = chatId,
                 messageId = outgoingMsg.messageId,
                 emoji = "❤️",
+                action = "ADD",
                 peerIpv6 = peerIpv6,
                 directEndpointHint = receiverEndpoint,
                 senderIpv6 = identity.yggIpv6Address
             )
-            assertTrue("Reaction frame must be delivered over TCP socket", reactionSent)
+            assertTrue("Reaction frame must be delivered over TCP socket", reactionResult.delivered)
             val rxReaction = withTimeout(3000L) { incomingReactionReceived.await() }
             assertEquals("❤️", rxReaction.emoji)
             assertEquals(outgoingMsg.messageId, rxReaction.messageId)
@@ -230,7 +238,11 @@ class ExampleRobolectricTest {
             switchImmediately = false
         )
         assertNotNull(secondProfile)
-        assertTrue(secondProfile.yggIpv6Address.startsWith("02"))
+        val secondFirstGroup = secondProfile.yggIpv6Address.substringBefore(":").toInt(16)
+        assertTrue(
+            "Real Yggdrasil v0.5 address must fall into 200::/7 (RFC 5952 compression makes a string prefix unreliable)",
+            secondFirstGroup in 0x200..0x3ff
+        )
         assertTrue(secondProfile.isActiveInBackground)
 
         val allProfiles = repo.getAllProfilesNow()

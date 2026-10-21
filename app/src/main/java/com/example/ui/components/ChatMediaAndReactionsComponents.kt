@@ -9,6 +9,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,11 +28,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -96,7 +100,9 @@ val DEFAULT_QUICK_REACTIONS = listOf("👍", "❤️", "🔥", "⚡", "🛡️",
 fun ReactionQuickPickerBar(
     messageId: String,
     onSelectEmoji: (String) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onReply: (() -> Unit)? = null,
+    onForward: (() -> Unit)? = null
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
@@ -104,15 +110,48 @@ fun ReactionQuickPickerBar(
         tonalElevation = 6.dp,
         shadowElevation = 6.dp,
         modifier = Modifier
+            .fillMaxWidth()
             .padding(vertical = 4.dp)
             .border(1.dp, EmeraldPrimary.copy(alpha = 0.45f), RoundedCornerShape(24.dp))
             .testTag("reaction_picker_bar_$messageId")
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 10.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            if (onReply != null) {
+                IconButton(
+                    onClick = onReply,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .testTag("reply_to_message_$messageId")
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Reply,
+                        contentDescription = "Ответить на сообщение",
+                        tint = CyberTealSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+            if (onForward != null) {
+                IconButton(
+                    onClick = onForward,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .testTag("forward_message_$messageId")
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Forward,
+                        contentDescription = "Переслать сообщение",
+                        tint = EmeraldPrimary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
             DEFAULT_QUICK_REACTIONS.forEach { emoji ->
                 Box(
                     modifier = Modifier
@@ -356,20 +395,19 @@ fun ImageMessagePreviewCard(
     messageId: String,
     imageName: String,
     imageUri: String?,
-    sizeBytes: Long,
-    merkleRootHex: String?
+    sizeBytes: Long
 ) {
     var showFullScreen by rememberSaveable(messageId) { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp)
+            .padding(vertical = 2.dp)
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(175.dp)
+                .height(152.dp)
                 .clip(RoundedCornerShape(12.dp))
                 .background(
                     Brush.linearGradient(
@@ -423,7 +461,7 @@ fun ImageMessagePreviewCard(
                     .padding(8.dp)
             ) {
                 Text(
-                    text = "${(sizeBytes / 1024).coerceAtLeast(12)} КБ • Нажмите для просмотра",
+                    text = "${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Открыть",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
@@ -461,8 +499,8 @@ fun ImageMessagePreviewCard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "Размер: ${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Merkle SHA-256: ${merkleRootHex?.take(16) ?: "verified"}",
-                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                text = "Размер: ${(sizeBytes / 1024).coerceAtLeast(1)} КБ",
+                                style = MaterialTheme.typography.labelSmall,
                                 color = CyberTealSecondary
                             )
                         }
@@ -513,8 +551,7 @@ fun FileAttachmentBubbleCard(
     messageId: String,
     fileName: String,
     fileUri: String?,
-    sizeBytes: Long,
-    merkleRootHex: String?
+    sizeBytes: Long
 ) {
     val context = LocalContext.current
     var showInspector by rememberSaveable(messageId) { mutableStateOf(false) }
@@ -546,8 +583,8 @@ fun FileAttachmentBubbleCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Merkle SHA-256: ${merkleRootHex?.take(12) ?: "verified"} • Открыть",
-                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    text = "${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Открыть",
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -576,10 +613,10 @@ fun FileAttachmentBubbleCard(
                             sample.take(64).joinToString(" ") { b -> "%02X".format(b) }
                         }
                     } else {
-                        "Контейнер FastCDC проверен (Merkle SHA-256 OK)"
+                        "Файл сохранён на устройстве"
                     }
                 } else {
-                    "Файл верифицирован по Merkle-дереву SHA-256"
+                    "Предпросмотр недоступен: файл не сохранён"
                 }
             } catch (_: Throwable) {
                 "Бинарный P2P пакет ($fileName)"
@@ -630,11 +667,6 @@ fun FileAttachmentBubbleCard(
                         text = "Размер: $sizeBytes байт (${(sizeBytes / 1024).coerceAtLeast(1)} КБ)",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "Merkle Root SHA-256:\n${merkleRootHex ?: "verified-p2p-chunk"}",
-                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                        color = CyberTealSecondary
                     )
                     if (!fileUri.isNullOrBlank()) {
                         Text(
