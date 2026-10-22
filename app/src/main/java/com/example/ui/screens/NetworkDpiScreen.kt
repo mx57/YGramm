@@ -1349,7 +1349,9 @@ private fun PeerNodeCard(
     onToggleConnect: () -> Unit,
     onRemove: () -> Unit
 ) {
-    val isAlive = peer.isConnected && peer.latencyMs > 0
+    // The core's link state decides aliveness; a live link simply has no measured
+    // session round trip yet, and that must not grey the card out.
+    val isAlive = peer.isConnected
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -1399,7 +1401,11 @@ private fun PeerNodeCard(
                     shape = RoundedCornerShape(6.dp)
                 ) {
                     Text(
-                        text = if (isAlive) "${peer.latencyMs} мс" else "ОФЛАЙН",
+                        text = when {
+                            !isAlive -> "ОФЛАЙН"
+                            peer.latencyMs > 0 -> "${peer.latencyMs} мс"
+                            else -> "ЛИНК, ПИНГ НЕ ИЗМЕРЕН"
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = if (isAlive) EmeraldPrimary else Color(0xFFEF4444),
                         fontWeight = FontWeight.Bold,

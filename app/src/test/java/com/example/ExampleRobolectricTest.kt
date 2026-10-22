@@ -392,4 +392,25 @@ class ExampleRobolectricTest {
             bridge.stop()
         }
     }
+
+    @Test
+    fun `core peer json decides which links count as up`() {
+        val raw = """
+            {"ok":true,"upCount":1,"total":3,"peers":[
+              {"URI":"tcp://10.0.2.2:21001?maxbackoff=20s","Up":false},
+              {"URI":"TLS://Example.COM:443?maxbackoff=20s","Up":true,"Latency":155000000},
+              {"URI":"","Up":true}
+            ]}
+        """.trimIndent()
+        val up = com.example.engine.YggNativeCoreBridge.readCoreUpPeers(raw)
+        assertEquals(
+            "Only links the core holds count, keyed by the endpoint form stored in the database",
+            mapOf("tls://example.com:443" to 155),
+            up
+        )
+        assertTrue(
+            "A broken native answer must not invent live peers",
+            com.example.engine.YggNativeCoreBridge.readCoreUpPeers("{not json").isEmpty()
+        )
+    }
 }

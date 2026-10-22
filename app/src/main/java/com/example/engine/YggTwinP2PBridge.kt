@@ -401,7 +401,10 @@ class YggTwinP2PBridge(
      * Synchronizes background TCP listeners for all user profiles that have `isActiveInBackground = true`.
      * Allows 2 or more profiles to run simultaneously in the background and communicate over real TCP sockets!
      */
-    fun syncConcurrentProfileListeners(profiles: List<UserProfileEntity>) {
+    fun syncConcurrentProfileListeners(
+        profiles: List<UserProfileEntity>,
+        persistedPeerUris: List<String> = emptyList()
+    ) {
         scope.launch {
             ipv6ToProfileIdMap.clear()
             profileRelayRoleMap.clear()
@@ -509,7 +512,11 @@ class YggTwinP2PBridge(
             // One real Yggdrasil node per profile — inter-profile traffic must
             // traverse the internet overlay, so every profile's node stays up
             // even while another profile is in the foreground.
-            val defaultPeerUris = YggPeerScannerCatalog.initialCatalog.map { it.endpointUri }
+            // Stored peers outrank catalog guesses: a node dialled only from the
+            // hardcoded list ignored the verified peers in the database and came up
+            // with zero live links. The catalog stays as the first-run fallback.
+            val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
+                .ifEmpty { YggPeerScannerCatalog.initialCatalog.map { it.endpointUri } }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
                 synchronized(nativeCoreStartLock) {
