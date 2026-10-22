@@ -23,8 +23,8 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 8
-    versionName = "1.6.1-arm64-v8a"
+    versionCode = 9
+    versionName = "1.6.2-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
