@@ -1,6 +1,7 @@
 // File: app/build.gradle.kts
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.io.File
+import java.util.zip.ZipFile
 import org.gradle.api.DefaultTask
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Internal
@@ -22,8 +23,8 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 5
-    versionName = "1.4.0-arm64-v8a"
+    versionCode = 6
+    versionName = "1.5.0-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
@@ -120,6 +121,19 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
 
     val signedRelease = File(releaseApkPath.get())
     if (signedRelease.exists() && signedRelease.length() > 0L) {
+      // libygggram.so is not tracked in git; a release built without the
+      // native core silently ships «НЕТ ЯДРА» to users. Fail the build instead.
+      ZipFile(signedRelease).use { zip ->
+        val hasCore = zip.entries().asSequence()
+          .any { it.name == "lib/arm64-v8a/libygggram.so" }
+        if (!hasCore) {
+          throw GradleException(
+            "Release APK is missing lib/arm64-v8a/libygggram.so. Rebuild the Go core first: " +
+              "cd core && GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=\"\$NDK/toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android24-clang\" " +
+              "go build -buildmode=c-shared -o ../app/src/main/jniLibs/arm64-v8a/libygggram.so ./cmd/libygggram"
+          )
+        }
+      }
       val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
       signedRelease.copyTo(targetFile, overwrite = true)
       println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")

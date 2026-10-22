@@ -13,6 +13,7 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Hub
@@ -123,6 +125,7 @@ fun ProfilePrivacyScreen(
     onSetProfileRelayRole: (String, String) -> Unit = { _, _ -> },
     onTriggerProfileTestNotification: (String, YggAlertCategory) -> Unit = { _, _ -> },
     onDeleteSecondaryProfile: (String) -> Unit = {},
+    onPanicWipe: () -> Unit = {},
     onOpenChatWithProfile: (UserProfileEntity) -> Unit = {},
     onToggleBackgroundService: (Boolean) -> Unit = {},
     onUpdatePrivacy: (
@@ -149,6 +152,7 @@ fun ProfilePrivacyScreen(
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showCreateProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showQrIdentityDialog by rememberSaveable { mutableStateOf(false) }
+    var showPanicWipeDialog by rememberSaveable { mutableStateOf(false) }
 
     val notificationPrefs = remember(context) {
         context.getSharedPreferences("ygggram_ui_prefs", Context.MODE_PRIVATE)
@@ -1124,6 +1128,46 @@ fun ProfilePrivacyScreen(
                 }
             }
         }
+
+        // 6. Panic-wipe: emergency removal of all local key material and history
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                ),
+                border = BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.5f))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.DeleteForever,
+                            contentDescription = null,
+                            tint = Color(0xFFEF4444)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Экстренное стирание (Panic-wipe)",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Останавливает все ноды Yggdrasil и безвозвратно удаляет с устройства: профили вместе с mnemonic-ключами, переписку, файлы, журналы звонков и резервные копии. Приложение вернётся в состояние свежей установки.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = { showPanicWipeDialog = true },
+                        modifier = Modifier.testTag("panic_wipe_button")
+                    ) {
+                        Text("Стереть всё…", color = Color(0xFFEF4444))
+                    }
+                }
+            }
+        }
     }
 
     if (showEditProfileDialog) {
@@ -1159,6 +1203,36 @@ fun ProfilePrivacyScreen(
             onContactScanned = { payload ->
                 showQrIdentityDialog = false
                 onAddContactFromQr(payload)
+            }
+        )
+    }
+
+    if (showPanicWipeDialog) {
+        AlertDialog(
+            onDismissRequest = { showPanicWipeDialog = false },
+            icon = { Icon(Icons.Default.DeleteForever, contentDescription = null, tint = Color(0xFFEF4444)) },
+            title = { Text("Экстренное стирание всех данных?") },
+            text = {
+                Text(
+                    "Будут удалены без возможности восстановления: все профили с их mnemonic-ключами, " +
+                        "переписка, файлы, журналы звонков и резервные копии на этом устройстве. " +
+                        "Скопии переписки на узлах собеседников останутся — восстановить их нельзя " +
+                        "ни с одного из устройств после стирания."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showPanicWipeDialog = false
+                        onPanicWipe()
+                    },
+                    modifier = Modifier.testTag("panic_wipe_confirm_button")
+                ) {
+                    Text("Стереть безвозвратно", color = Color(0xFFEF4444), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPanicWipeDialog = false }) { Text("Отмена") }
             }
         )
     }

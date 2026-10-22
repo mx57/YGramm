@@ -76,6 +76,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -116,6 +117,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
@@ -169,7 +171,8 @@ fun ChatsScreen(
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
     onRetryMessage: (MessageEntity) -> Unit = {},
-    onPingChatRoute: (String) -> Unit = {}
+    onPingChatRoute: (String) -> Unit = {},
+    onSetContactVerified: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     var showNewChatDialog by rememberSaveable { mutableStateOf(false) }
@@ -318,6 +321,9 @@ fun ChatsScreen(
                             },
                             onForwardMessage = onForwardMessage,
                             onTyping = { onTyping(activeConversation.chatId) },
+                            onSetContactVerified = { verified ->
+                                onSetContactVerified(activeConversation.chatId, verified)
+                            },
                             onSendSelfEchoTest = {
                                 onSendMessage(
                                     activeConversation.chatId,
@@ -371,6 +377,9 @@ fun ChatsScreen(
                     },
                     onForwardMessage = onForwardMessage,
                     onTyping = { onTyping(activeConversation.chatId) },
+                    onSetContactVerified = { verified ->
+                        onSetContactVerified(activeConversation.chatId, verified)
+                    },
                     onSendSelfEchoTest = {
                         onSendMessage(
                             activeConversation.chatId,
@@ -1425,7 +1434,8 @@ private fun ChatDetailPane(
     forwardTargets: List<ConversationEntity> = emptyList(),
     onSendReply: (String, String) -> Unit = { _, _ -> },
     onForwardMessage: (String, String) -> Unit = { _, _ -> },
-    onTyping: () -> Unit = {}
+    onTyping: () -> Unit = {},
+    onSetContactVerified: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -1685,6 +1695,56 @@ private fun ChatDetailPane(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            Spacer(modifier = Modifier.height(6.dp))
+                            val peerSafetyNumber = remember(conversation.publicKeyHex) {
+                                com.example.engine.YggCryptoEngine.safetyNumber(conversation.publicKeyHex)
+                            }
+                            Text(
+                                text = "Ключевое число узла (safety number)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(
+                                text = peerSafetyNumber.ifBlank { "Ключ узла неизвестен — дождитесь обмена сообщениями" },
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                color = if (conversation.isVerified) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Сверьте это число с экраном «Мой QR» на устройстве собеседника — совпадение означает, что ключи не подменены.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        if (conversation.isVerified) Icons.Default.VerifiedUser else Icons.Default.Shield,
+                                        contentDescription = null,
+                                        tint = if (conversation.isVerified) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = if (conversation.isVerified) "Ключ верифицирован" else "Ключ не проверен",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                                TextButton(
+                                    onClick = { onSetContactVerified(!conversation.isVerified) },
+                                    modifier = Modifier.testTag("toggle_contact_verified_${conversation.chatId}")
+                                ) {
+                                    Text(
+                                        if (conversation.isVerified) "Снять отметку" else "Совпадает",
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
                         }
                     }
                 }

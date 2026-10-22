@@ -39,7 +39,8 @@ object YggNativeCoreBridge {
         val liveLinks: Int = 0,
         val totalLinks: Int = 0,
         val knownNodes: Int = 0,
-        val sessionCount: Int = 0
+        val sessionCount: Int = 0,
+        val restartCount: Int = 0
     )
 
     private external fun nativeInitCore(profileId: String, mnemonic: String, filesDir: String): String?

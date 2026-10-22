@@ -5,6 +5,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
@@ -27,6 +28,48 @@ interface YggDao {
 
     @Query("DELETE FROM ygg_profiles WHERE profileId = :profileId")
     suspend fun deleteProfile(profileId: String)
+
+    // Panic-wipe: removes every trace of user data (profiles with mnemonics,
+    // chats, messages, keys, transfers, backups) in one transaction.
+    @Query("DELETE FROM ygg_profiles")
+    suspend fun wipeProfilesTable()
+
+    @Query("DELETE FROM conversations")
+    suspend fun wipeConversationsTable()
+
+    @Query("DELETE FROM messages")
+    suspend fun wipeMessagesTable()
+
+    @Query("DELETE FROM p2p_file_transfers")
+    suspend fun wipeFileTransfersTable()
+
+    @Query("DELETE FROM ygg_peers")
+    suspend fun wipePeersTable()
+
+    @Query("DELETE FROM linked_devices")
+    suspend fun wipeLinkedDevicesTable()
+
+    @Query("DELETE FROM backup_snapshots")
+    suspend fun wipeBackupSnapshotsTable()
+
+    @Query("DELETE FROM crypto_keys")
+    suspend fun wipeCryptoKeysTable()
+
+    @Query("DELETE FROM call_log")
+    suspend fun wipeCallLogTable()
+
+    @Transaction
+    suspend fun wipeAllUserData() {
+        wipeMessagesTable()
+        wipeConversationsTable()
+        wipeFileTransfersTable()
+        wipeCallLogTable()
+        wipeBackupSnapshotsTable()
+        wipeLinkedDevicesTable()
+        wipeCryptoKeysTable()
+        wipePeersTable()
+        wipeProfilesTable()
+    }
 
     @Query("SELECT * FROM conversations ORDER BY lastTimestamp DESC")
     fun observeConversations(): Flow<List<ConversationEntity>>

@@ -59,6 +59,7 @@ class NetworkDpiController(
     val isAdaptiveJitterEnabled: StateFlow<Boolean> = _isAdaptiveJitterEnabled.asStateFlow()
 
     private var watchdogJob: Job? = null
+    private var peerScanJob: Job? = null
 
     init {
         startSmartWatchdog()
@@ -76,11 +77,17 @@ class NetworkDpiController(
                 if (!_isSmartWatchdogEnabled.value) continue
                 if (!networkEngine.isRealNetworkAvailable() || networkEngine.isAirplaneModeActive()) continue
 
+                val liveLinks = networkEngine.coreLiveLinkCount()
+                if (liveLinks < 0) continue
+                if (liveLinks < 2) {
+                    // The node itself is the authority: at one public link every route
+                    // depends on a single flapping neighbour, whatever the stored peer
+                    // flags say.
+                    autoCascadeFailover("Ядро держит лишь $liveLinks живых линков: автопилот добавляет резервные узлы...")
+                    continue
+                }
                 val connectedPeers = repository.getAllPeersNow().filter { it.isConnected }
-                if (connectedPeers.isEmpty()) {
-                    // No live peers connected, trigger auto-failover to best available peer
-                    autoCascadeFailover("Нет активных пиров: автопилот подключает резервный узел...")
-                } else {
+                if (connectedPeers.isNotEmpty()) {
                     // Check if current connected peers are failing
                     val unreachableCount = connectedPeers.count { peer ->
                         val probe = networkEngine.probeRealYggdrasilPeer(
@@ -153,11 +160,19 @@ class NetworkDpiController(
                     isConnected = true,
                     whitelistCompatible = candidate.whitelistCompatible
                 )
-                withContext(Dispatchers.Main) {
-                    onBannerMessage("Автопилот восстановил связь через ${candidate.countryFlag} ${candidate.cityRu} (${probe.rttMs} мс)")
-                    onSyncForegroundNotification()
+                // A reachable port is not a Yggdrasil link: hand the peer to the live node
+                // and only report recovery once the node accepted it.
+                val core = networkEngine.applyPeerChangeToCores(candidate.endpointUri, enabled = true)
+                if (core.applied > 0) {
+                    withContext(Dispatchers.Main) {
+                        onBannerMessage(
+                            "Автопилот добавил ${candidate.countryFlag} ${candidate.cityRu} в ноду " +
+                                "(${probe.rttMs} мс • линков ядра: ${core.liveLinks} из ${core.totalLinks})"
+                        )
+                        onSyncForegroundNotification()
+                    }
+                    return
                 }
-                return
             }
         }
     }
@@ -282,7 +297,7 @@ class NetworkDpiController(
 
     fun scanYggdrasilPeersByCountry() {
         if (_peerScanner.value.isScanning) return
-        scope.launch {
+        peerScanJob = scope.launch {
             if (!networkEngine.isRealNetworkAvailable() || networkEngine.isAirplaneModeActive()) {
                 val reason = if (networkEngine.isAirplaneModeActive()) "Активен Авиарежим" else "Отсутствует подключение к Интернету"
                 _peerScanner.update { state ->
@@ -405,30 +420,47 @@ class NetworkDpiController(
                 }
                 state.copy(discoveredPeers = updatedDiscovered)
             }
+            val core = networkEngine.applyPeerChangeToCores(scanned.endpointUri, enabled = true)
             onBannerMessage(
-                if (probe.reachable) "Узел ${scanned.countryFlag} ${scanned.cityRu} подключен (RTT: ${probe.rttMs} мс)"
-                else "Узел ${scanned.cityRu} добавлен в маршруты, но сейчас не отвечает (${probe.errorDetail ?: "Timeout"})"
+                when {
+                    core.applied == 0 ->
+                        "Пир ${scanned.cityRu} сохранён, но живая нода его не приняла: " +
+                            (core.errorDetail ?: "нет активной ноды Yggdrasil")
+                    probe.reachable ->
+                        "Пир ${scanned.countryFlag} ${scanned.cityRu} добавлен в ноду (RTT: ${probe.rttMs} мс • " +
+                            "линков ядра: ${core.liveLinks} из ${core.totalLinks})"
+                    else ->
+                        "Пир ${scanned.cityRu} добавлен в маршруты, но сейчас не отвечает " +
+                            "(${probe.errorDetail ?: "Timeout"}) • линков ядра: ${core.liveLinks} из ${core.totalLinks}"
+                }
             )
             onSyncForegroundNotification()
         }
     }
 
     fun connectTopFastestPeersInSelectedCountry() {
-        val scanner = _peerScanner.value
-        val matching = scanner.discoveredPeers
-            .filter {
-                (scanner.selectedCountryCode == "ALL" || it.countryCode == scanner.selectedCountryCode) &&
-                    (!scanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
-                    it.latencyMs > 0
-            }
-            .sortedBy { it.latencyMs }
-            .take(3)
-
-        if (matching.isEmpty()) {
-            onBannerMessage("Сначала нажмите «Сканировать пинг», чтобы найти реально доступные узлы")
-            return
-        }
         scope.launch {
+            // The region chips fire scan and connect back to back. Reading the catalog
+            // before the scan finishes would connect the previous run's peers — or none.
+            peerScanJob?.join()
+            val scanner = _peerScanner.value
+            val matching = scanner.discoveredPeers
+                .filter {
+                    (scanner.selectedCountryCode == "ALL" || it.countryCode == scanner.selectedCountryCode) &&
+                        (!scanner.onlyWhitelistCompatible || it.whitelistCompatible) &&
+                        it.latencyMs > 0
+                }
+                .sortedBy { it.latencyMs }
+                .take(3)
+
+            if (matching.isEmpty()) {
+                onBannerMessage("Сначала нажмите «Сканировать пинг», чтобы найти реально доступные узлы")
+                return@launch
+            }
+            var applied = 0
+            var live = 0
+            var total = 0
+            var failure: String? = null
             matching.forEach { scanned ->
                 repository.addOrUpdatePeer(
                     peerId = "peer_${scanned.id}",
@@ -441,9 +473,20 @@ class NetworkDpiController(
                     isConnected = true,
                     whitelistCompatible = scanned.whitelistCompatible
                 )
+                val core = networkEngine.applyPeerChangeToCores(scanned.endpointUri, enabled = true)
+                applied += core.applied
+                live = maxOf(live, core.liveLinks)
+                total = maxOf(total, core.totalLinks)
+                failure = core.errorDetail ?: failure
             }
             onBannerMessage(
-                "Подключены ${matching.size} быстрых пира (лучший: ${matching.first().cityRu}, ${matching.first().latencyMs} мс)"
+                if (applied == 0) {
+                    "Нода не приняла пиры: ${failure ?: "нет активной ноды Yggdrasil"}"
+                } else {
+                    "В ноду добавлено $applied из ${matching.size} быстрых пиров " +
+                        "(лучший: ${matching.first().cityRu}, ${matching.first().latencyMs} мс • " +
+                        "линков ядра: $live из $total)"
+                }
             )
             onSyncForegroundNotification()
         }

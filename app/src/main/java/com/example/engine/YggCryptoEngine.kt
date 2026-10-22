@@ -67,6 +67,22 @@ object YggCryptoEngine {
     fun sha256Hex(text: String): String =
         sha256Hex(text.toByteArray(StandardCharsets.UTF_8))
 
+    /**
+     * Human-comparable fingerprint of an Ed25519 node key: 12 groups of 5 digits,
+     * like Signal's safety number. Both devices derive the same value from the same
+     * public key, so reading it aloud or scanning a QR proves the keys match.
+     * Returns "" when the key is not a usable 32-byte hex.
+     */
+    fun safetyNumber(nodePublicKeyHex: String): String {
+        val normalized = nodePublicKeyHex.trim().lowercase().filter { it in '0'..'9' || it in 'a'..'f' }
+        if (normalized.length != 64) return ""
+        val digestHex = sha256Hex("ygggram-safety-number:v1:" + normalized)
+        return (0 until 12).joinToString(" ") { group ->
+            digestHex.substring(group * 5, group * 5 + 5).toInt(16)
+                .rem(100_000).toString().padStart(5, '0')
+        }
+    }
+
     fun hmacSha512(key: ByteArray, data: ByteArray): ByteArray {
         val mac = Mac.getInstance("HmacSHA512")
         mac.init(SecretKeySpec(key, "HmacSHA512"))

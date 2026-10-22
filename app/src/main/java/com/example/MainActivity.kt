@@ -300,7 +300,13 @@ fun YggGramRootApp(
     }
 
     val totalUnread = conversations.sumOf { it.unreadCount }
-    val connectedPeers = peers.count { it.isConnected }
+    // The node knows which public links are up; the stored peer flags only record that a
+    // TCP/TLS probe once succeeded, which is not the same fact.
+    val connectedPeers = if (uiState.coreMesh.available) {
+        uiState.coreMesh.liveLinks
+    } else {
+        peers.count { it.isConnected }
+    }
     val activeBgProfilesCount = userProfiles.count { it.isActiveInBackground || it.isCurrentPrimary }.coerceAtLeast(1)
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -728,7 +734,8 @@ fun YggGramRootApp(
                                     }
                                 },
                                 onRetryMessage = viewModel::retrySendMessage,
-                                onPingChatRoute = viewModel::pingConversationRoute
+                                onPingChatRoute = viewModel::pingConversationRoute,
+                                onSetContactVerified = viewModel::setContactKeyVerified
                             )
 
                             YggNavTab.NETWORK_MAP -> NetworkMapScreen(
@@ -790,6 +797,7 @@ fun YggGramRootApp(
                                 onSetProfileRelayRole = viewModel::setProfileNodeRelayRole,
                                 onTriggerProfileTestNotification = viewModel::triggerProfileTestNotification,
                                 onDeleteSecondaryProfile = viewModel::deleteSecondaryProfile,
+                                onPanicWipe = viewModel::panicWipeAllData,
                                 onOpenChatWithProfile = viewModel::openChatWithSecondaryProfile,
                                 onToggleBackgroundService = viewModel::setBackgroundServiceEnabled,
                                 onUpdatePrivacy = viewModel::updatePrivacySetting,
