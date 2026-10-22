@@ -2509,9 +2509,29 @@ class YggTwinP2PBridge(
             }
         }
 
+        // WriteTo succeeding is not delivery: without a path entry the pathfinder only
+        // starts a rumour lookup and the frame is dropped if that lookup fails. Say so
+        // instead of promoting the message to «Ожидает доставки».
+        if (YggNativeCoreBridge.hasOverlayRoute(senderProfileId, recipientKeyHex) == false) {
+            logPacket(
+                direction = "ERR • YGG",
+                summary = "Маршрут к узлу «$peerTitle» в оверлее не найден",
+                details = "Пакет запущен в поиск маршрута • ACK не получен • messageId=${messageId.take(12)}"
+            )
+            return@withContext SelfYggdrasilRelayResult(
+                delivered = false,
+                relayEndpointUri = "",
+                relayRegionLabel = "",
+                rttMs = -1L,
+                txBytes = totalOutboundBytes,
+                rxBytes = 0L,
+                errorDetail = "Узел получателя не виден в оверлее: маршрута к его Ed25519-ключу нет, поиск маршрута ответа не дал"
+            )
+        }
+
         logPacket(
             direction = "TX -> YGG",
-            summary = "Пакет принят оверлеем; ACK от «$peerTitle» еще не получен",
+            summary = "Пакет ушёл по найденному маршруту; ACK от «$peerTitle» еще не получен",
             details = "Статус: ожидается ACK • повторы идут в фоне"
         )
         return@withContext SelfYggdrasilRelayResult(

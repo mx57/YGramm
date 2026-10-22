@@ -119,6 +119,7 @@ extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeAddPeer(JNIEnv*
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeRemovePeer(JNIEnv* env, jobject thiz, jstring profileIdC, jstring peerUriC, jstring sintfC);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeGetPeersJson(JNIEnv* env, jobject thiz, jstring profileIdC);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeSendOverlay(JNIEnv* env, jobject thiz, jstring profileIdC, jstring destKeyC, jstring payloadC);
+extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeOverlayRoute(JNIEnv* env, jobject thiz, jstring profileIdC, jstring destKeyC);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativePollOverlay(JNIEnv* env, jobject thiz, jstring profileIdC, jint timeoutMs);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeGetLinkLog(JNIEnv* env, jobject thiz);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers(JNIEnv* env, jobject thiz, jstring profileIdC);
