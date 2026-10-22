@@ -9,11 +9,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.example.R
 
-val SpaceGroteskFontFamily = FontFamily(
-    Font(R.font.space_grotesk, FontWeight.Normal),
-    Font(R.font.space_grotesk, FontWeight.Medium),
-    Font(R.font.space_grotesk, FontWeight.SemiBold),
-    Font(R.font.space_grotesk, FontWeight.Bold)
+// Both files are fontTools subsets of the google/fonts originals (see LICENSE-fonts.md).
+// Space Grotesk was replaced because it has no Cyrillic at all: Russian text silently fell
+// back to the system font mid-sentence while Latin and digits kept the brand face.
+val GolosTextFontFamily = FontFamily(
+    Font(R.font.golos_text, FontWeight.Normal),
+    Font(R.font.golos_text, FontWeight.Medium),
+    Font(R.font.golos_text, FontWeight.SemiBold),
+    Font(R.font.golos_text, FontWeight.Bold)
 )
 
 val JetBrainsMonoFontFamily = FontFamily(
@@ -24,28 +27,28 @@ val JetBrainsMonoFontFamily = FontFamily(
 
 val Typography = Typography(
     headlineLarge = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 28.sp,
         lineHeight = 34.sp,
         letterSpacing = (-0.5).sp
     ),
     headlineMedium = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.Bold,
         fontSize = 22.sp,
         lineHeight = 28.sp,
         letterSpacing = (-0.25).sp
     ),
     titleLarge = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.SemiBold,
         fontSize = 18.sp,
         lineHeight = 24.sp,
         letterSpacing = 0.sp
     ),
     titleMedium = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.SemiBold,
         fontSize = 15.sp,
         lineHeight = 20.sp,
@@ -59,14 +62,14 @@ val Typography = Typography(
         letterSpacing = 0.2.sp
     ),
     bodyLarge = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.Normal,
         fontSize = 15.sp,
         lineHeight = 22.sp,
         letterSpacing = 0.15.sp
     ),
     bodyMedium = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.Normal,
         fontSize = 13.sp,
         lineHeight = 19.sp,
@@ -80,7 +83,7 @@ val Typography = Typography(
         letterSpacing = 0.2.sp
     ),
     labelLarge = TextStyle(
-        fontFamily = SpaceGroteskFontFamily,
+        fontFamily = GolosTextFontFamily,
         fontWeight = FontWeight.Medium,
         fontSize = 13.sp,
         lineHeight = 18.sp,
