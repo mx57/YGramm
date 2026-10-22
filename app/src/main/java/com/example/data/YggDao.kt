@@ -117,6 +117,15 @@ interface YggDao {
     @Query("UPDATE messages SET deliveryState = :newState WHERE messageId = :messageId")
     suspend fun updateMessageDeliveryState(messageId: String, newState: String)
 
+    @Query("SELECT * FROM messages WHERE chatId = :chatId AND timestamp < :beforeTimestamp")
+    suspend fun getExpiredMessages(chatId: String, beforeTimestamp: Long): List<MessageEntity>
+
+    @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getNewestMessage(chatId: String): MessageEntity?
+
+    @Query("DELETE FROM messages WHERE messageId IN (:messageIds)")
+    suspend fun deleteMessagesByIds(messageIds: List<String>)
+
     @Query(
         "UPDATE messages SET deliveryState = 'READ' " +
             "WHERE isOutgoing = 1 AND (messageId = :wireMessageId OR peerMessageId = :wireMessageId)"
