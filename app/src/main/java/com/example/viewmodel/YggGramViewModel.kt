@@ -338,6 +338,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private val networkEngine = YggTwinP2PBridge(
         context = application.applicationContext,
         onPacketReceived = { packet ->
+            // Joined before the bridge sends its delivery ACK, so «Доставлено» can only
+            // mean the row is already in this device's database.
             viewModelScope.launch {
                 val currentPrimaryId = _uiState.value.currentProfileId
                 val allProfs = repository.getAllProfilesNow()
@@ -411,7 +413,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     launch { flushReadReceipts(chatId) }
                 }
                 syncForegroundServiceNotification()
-            }
+            }.join()
         },
         onDeliveryAckReceived = { chatId, messageId, rttMs ->
             viewModelScope.launch {

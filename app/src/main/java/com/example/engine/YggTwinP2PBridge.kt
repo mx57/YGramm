@@ -1135,7 +1135,6 @@ class YggTwinP2PBridge(
                     rttMs = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L),
                     timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis()
                 )
-                sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK")
                 logPacket(
                     direction = "RX <- YGG",
                     summary = "Принят пакет от «${incoming.senderNodeLabel}» через оверлей Yggdrasil (интернет)",
@@ -1143,6 +1142,9 @@ class YggTwinP2PBridge(
                 )
                 onProfileRelayPacketHandled(profileId, "RX_OVERLAY")
                 onPacketReceived(incoming)
+                // Only after the message is in the local database: an ACK sent earlier tells
+                // the sender «Доставлено» for a packet this device may still lose on insert.
+                sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK")
             }
             "ACK" -> {
                 if (map["attachmentChunkAck"] == "1") {
@@ -1557,8 +1559,6 @@ class YggTwinP2PBridge(
                             "sentAt" to sentAt.toString()
                         )
                     )
-                    writer.println(ackFrame)
-
                     val viaInfo = if (routedViaPeer.isNotBlank()) {
                         "через внешний пир Yggdrasil $routedViaPeer ($routedViaRegion, RTT $rtt мс)"
                     } else {
@@ -1567,6 +1567,7 @@ class YggTwinP2PBridge(
                     if (alreadySeen) {
                         // The sender retried because the ACK was lost: confirm again,
                         // but do not show the message twice.
+                        writer.println(ackFrame)
                         logPacket(
                             direction = "RX <- YGG",
                             summary = "Дубликат пакета «${msgId.take(12)}» пропущен (ретрай отправителя)",
@@ -1579,6 +1580,8 @@ class YggTwinP2PBridge(
                             details = "Получатель: $targetIpv6 • AEAD: ${incoming.cipherPayloadHex.take(24)}... • Отправлен крипто-ACK"
                         )
                         onPacketReceived(incoming)
+                        // Ack only once the packet is persisted, as on the overlay path.
+                        writer.println(ackFrame)
                     }
                 }
                 "REACTION" -> {
