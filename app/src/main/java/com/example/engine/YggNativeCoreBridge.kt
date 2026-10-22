@@ -1,6 +1,8 @@
 // File: app/src/main/java/com/example/engine/YggNativeCoreBridge.kt
 package com.example.engine
 
+import org.json.JSONObject
+
 /**
  * JNI bridge to the real Yggdrasil Go core (`libygggram.so`).
  * Each active profile runs its own independent node; every call is keyed by
@@ -9,7 +11,6 @@ package com.example.engine
  * when the prebuilt `.so` is not packaged.
  */
 object YggNativeCoreBridge {
-    private const val OK_MARKER = "\"ok\":true"
 
     @Volatile
     var isNativeLibraryLoaded: Boolean = false
@@ -69,87 +70,45 @@ object YggNativeCoreBridge {
         } catch (t: Throwable) {
             return NativeCoreResult(false, "", "Нативное ядро упало: ${t.javaClass.simpleName}: ${t.message}")
         }
-        return if (raw.contains(OK_MARKER)) {
+        val parsed = try {
+            JSONObject(raw)
+        } catch (_: Exception) {
+            null
+        }
+        return if (parsed?.optBoolean("ok", false) == true) {
             NativeCoreResult(ok = true, rawJson = raw, error = "")
         } else {
-            NativeCoreResult(false, raw, extractJsonError(raw))
+            NativeCoreResult(
+                ok = false,
+                rawJson = raw,
+                error = parsed?.optString("error").orEmpty().ifBlank {
+                    "Нативное ядро вернуло ошибку без описания"
+                }
+            )
         }
     }
 
-    private fun extractJsonError(raw: String): String {
-        val marker = "\"error\":\""
-        val valueStart = raw.indexOf(marker)
-        if (valueStart < 0) return "Нативное ядро вернуло ошибку без описания"
-        val start = valueStart + marker.length
-        var i = start
-        while (i < raw.length) {
-            val c = raw[i]
-            if (c == '\\' && i + 1 < raw.length) {
-                i += 2
-                continue
-            }
-            if (c == '"') return raw.substring(start, i)
-            i++
-        }
-        return raw.substring(start).take(200)
+    private fun parsed(rawJson: String): JSONObject? = try {
+        JSONObject(rawJson)
+    } catch (_: Exception) {
+        null
     }
 
-    fun extractJsonField(rawJson: String, field: String): String {
-        val marker = "\"$field\":\""
-        val start = rawJson.indexOf(marker).takeIf { it >= 0 } ?: return ""
-        var i = start + marker.length
-        val sb = StringBuilder()
-        while (i < rawJson.length) {
-            val c = rawJson[i]
-            if (c == '\\' && i + 1 < rawJson.length) {
-                sb.append(rawJson[i + 1])
-                i += 2
-                continue
-            }
-            if (c == '"') break
-            sb.append(c)
-            i++
-        }
-        return sb.toString()
-    }
+    fun extractJsonField(rawJson: String, field: String): String =
+        parsed(rawJson)?.optString(field, "").orEmpty()
 
     /**
      * Reads a numeric field from the core's JSON answer. Returns [fallback] when the
      * field is missing or not a number.
      */
-    fun extractJsonInt(rawJson: String, field: String, fallback: Int = -1): Int {
-        val marker = "\"$field\":"
-        val start = rawJson.indexOf(marker).takeIf { it >= 0 } ?: return fallback
-        var i = start + marker.length
-        var value = 0
-        var digits = 0
-        var negative = false
-        if (i < rawJson.length && rawJson[i] == '-') {
-            negative = true
-            i++
-        }
-        while (i < rawJson.length && rawJson[i].isDigit()) {
-            value = value * 10 + (rawJson[i] - '0')
-            i++
-            digits++
-        }
-        if (digits == 0) return fallback
-        return if (negative) -value else value
-    }
+    fun extractJsonInt(rawJson: String, field: String, fallback: Int = -1): Int =
+        parsed(rawJson)?.optInt(field, fallback) ?: fallback
 
     /**
      * Reads a boolean field from the core's JSON answer.
      */
-    fun extractJsonBool(rawJson: String, field: String, fallback: Boolean = false): Boolean {
-        val marker = "\"$field\":"
-        val start = rawJson.indexOf(marker).takeIf { it >= 0 } ?: return fallback
-        val rest = rawJson.substring((start + marker.length).coerceAtMost(rawJson.length))
-        return when {
-            rest.startsWith("true") -> true
-            rest.startsWith("false") -> false
-            else -> fallback
-        }
-    }
+    fun extractJsonBool(rawJson: String, field: String, fallback: Boolean = false): Boolean =
+        parsed(rawJson)?.optBoolean(field, fallback) ?: fallback
 
     fun initCore(profileId: String, mnemonic: String, filesDir: String): NativeCoreResult =
         invoke { nativeInitCore(profileId, mnemonic, filesDir) }
@@ -258,44 +217,10 @@ object YggNativeCoreBridge {
         } catch (_: Throwable) {
             return emptyList()
         }
+        val entries = parsed(raw)?.optJSONArray("lines") ?: return emptyList()
         val lines = mutableListOf<String>()
-        var idx = raw.indexOf("\"lines\":[")
-        if (idx < 0) return emptyList()
-        idx += "\"lines\":[".length
-        var i = idx
-        val sb = StringBuilder()
-        var inString = false
-        while (i < raw.length) {
-            val c = raw[i]
-            if (inString) {
-                if (c == '\\') {
-                    val next = raw.getOrNull(i + 1) ?: break
-                    when (next) {
-                        'n' -> { lines.add(sb.toString()); sb.clear() }
-                        '"' -> sb.append('"')
-                        '\\' -> sb.append('\\')
-                        else -> sb.append(next)
-                    }
-                    i += 2
-                    continue
-                }
-                if (c == '"') {
-                    inString = false
-                    if (sb.isNotEmpty()) { lines.add(sb.toString()); sb.clear() }
-                    i++
-                    continue
-                }
-                sb.append(c)
-                i++
-                continue
-            }
-            if (c == '"') {
-                inString = true
-                i++
-                continue
-            }
-            if (c == ']') break
-            i++
+        for (i in 0 until entries.length()) {
+            entries.optString(i).lineSequence().filter { it.isNotBlank() }.forEach { lines.add(it) }
         }
         return lines.takeLast(maxLines)
     }

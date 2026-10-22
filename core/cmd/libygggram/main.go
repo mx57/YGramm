@@ -166,6 +166,17 @@ func engineJSON(ok bool, extra map[string]any) string {
 	return string(raw)
 }
 
+// A panic that escapes a cgo export aborts the whole Android process, so every JNI entry
+// point runs through this and turns a panic into a normal {"ok":false} envelope instead.
+func guardedCall(fn func() string) (out string) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = engineJSON(false, map[string]any{"error": fmt.Sprintf("native panic: %v", r)})
+		}
+	}()
+	return fn()
+}
+
 // Public peer links flap: the core re-dials a dropped link with an exponential
 // backoff that grows up to over an hour, which leaves the node without any
 // route for long stretches. The watchdog interrupts that backoff so a dropped
@@ -423,14 +434,14 @@ func YggGramGetPeersJSONImpl(profileID string) string {
 		})
 	}
 	raw, _ := json.Marshal(map[string]any{
-		"ok":          true,
-		"profileId":   profileID,
-		"peers":       peers,
-		"upCount":     upCount,
-		"total":       len(peers),
-		"knownNodes":  knownNodes,
+		"ok":           true,
+		"profileId":    profileID,
+		"peers":        peers,
+		"upCount":      upCount,
+		"total":        len(peers),
+		"knownNodes":   knownNodes,
 		"sessionCount": len(sessions),
-		"sessions":    sessions,
+		"sessions":     sessions,
 	})
 	return string(raw)
 }
@@ -652,14 +663,14 @@ func YggGramPollOverlayImpl(profileID string, timeoutMs int) string {
 //export Java_com_example_engine_YggNativeCoreBridge_nativeStopCore
 func Java_com_example_engine_YggNativeCoreBridge_nativeStopCore(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
-	result := YggGramStopCoreImpl(valueOrEmpty(profileId))
+	result := guardedCall(func() string { return YggGramStopCoreImpl(valueOrEmpty(profileId)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }
 
 //export Java_com_example_engine_YggNativeCoreBridge_nativeStopAllCores
 func Java_com_example_engine_YggNativeCoreBridge_nativeStopAllCores(env *C.JNIEnv, thiz C.jobject) C.jstring {
-	return C.jni_from_cstring(env, C.CString(YggGramStopAllImpl()))
+	return C.jni_from_cstring(env, C.CString(guardedCall(YggGramStopAllImpl)))
 }
 
 //export Java_com_example_engine_YggNativeCoreBridge_nativeInitCore
@@ -667,7 +678,9 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeInitCore(env *C.JNIEnv, t
 	profileId := C.jni_to_cstring(env, profileIdC)
 	mnemonic := C.jni_to_cstring(env, mnemonicC)
 	filesDir := C.jni_to_cstring(env, filesDirC)
-	result := YggGramInitCoreImpl(valueOrEmpty(profileId), valueOrEmpty(mnemonic), valueOrEmpty(filesDir))
+	result := guardedCall(func() string {
+		return YggGramInitCoreImpl(valueOrEmpty(profileId), valueOrEmpty(mnemonic), valueOrEmpty(filesDir))
+	})
 	C.free(unsafe.Pointer(profileId))
 	C.free(unsafe.Pointer(mnemonic))
 	C.free(unsafe.Pointer(filesDir))
@@ -679,7 +692,9 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeAddPeer(env *C.JNIEnv, th
 	profileId := C.jni_to_cstring(env, profileIdC)
 	peerUri := C.jni_to_cstring(env, peerUriC)
 	sintf := C.jni_to_cstring(env, sintfC)
-	result := YggGramAddPeerImpl(valueOrEmpty(profileId), valueOrEmpty(peerUri), valueOrEmpty(sintf))
+	result := guardedCall(func() string {
+		return YggGramAddPeerImpl(valueOrEmpty(profileId), valueOrEmpty(peerUri), valueOrEmpty(sintf))
+	})
 	C.free(unsafe.Pointer(profileId))
 	C.free(unsafe.Pointer(peerUri))
 	C.free(unsafe.Pointer(sintf))
@@ -691,7 +706,9 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeRemovePeer(env *C.JNIEnv,
 	profileId := C.jni_to_cstring(env, profileIdC)
 	peerUri := C.jni_to_cstring(env, peerUriC)
 	sintf := C.jni_to_cstring(env, sintfC)
-	result := YggGramRemovePeerImpl(valueOrEmpty(profileId), valueOrEmpty(peerUri), valueOrEmpty(sintf))
+	result := guardedCall(func() string {
+		return YggGramRemovePeerImpl(valueOrEmpty(profileId), valueOrEmpty(peerUri), valueOrEmpty(sintf))
+	})
 	C.free(unsafe.Pointer(profileId))
 	C.free(unsafe.Pointer(peerUri))
 	C.free(unsafe.Pointer(sintf))
@@ -701,7 +718,7 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeRemovePeer(env *C.JNIEnv,
 //export Java_com_example_engine_YggNativeCoreBridge_nativeGetPeersJson
 func Java_com_example_engine_YggNativeCoreBridge_nativeGetPeersJson(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
-	result := YggGramGetPeersJSONImpl(valueOrEmpty(profileId))
+	result := guardedCall(func() string { return YggGramGetPeersJSONImpl(valueOrEmpty(profileId)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }
@@ -711,7 +728,9 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeSendOverlay(env *C.JNIEnv
 	profileId := C.jni_to_cstring(env, profileIdC)
 	destKey := C.jni_to_cstring(env, destKeyC)
 	payload := C.jni_to_cstring(env, payloadC)
-	result := YggGramSendOverlayImpl(valueOrEmpty(profileId), valueOrEmpty(destKey), valueOrEmpty(payload))
+	result := guardedCall(func() string {
+		return YggGramSendOverlayImpl(valueOrEmpty(profileId), valueOrEmpty(destKey), valueOrEmpty(payload))
+	})
 	C.free(unsafe.Pointer(profileId))
 	C.free(unsafe.Pointer(destKey))
 	C.free(unsafe.Pointer(payload))
@@ -721,21 +740,21 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeSendOverlay(env *C.JNIEnv
 //export Java_com_example_engine_YggNativeCoreBridge_nativePollOverlay
 func Java_com_example_engine_YggNativeCoreBridge_nativePollOverlay(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring, timeoutMs C.jint) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
-	result := YggGramPollOverlayImpl(valueOrEmpty(profileId), int(timeoutMs))
+	result := guardedCall(func() string { return YggGramPollOverlayImpl(valueOrEmpty(profileId), int(timeoutMs)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }
 
 //export Java_com_example_engine_YggNativeCoreBridge_nativeGetLinkLog
 func Java_com_example_engine_YggNativeCoreBridge_nativeGetLinkLog(env *C.JNIEnv, thiz C.jobject) C.jstring {
-	result := YggGramGetLinkLogImpl()
+	result := guardedCall(func() string { return YggGramGetLinkLogImpl() })
 	return C.jni_from_cstring(env, C.CString(result))
 }
 
 //export Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers
 func Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
-	result := YggGramRetryPeersImpl(valueOrEmpty(profileId))
+	result := guardedCall(func() string { return YggGramRetryPeersImpl(valueOrEmpty(profileId)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }
@@ -743,7 +762,7 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers(env *C.JNIEnv,
 //export Java_com_example_engine_YggNativeCoreBridge_nativeProbeOverlay
 func Java_com_example_engine_YggNativeCoreBridge_nativeProbeOverlay(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring, timeoutMsC C.jint) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
-	result := YggGramOverlayProbeImpl(valueOrEmpty(profileId), int(timeoutMsC))
+	result := guardedCall(func() string { return YggGramOverlayProbeImpl(valueOrEmpty(profileId), int(timeoutMsC)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }
