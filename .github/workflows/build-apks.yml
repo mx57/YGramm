@@ -45,11 +45,19 @@ jobs:
           cd ..
           ls -la app/src/main/jniLibs/arm64-v8a/
 
-      - name: Decode debug.keystore from base64
+      - name: Create the debug signing keystore
         run: |
-          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          # app/build.gradle.kts pins the debug build to ${rootDir}/debug.keystore and that
+          # file is gitignored, so :app:validateSigningDebug fails on a fresh runner.
+          # A debug keystore is a throwaway build artifact, not a secret: generate it here
+          # instead of committing key material.
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -keystore debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
+          test -f debug.keystore
 
       - name: Run unit tests and build both variants
         run: |
