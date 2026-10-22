@@ -125,24 +125,13 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
       throw GradleException("Signed release APK not found at ${signedRelease.absolutePath}")
     }
 
-    // Remove all extra/legacy APKs from repository root and apk-releases
-    listOf(
-      File(root, "YggGram-main.apk"),
-      File(root, "YggGram-clone-node2.apk")
-    ).forEach { if (it.exists()) it.delete() }
-
-    val releaseDir = File(root, "apk-releases").apply { mkdirs() }
-    releaseDir.listFiles()?.forEach { file ->
-      if (file.name != "YggGram-arm64-v8a.apk") {
-        file.delete()
-      }
-    }
-
-    // libygggram.so is not tracked in git; a release built without the
-    // native core silently ships «НЕТ ЯДРА» to users. Fail the build instead.
+    // Validate before touching apk-releases/: the cleanup below deletes the published
+    // checksum, so a build that is about to be refused must not have run it first.
     ZipFile(signedRelease).use { zip ->
       val entries = zip.entries().asSequence().map { it.name }.toSet()
       if (!entries.contains("lib/arm64-v8a/libygggram.so")) {
+        // libygggram.so is not tracked in git; a release built without the
+        // native core silently ships «НЕТ ЯДРА» to users.
         throw GradleException(
           "Release APK is missing lib/arm64-v8a/libygggram.so. Rebuild the Go core first: " +
             "cd core && GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=\"\$NDK/toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android24-clang\" " +
@@ -157,6 +146,20 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
         )
       }
     }
+
+    // Remove all extra/legacy APKs from repository root and apk-releases
+    listOf(
+      File(root, "YggGram-main.apk"),
+      File(root, "YggGram-clone-node2.apk")
+    ).forEach { if (it.exists()) it.delete() }
+
+    val releaseDir = File(root, "apk-releases").apply { mkdirs() }
+    releaseDir.listFiles()?.forEach { file ->
+      if (file.name != "YggGram-arm64-v8a.apk") {
+        file.delete()
+      }
+    }
+
     val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
     signedRelease.copyTo(targetFile, overwrite = true)
     println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
