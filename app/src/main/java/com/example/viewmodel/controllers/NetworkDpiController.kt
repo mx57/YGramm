@@ -149,8 +149,15 @@ class NetworkDpiController(
                 timeoutMs = 3000
             )
             if (probe.reachable) {
+                // One rotating spare, never a growing pile: every peer the node cannot
+                // shake hands with keeps its own dial loop, and a long list of dead ones
+                // is what left the node reporting 0 links out of 24.
+                val previousUri = repository.getAllPeersNow()
+                    .firstOrNull { it.peerId == WATCHDOG_PEER_ID }
+                    ?.endpointUri
+                    ?.trim()
                 repository.addOrUpdatePeer(
-                    peerId = "peer_watchdog_${candidate.id}",
+                    peerId = WATCHDOG_PEER_ID,
                     endpointUri = candidate.endpointUri,
                     transportType = candidate.transportType,
                     sniDomain = candidate.sniDomain,
@@ -160,6 +167,9 @@ class NetworkDpiController(
                     isConnected = true,
                     whitelistCompatible = candidate.whitelistCompatible
                 )
+                if (previousUri != null && previousUri != candidate.endpointUri) {
+                    networkEngine.applyPeerChangeToCores(previousUri, enabled = false)
+                }
                 // A reachable port is not a Yggdrasil link: hand the peer to the live node
                 // and only report recovery once the node accepted it.
                 val core = networkEngine.applyPeerChangeToCores(candidate.endpointUri, enabled = true)
@@ -175,6 +185,10 @@ class NetworkDpiController(
                 }
             }
         }
+    }
+
+    private companion object {
+        const val WATCHDOG_PEER_ID = "peer_watchdog_active"
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {

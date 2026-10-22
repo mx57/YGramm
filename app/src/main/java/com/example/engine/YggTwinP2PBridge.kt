@@ -141,6 +141,8 @@ data class YggLivePacketLogEntry(
 
 data class PeerProbeResult(
     val endpointUri: String,
+    // True only when the endpoint answered the handshake it was asked to answer —
+    // an open port that never replies cannot carry a Yggdrasil link.
     val reachable: Boolean,
     val rttMs: Int,
     val protocolUsed: String,
@@ -399,7 +401,10 @@ class YggTwinP2PBridge(
      * Synchronizes background TCP listeners for all user profiles that have `isActiveInBackground = true`.
      * Allows 2 or more profiles to run simultaneously in the background and communicate over real TCP sockets!
      */
-    fun syncConcurrentProfileListeners(profiles: List<UserProfileEntity>) {
+    fun syncConcurrentProfileListeners(
+        profiles: List<UserProfileEntity>,
+        persistedPeerUris: List<String> = emptyList()
+    ) {
         scope.launch {
             ipv6ToProfileIdMap.clear()
             profileRelayRoleMap.clear()
@@ -507,7 +512,11 @@ class YggTwinP2PBridge(
             // One real Yggdrasil node per profile — inter-profile traffic must
             // traverse the internet overlay, so every profile's node stays up
             // even while another profile is in the foreground.
-            val defaultPeerUris = YggPeerScannerCatalog.initialCatalog.map { it.endpointUri }
+            // Stored peers outrank catalog guesses: a node dialled only from the
+            // hardcoded list ignored the verified peers in the database and came up
+            // with zero live links. The catalog stays as the first-run fallback.
+            val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
+                .ifEmpty { YggPeerScannerCatalog.initialCatalog.map { it.endpointUri } }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
                 synchronized(nativeCoreStartLock) {
@@ -1930,6 +1939,10 @@ class YggTwinP2PBridge(
         val startNs = System.nanoTime()
         var txCount = 0L
         var rxCount = 0L
+        // Only a node that answers the Yggdrasil handshake can carry traffic. An open port
+        // cannot, and a peer added on that promise sits down in the dial list forever.
+        var answered = false
+        var handshakeFailure: String? = null
         try {
             Socket().use { rawSocket ->
                 rawSocket.soTimeout = timeoutMs
@@ -1956,10 +1969,14 @@ class YggTwinP2PBridge(
                         } catch (_: Throwable) {
                             0
                         }
-                        if (readLen > 0) rxCount += readLen
-                    } catch (_: javax.net.ssl.SSLHandshakeException) {
+                        if (readLen > 0) {
+                            rxCount += readLen
+                            answered = true
+                        }
+                    } catch (e: Throwable) {
                         // The TCP socket connected but TLS was refused: report the zero bytes that
                         // actually crossed the wire instead of inventing a handshake transcript.
+                        handshakeFailure = e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "")
                     }
                 } else if (isLocalConcurrentProfile) {
                     val ping = encodeWireFrame(mapOf("type" to "PING", "sentAt" to System.currentTimeMillis().toString()))
@@ -1968,7 +1985,10 @@ class YggTwinP2PBridge(
                     writer.println(ping)
                     txCount += ping.toByteArray(StandardCharsets.UTF_8).size
                     val pong = reader.readLine()
-                    if (pong != null) rxCount += pong.toByteArray(StandardCharsets.UTF_8).size
+                    if (pong != null) {
+                        rxCount += pong.toByteArray(StandardCharsets.UTF_8).size
+                        answered = true
+                    }
                 } else {
                     val metaBytes = buildYggdrasilMetaHandshakeBytes("")
                     rawSocket.outputStream.write(metaBytes)
@@ -1980,17 +2000,23 @@ class YggTwinP2PBridge(
                     } catch (_: Throwable) {
                         0
                     }
-                    if (readLen > 0) rxCount += readLen
+                    if (readLen > 0) {
+                        rxCount += readLen
+                        answered = true
+                    }
                 }
             }
             val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+            val silence = if (answered) null else
+                "Порт открыт, но ответа на handshake Yggdrasil нет за ${timeoutMs} мс — это не узел Yggdrasil"
             PeerProbeResult(
                 endpointUri = endpointUri,
-                reachable = true,
+                reachable = answered && handshakeFailure == null,
                 rttMs = elapsedMs,
                 protocolUsed = if (isTls) "TLS" else "TCP",
                 rxBytes = rxCount,
-                txBytes = txCount
+                txBytes = txCount,
+                errorDetail = handshakeFailure ?: silence
             )
         } catch (e: Throwable) {
             PeerProbeResult(

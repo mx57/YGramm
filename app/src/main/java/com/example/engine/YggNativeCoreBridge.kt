@@ -41,7 +41,12 @@ object YggNativeCoreBridge {
         val totalLinks: Int = 0,
         val knownNodes: Int = 0,
         val sessionCount: Int = 0,
-        val restartCount: Int = 0
+        val restartCount: Int = 0,
+        // Endpoint (query stripped, lowercased) -> link latency in ms for the links
+        // the core itself reports up. The TCP scanner cannot know this: a node can
+        // refuse a plain handshake while the Yggdrasil link over the same endpoint
+        // carries traffic, and the scanner used to grey out exactly those peers.
+        val upPeers: Map<String, Int> = emptyMap()
     )
 
     private external fun nativeInitCore(profileId: String, mnemonic: String, filesDir: String): String?
@@ -139,13 +144,38 @@ object YggNativeCoreBridge {
         val result = getPeersJson(profileId)
         if (!result.ok) return CoreMeshState(available = false)
         val raw = result.rawJson
+        val upPeers = readCoreUpPeers(raw)
         return CoreMeshState(
             available = true,
             liveLinks = extractJsonInt(raw, "upCount", 0),
             totalLinks = extractJsonInt(raw, "total", 0),
             knownNodes = extractJsonInt(raw, "knownNodes", 0),
-            sessionCount = extractJsonInt(raw, "sessionCount", 0)
+            sessionCount = extractJsonInt(raw, "sessionCount", 0),
+            upPeers = upPeers
         )
+    }
+
+    /**
+     * Per-link state straight from the core's dial table. The URI the core reports
+     * carries the `maxbackoff` query it appended, so it is stripped here to match the
+     * endpoint exactly as the database stores it.
+     */
+    internal fun readCoreUpPeers(rawJson: String): Map<String, Int> {
+        val peers = try {
+            JSONObject(rawJson).optJSONArray("peers")
+        } catch (_: Exception) {
+            null
+        } ?: return emptyMap()
+        val result = HashMap<String, Int>(peers.length())
+        for (i in 0 until peers.length()) {
+            val peer = peers.optJSONObject(i) ?: continue
+            if (!peer.optBoolean("Up", false)) continue
+            val endpoint = peer.optString("URI").substringBefore("?").trim().lowercase()
+            if (endpoint.isNotBlank()) {
+                result[endpoint] = (peer.optLong("Latency", 0L) / 1_000_000L).toInt()
+            }
+        }
+        return result
     }
 
     /**

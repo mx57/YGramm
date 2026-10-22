@@ -706,7 +706,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             applyUserProfileEntityToState(primaryProfile)
             networkEngine.start()
             val allProfs = repository.getAllProfilesNow()
-            networkEngine.syncConcurrentProfileListeners(allProfs)
+            networkEngine.syncConcurrentProfileListeners(allProfs, storedPeerUrisForBoot())
             startNetworkAndAirplaneObserver()
             syncForegroundServiceNotification()
             refreshRealPeerConnectivity()
@@ -745,6 +745,33 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
         _uiState.update {
             it.copy(coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)))
+        }
+        applyCoreLinkStatusToPeers(state)
+    }
+
+    /**
+     * The core decides which peer rows are live. The TCP/TLS scanner only guesses from
+     * a handshake it is allowed to speak, and a node that refuses that guess can still
+     * hold a working Yggdrasil link over the same endpoint — the greyed-out cards next
+     * to growing RX/TX counters were that contradiction on screen.
+     */
+    private suspend fun applyCoreLinkStatusToPeers(state: YggNativeCoreBridge.CoreMeshState) {
+        if (!state.available) return
+        repository.getAllPeersNow().forEach { peer ->
+            val coreLatency = state.upPeers[peer.endpointUri.substringBefore("?").trim().lowercase()]
+            // The core only measures latency once a session round trip happened, so a
+            // live link without a number keeps the last real measurement of the same port.
+            val target = when {
+                coreLatency != null -> true to if (coreLatency > 0) coreLatency else peer.latencyMs
+                else -> false to -1
+            }
+            if (peer.isConnected != target.first || peer.latencyMs != target.second) {
+                repository.updatePeerProbeStatus(
+                    peerId = peer.peerId,
+                    reachable = target.first,
+                    latencyMs = target.second
+                )
+            }
         }
     }
 
@@ -1124,7 +1151,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 nodeRelayRole = nodeRelayRole
             )
             val allProfs = repository.getAllProfilesNow()
-            networkEngine.syncConcurrentProfileListeners(allProfs)
+            networkEngine.syncConcurrentProfileListeners(allProfs, storedPeerUrisForBoot())
 
             if (switchImmediately) {
                 applyUserProfileEntityToState(created)
@@ -1448,6 +1475,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
+     * Peers the nodes dial at boot. Connected ones come first because the core caps
+     * the dial list — a stored peer that answered the last scan must not be pushed
+     * out by catalog entries that were never verified.
+     */
+    private suspend fun storedPeerUrisForBoot(): List<String> =
+        repository.getAllPeersNow()
+            .sortedByDescending { it.isConnected }
+            .map { it.endpointUri }
+
+    /**
      * Probes all configured peers in the routing table using real TCP/TLS sockets.
      * In Airplane Mode or when offline, immediately marks all peers disconnected (-1 ms).
      */
@@ -1506,8 +1543,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     "TCP/TLS-сканер: ни один из ${results.size} пиров не ответил на рукопожатие"
                 }
                 state.copy(
-                    rxPacketsCount = state.rxPacketsCount + aliveCount,
-                    txPacketsCount = state.txPacketsCount + results.size,
                     coreMesh = coreMesh,
                     antiDpiConfig = state.antiDpiConfig.copy(
                         isProbingRoutes = false,
