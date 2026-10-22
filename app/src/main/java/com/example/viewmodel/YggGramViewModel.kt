@@ -149,14 +149,13 @@ data class DecentralizedUserProfile(
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
     val relayedPacketsCount: Int = 0,
-    val profileSignatureHex: String = "ed25519_sig:9f41a08c273b6501e849201c73d6a9021f384e55b601a29c"
+    val profileFingerprintHex: String = ""
 )
 
 data class PrivacyMatrixState(
     val sealedSenderGlobal: Boolean = true,
     val stripNetworkMetadata: Boolean = true,
     val blockScreenshots: Boolean = true,
-    val autoRotatePreKeysHours: Int = 24,
     val defaultDisappearingSeconds: Int = 0,
     val hashcashDifficultyBits: Int = 10,
     val allowDirectLanDiscovery: Boolean = false,
@@ -635,16 +634,39 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
 
         _uiState.update { state ->
+            val p = state.privacyMatrix
             state.copy(
-                privacyMatrix = state.privacyMatrix.copy(
+                privacyMatrix = p.copy(
                     inAppNotificationsEnabled = uiPrefs.getBoolean("notif_in_app", true),
                     systemNotificationsEnabled = uiPrefs.getBoolean("notif_system", true),
                     suppressNotificationsForOpenChat = uiPrefs.getBoolean("notif_suppress_open_chat", true),
                     messageNotificationsEnabled = uiPrefs.getBoolean("notif_messages", true),
                     voiceNotificationsEnabled = uiPrefs.getBoolean("notif_voice", true),
-                    callNotificationsEnabled = uiPrefs.getBoolean("notif_calls", true)
+                    callNotificationsEnabled = uiPrefs.getBoolean("notif_calls", true),
+                    sealedSenderGlobal = uiPrefs.getBoolean("priv_sealed_sender", p.sealedSenderGlobal),
+                    stripNetworkMetadata = uiPrefs.getBoolean("priv_strip_metadata", p.stripNetworkMetadata),
+                    blockScreenshots = uiPrefs.getBoolean("priv_block_screenshots", p.blockScreenshots),
+                    defaultDisappearingSeconds = uiPrefs.getInt("priv_default_ttl_sec", p.defaultDisappearingSeconds),
+                    hashcashDifficultyBits = uiPrefs.getInt("priv_hashcash_bits", p.hashcashDifficultyBits),
+                    allowDirectLanDiscovery = uiPrefs.getBoolean("priv_allow_lan", p.allowDirectLanDiscovery),
+                    autoSyncOnMeshConnect = uiPrefs.getBoolean("priv_autosync_mesh", p.autoSyncOnMeshConnect),
+                    webDavEndpointUrl = uiPrefs.getString("priv_webdav_url", p.webDavEndpointUrl) ?: p.webDavEndpointUrl
                 )
             )
+        }
+        networkEngine.allowDirectLanRouting = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+        // The disappearing timer was stored but never enforced; messages now leave the database
+        // and the attachment files leave the disk once the chat TTL passes.
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                val purged = repository.purgeExpiredDisappearingMessages()
+                if (purged > 0) {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Автоудаление: удалено сообщений: $purged")
+                    }
+                }
+                delay(60_000L)
+            }
         }
         YggNodeForegroundService.onUserRequestedStop = {
             networkEngine.stop()
@@ -743,7 +765,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     isActiveInBackground = profileEntity.isActiveInBackground,
                     nodeRelayRole = profileEntity.nodeRelayRole,
                     relayedPacketsCount = profileEntity.relayedPacketsCount,
-                    profileSignatureHex = "ed25519_sig:${sigHash.take(44)}"
+                    profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
                 )
             )
         }
@@ -1669,12 +1691,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val queued = repository.getQueuedMessages()
             var deliveredCount = 0
             var confirmedCount = 0
+            var unreadableAttachments = 0
             val currentIdentity = _uiState.value.identity
             val candidateExternalPeers = buildCandidateExternalPeersList()
 
             for (msg in queued) {
                 val conv = repository.getConversation(msg.chatId) ?: continue
-                val attachmentBase64 = if (msg.attachmentType != null || msg.attachmentName != null) {
+                val wantsAttachment = msg.attachmentType != null || msg.attachmentName != null
+                val attachmentBase64 = if (wantsAttachment) {
                     YggAudioMediaEngine.prepareAttachmentForP2P(
                         context = app,
                         attachmentName = msg.attachmentName,
@@ -1685,6 +1709,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     ).second.takeIf { it.isNotBlank() }
                 } else {
                     null
+                }
+                if (wantsAttachment && attachmentBase64 == null) {
+                    // Dispatching without the payload would mark the note delivered while the peer
+                    // receives an empty attachment, so the message stays in the queue.
+                    unreadableAttachments++
+                    continue
                 }
                 if (isConversationSelfNode(conv, currentIdentity)) {
                     // A node cannot address itself inside the 0200::/7 overlay, so a message
@@ -1742,6 +1772,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             if (queued.isNotEmpty()) {
+                val attachmentNote = if (unreadableAttachments > 0) {
+                    " • вложений без читаемого файла: $unreadableAttachments, они остались в очереди"
+                } else ""
                 _uiState.update {
                     it.copy(
                         statusBannerMessage = when {
@@ -1751,7 +1784,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                                 "Отправлено $deliveredCount из ${queued.size}, ACK пока не получен — нажмите «Повторить» в чате"
                             else ->
                                 "Сообщения (${queued.size} шт.) остаются в очереди S&F: подтвержденного маршрута нет"
-                        }
+                        } + attachmentNote
                     )
                 }
             }
@@ -1905,11 +1938,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
                 resolvedLocalUri = localSavedUri
                 attachmentBase64 = encodedB64.takeIf { it.isNotBlank() }
+                if (attachmentBase64 == null) {
+                    _uiState.update {
+                        it.copy(statusBannerMessage = "Вложение не отправлено: файл не читается. Выберите его заново.")
+                    }
+                    return@launch
+                }
                 if (resolvedSizeBytes <= 0L && !localSavedUri.isNullOrBlank()) {
                     try {
                         val path = android.net.Uri.parse(localSavedUri).path
                         if (!path.isNullOrBlank()) {
-                            resolvedSizeBytes = java.io.File(path).length().coerceAtLeast(1024L)
+                            resolvedSizeBytes = java.io.File(path).length()
                         }
                     } catch (_: Throwable) {
                     }
@@ -2058,18 +2097,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         recordedFileSizeBytes: Long = 0L
     ) {
         val safeDur = durationSeconds.coerceAtLeast(1)
-        val estimatedBytes = if (recordedFileSizeBytes > 0L) {
-            recordedFileSizeBytes
-        } else {
-            (safeDur * 32_000L).coerceAtLeast(16_384L)
-        }
+        // A guessed "duration x 32 kbps" size used to be shown for notes whose file was never
+        // measured; sendMessage now re-reads the real length from the saved file.
         val fileName = recordedFileUri?.substringAfterLast("/")?.takeIf { it.isNotBlank() }
             ?: "voice_${System.currentTimeMillis() % 100000}.wav"
         sendMessage(
             chatId = chatId,
             plainText = "Голосовое сообщение PCM/Opus AEAD (${safeDur} сек)",
             attachmentName = fileName,
-            attachmentSizeBytes = estimatedBytes,
+            attachmentSizeBytes = recordedFileSizeBytes,
             attachmentType = "VOICE",
             attachmentUri = recordedFileUri,
             voiceDurationSec = safeDur,
@@ -2094,7 +2130,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             chatId = chatId,
             plainText = defaultCaption,
             attachmentName = fileName,
-            attachmentSizeBytes = fileSizeBytes.coerceAtLeast(1024L),
+            attachmentSizeBytes = fileSizeBytes,
             attachmentType = attachmentType,
             attachmentUri = attachmentUri
         )
@@ -3228,7 +3264,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 return@launch
             }
 
-            val attachmentBase64 = if (message.attachmentType != null || message.attachmentName != null) {
+            val wantsAttachment = message.attachmentType != null || message.attachmentName != null
+            val attachmentBase64 = if (wantsAttachment) {
                 YggAudioMediaEngine.prepareAttachmentForP2P(
                     context = app,
                     attachmentName = message.attachmentName,
@@ -3239,6 +3276,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 ).second.takeIf { it.isNotBlank() }
             } else {
                 null
+            }
+            if (wantsAttachment && attachmentBase64 == null) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Повтор не отправлен: файл вложения не читается. Прикрепите его заново.")
+                }
+                return@launch
             }
 
             val candidatePeers = buildCandidateExternalPeersList()
@@ -3849,13 +3892,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             handle = handle.trim().ifBlank { it.userProfile.handle },
                             bio = bio.trim(),
                             statusText = statusText.trim(),
-                            profileSignatureHex = "ed25519_sig:${sigHash.take(44)}"
+                            profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
                         )
                     )
                 }
             }
             _uiState.update {
-                it.copy(statusBannerMessage = "Децентрализованный профиль подписан ключом Ed25519 и сохранен")
+                it.copy(statusBannerMessage = "Профиль сохранён • отпечаток вычислен по ключу узла")
             }
         }
     }
@@ -3898,6 +3941,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             )
         }
+        val p = _uiState.value.privacyMatrix
+        uiPrefs.edit()
+            .putBoolean("priv_sealed_sender", p.sealedSenderGlobal)
+            .putBoolean("priv_strip_metadata", p.stripNetworkMetadata)
+            .putBoolean("priv_block_screenshots", p.blockScreenshots)
+            .putBoolean("priv_allow_lan", p.allowDirectLanDiscovery)
+            .putBoolean("priv_autosync_mesh", p.autoSyncOnMeshConnect)
+            .putInt("priv_default_ttl_sec", p.defaultDisappearingSeconds)
+            .putInt("priv_hashcash_bits", p.hashcashDifficultyBits)
+            .putString("priv_webdav_url", p.webDavEndpointUrl)
+            .apply()
     }
 
     fun dismissBanner() {

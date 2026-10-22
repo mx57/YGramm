@@ -110,8 +110,18 @@ class MainActivity : ComponentActivity() {
 
     private val incomingNotificationIntent = MutableStateFlow<Intent?>(null)
 
+    // FLAG_SECURE must be set when the window is created, so it is read straight from the
+    // persisted privacy matrix; it is re-applied whenever the switch changes.
+    fun applyScreenshotBlock() {
+        val block = getSharedPreferences("ygggram_ui_prefs", android.content.Context.MODE_PRIVATE)
+            .getBoolean("priv_block_screenshots", true)
+        val flag = android.view.WindowManager.LayoutParams.FLAG_SECURE
+        if (block) window.addFlags(flag) else window.clearFlags(flag)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyScreenshotBlock()
         incomingNotificationIntent.value = intent
         enableEdgeToEdge()
         setContent {
@@ -229,6 +239,10 @@ fun YggGramRootApp(
                 )
             }
         }
+    }
+
+    LaunchedEffect(uiState.privacyMatrix.blockScreenshots) {
+        (context.findHostActivity() as? MainActivity)?.applyScreenshotBlock()
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current

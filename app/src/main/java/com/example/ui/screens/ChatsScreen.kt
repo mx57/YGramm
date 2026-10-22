@@ -425,8 +425,8 @@ fun ChatsScreen(
                 qrModalInitialTab = 1
                 showQrModal = true
             },
-            onConfirm = { title, ipv6, ttl ->
-                onCreateNewChat(title, ipv6, ttl)
+            onConfirm = { title, ipv6 ->
+                onCreateNewChat(title, ipv6, uiState.privacyMatrix.defaultDisappearingSeconds)
                 showNewChatDialog = false
             }
         )
@@ -2404,7 +2404,7 @@ private fun NewChatDialog(
     myIpv6Address: String,
     onDismiss: () -> Unit,
     onOpenQrScanner: () -> Unit,
-    onConfirm: (String, String, Int) -> Unit
+    onConfirm: (String, String) -> Unit
 ) {
     var title by rememberSaveable { mutableStateOf("") }
     var ipv6Input by rememberSaveable { mutableStateOf("") }
@@ -2490,7 +2490,7 @@ private fun NewChatDialog(
                         } else {
                             ipv6Input.trim()
                         }
-                        onConfirm(title.ifBlank { "Контакт Yggdrasil" }, combined, 0)
+                        onConfirm(title.ifBlank { "Контакт Yggdrasil" }, combined)
                     }
                 },
                 modifier = Modifier.testTag("confirm_new_chat_button")

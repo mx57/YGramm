@@ -2,11 +2,13 @@
 package com.example.data
 
 import android.content.Context
+import android.net.Uri
 import android.util.Log
 import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggCryptoEngine
+import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
@@ -797,6 +799,45 @@ class YggRepository(
     }
 
     suspend fun getMessage(messageId: String): MessageEntity? = dao.getMessageById(messageId)
+
+    /**
+     * Enforces the per-chat disappearing timer: every message older than the chat's TTL is
+     * dropped from the database together with its local attachment file. Callers must run this
+     * on an IO dispatcher. Returns how many messages were removed.
+     */
+    suspend fun purgeExpiredDisappearingMessages(): Int {
+        val cutoffBase = System.currentTimeMillis()
+        var removed = 0
+        for (conv in dao.getAllConversationsNow()) {
+            val ttlSeconds = conv.disappearingTtlSeconds
+            if (ttlSeconds <= 0) continue
+            val expired = dao.getExpiredMessages(conv.chatId, cutoffBase - ttlSeconds * 1000L)
+            if (expired.isEmpty()) continue
+            expired.forEach { msg ->
+                val uri = msg.attachmentUri ?: return@forEach
+                // Only files this app wrote itself may be deleted; content:// rows belong to the provider.
+                if (uri.startsWith("file://")) {
+                    Uri.parse(uri).path?.let { File(it).delete() }
+                }
+            }
+            dao.deleteMessagesByIds(expired.map { it.messageId })
+            removed += expired.size
+            // The chat list keeps its own preview copy: without this the text of a
+            // disappeared message would stay visible in the conversation list forever.
+            val newest = dao.getNewestMessage(conv.chatId)
+            dao.upsertConversation(
+                conv.copy(
+                    lastMessagePreview = when {
+                        newest == null -> "Нет сообщений • Начните диалог"
+                        newest.plainText.isNotBlank() -> newest.plainText
+                        else -> "📎 ${newest.attachmentName ?: "Вложение"}"
+                    },
+                    lastTimestamp = newest?.timestamp ?: conv.lastTimestamp
+                )
+            )
+        }
+        return removed
+    }
 
     /**
      * Applies a reaction event received from a peer. The wire id may be this device's

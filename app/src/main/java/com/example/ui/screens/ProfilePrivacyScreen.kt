@@ -317,7 +317,9 @@ fun ProfilePrivacyScreen(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "P2P-порт: ${profile.allocatedTcpPort} • Подпись: ${profile.profileSignatureHex}",
+                                text = "P2P-порт: ${profile.allocatedTcpPort}" +
+                                    profile.profileFingerprintHex.takeIf { it.isNotBlank() }
+                                        ?.let { " • Отпечаток: ${it.removePrefix("sha256_fp:")}" }.orEmpty(),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,

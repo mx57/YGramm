@@ -24,3 +24,6 @@ debug.keystore
 !/YggGram-clone-node2.apk
 !/apk-releases/
 !/apk-releases/*.apk
+
+# Rebuilt by CI from core/ with Go+NDK; committing them would ship stale cores
+app/src/main/jniLibs/**/*.so
