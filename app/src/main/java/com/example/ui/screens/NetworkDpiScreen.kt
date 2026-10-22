@@ -1080,6 +1080,12 @@ fun NetworkDpiScreen(
                                 style = MaterialTheme.typography.titleMedium
                             )
 
+                            Text(
+                                text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
                             DpiSwitchRow(
                                 title = "Туннель WebSocket поверх CDN (wss:// Белый список)",
                                 subtitle = "Инкапсуляция фреймов Yggdrasil в HTTP/2 и WebSocket через разрешенные IP-диапазоны CDN",
@@ -1638,7 +1644,7 @@ private fun SimpleNetworkShieldContent(
 ) {
     val cfg = uiState.antiDpiConfig
     val isOnline = uiState.isNetworkAvailable && !uiState.isAirplaneModeOn
-    val isProtected = isOnline && liveRoutes > 0
+    val hasOverlayLink = isOnline && liveRoutes > 0
     val activePeer = peers.firstOrNull { it.isConnected }
     val bestLatency = peers.filter { it.isConnected && it.latencyMs > 0 }.minOfOrNull { it.latencyMs }
         ?: activePeer?.latencyMs?.takeIf { it > 0 } ?: -1
@@ -1660,7 +1666,7 @@ private fun SimpleNetworkShieldContent(
                 ),
                 border = androidx.compose.foundation.BorderStroke(
                     width = 1.5.dp,
-                    color = if (isProtected) EmeraldPrimary.copy(alpha = 0.5f)
+                    color = if (hasOverlayLink) EmeraldPrimary.copy(alpha = 0.5f)
                     else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.4f)
                     else CyberTealSecondary.copy(alpha = 0.4f)
                 )
@@ -1675,6 +1681,9 @@ private fun SimpleNetworkShieldContent(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Row(
+                            // Without weight the title column takes the whole row and the status
+                            // badge is measured out of the layout as soon as the text grows.
+                            modifier = Modifier.weight(1f),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
@@ -1683,16 +1692,16 @@ private fun SimpleNetworkShieldContent(
                                     .size(44.dp)
                                     .clip(CircleShape)
                                     .background(
-                                        if (isProtected) EmeraldPrimary.copy(alpha = 0.15f)
+                                        if (hasOverlayLink) EmeraldPrimary.copy(alpha = 0.15f)
                                         else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.15f)
                                         else CyberTealSecondary.copy(alpha = 0.15f)
                                     ),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = if (isProtected) Icons.Default.Shield else Icons.Default.Radar,
+                                    imageVector = if (hasOverlayLink) Icons.Default.Shield else Icons.Default.Radar,
                                     contentDescription = null,
-                                    tint = if (isProtected) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else CyberTealSecondary,
+                                    tint = if (hasOverlayLink) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else CyberTealSecondary,
                                     modifier = Modifier.size(26.dp)
                                 )
                             }
@@ -1704,29 +1713,32 @@ private fun SimpleNetworkShieldContent(
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    text = if (isProtected) "ТСПУ и цензура заблокированы"
+                                    // liveRoutes is a peer link count, not proof against DPI: the core
+                                    // dials a plain TLS link, so the shield must not claim censorship
+                                    // bypass it has no way to observe.
+                                    text = if (hasOverlayLink) "Линк к пиру есть • маскировки трафика нет"
                                     else if (!isOnline) "Сеть недоступна или Авиарежим"
                                     else "Поиск стабильного узла 0200::/7",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = if (isProtected) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = if (hasOverlayLink) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
 
                         // Status Badge
                         Surface(
-                            color = if (isProtected) EmeraldPrimary.copy(alpha = 0.2f)
+                            color = if (hasOverlayLink) EmeraldPrimary.copy(alpha = 0.2f)
                             else if (!isOnline) AmberShieldTertiary.copy(alpha = 0.2f)
                             else MaterialTheme.colorScheme.surfaceContainerHigh,
                             shape = RoundedCornerShape(12.dp)
                         ) {
                             Text(
-                                text = if (isProtected) "● ЗАЩИЩЕНО"
+                                text = if (hasOverlayLink) "● В ОВЕРЛЕЕ"
                                 else if (!isOnline) "ОФЛАЙН"
                                 else "ПОИСК",
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
-                                color = if (isProtected) EmeraldPrimary
+                                color = if (hasOverlayLink) EmeraldPrimary
                                 else if (!isOnline) AmberShieldTertiary
                                 else CyberTealSecondary,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -1773,13 +1785,16 @@ private fun SimpleNetworkShieldContent(
                         }
                         Column(horizontalAlignment = Alignment.End) {
                             Text(
-                                text = "МАСКИРОВКА",
+                                text = "ТРАНСПОРТ",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(3.dp))
                             Text(
-                                text = cfg.activePreset.badge,
+                                // The preset badge names a masking mode the core never applies; the
+                                // only transport fact worth showing is how the live link is dialled.
+                                text = activePeer?.endpointUri?.substringBefore("://")?.uppercase()
+                                    ?.takeIf { it.isNotBlank() } ?: "нет линка",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 color = CyberTealSecondary
@@ -1965,6 +1980,12 @@ private fun SimpleNetworkShieldContent(
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
+                    )
+
+                    Text(
+                        text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     DpiSwitchRow(
