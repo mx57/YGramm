@@ -338,6 +338,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private val networkEngine = YggTwinP2PBridge(
         context = application.applicationContext,
         onPacketReceived = { packet ->
+            // Joined before the bridge sends its delivery ACK, so «Доставлено» can only
+            // mean the row is already in this device's database.
             viewModelScope.launch {
                 val currentPrimaryId = _uiState.value.currentProfileId
                 val allProfs = repository.getAllProfilesNow()
@@ -411,7 +413,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     launch { flushReadReceipts(chatId) }
                 }
                 syncForegroundServiceNotification()
-            }
+            }.join()
         },
         onDeliveryAckReceived = { chatId, messageId, rttMs ->
             viewModelScope.launch {
@@ -427,6 +429,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     it.copy(
                         rxPacketsCount = it.rxPacketsCount + 1,
                         statusBannerMessage = "Получатель подтвердил доставку ACK (${rttMs} мс)"
+                    )
+                }
+            }
+        },
+        onDeliveryAckTimeout = { chatId, messageId, attempts ->
+            viewModelScope.launch {
+                // Only a message that was claiming «Ожидает доставки» loses that claim:
+                // one rejected up-front for having no route keeps its sharper reason.
+                if (repository.requeueUnacknowledged(messageId) && chatId.isNotBlank()) {
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = true,
+                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток), автоповтор каждые 45 с"
                     )
                 }
             }

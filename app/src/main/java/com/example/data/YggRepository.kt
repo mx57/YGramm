@@ -935,6 +935,15 @@ class YggRepository(
         }
     }
 
+    /**
+     * A frame handed to the overlay is not delivery. Without an ACK the message goes back
+     * to the store-and-forward queue instead of freezing at «Ожидает доставки» until the
+     * user taps «Повторить»; the receiver dedupes by wire message id, so the resend is safe.
+     * False means the message was never awaiting an ACK, so its own reason stays on screen.
+     */
+    suspend fun requeueUnacknowledged(messageId: String): Boolean =
+        messageId.isNotBlank() && dao.requeueIfAwaitingAck(messageId) > 0
+
     suspend fun getUnreadIncomingWireIds(chatId: String): List<String> =
         if (chatId.isBlank()) emptyList() else dao.getUnreadIncomingPeerIds(chatId)
 

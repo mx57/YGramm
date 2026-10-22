@@ -117,6 +117,11 @@ interface YggDao {
     @Query("UPDATE messages SET deliveryState = :newState WHERE messageId = :messageId")
     suspend fun updateMessageDeliveryState(messageId: String, newState: String)
 
+    // Rows touched is what tells the caller whether this message was actually claiming
+    // «Ожидает доставки»: a send rejected for having no route must keep that reason.
+    @Query("UPDATE messages SET deliveryState = 'QUEUED_OFFLINE_SF' WHERE messageId = :messageId AND deliveryState = 'SENT_P2P'")
+    suspend fun requeueIfAwaitingAck(messageId: String): Int
+
     @Query("SELECT * FROM messages WHERE chatId = :chatId AND timestamp < :beforeTimestamp")
     suspend fun getExpiredMessages(chatId: String, beforeTimestamp: Long): List<MessageEntity>
 

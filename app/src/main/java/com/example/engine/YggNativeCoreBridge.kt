@@ -51,6 +51,7 @@ object YggNativeCoreBridge {
     private external fun nativeRemovePeer(profileId: String, peerUri: String, sinInterface: String): String?
     private external fun nativeGetPeersJson(profileId: String): String?
     private external fun nativeSendOverlay(profileId: String, destPubKeyHex: String, payloadBase64: String): String?
+    private external fun nativeOverlayRoute(profileId: String, destPubKeyHex: String): String?
     private external fun nativePollOverlay(profileId: String, timeoutMs: Int): String?
     private external fun nativeGetLinkLog(): String?
     private external fun nativeRetryPeers(profileId: String): String?
@@ -197,6 +198,18 @@ object YggNativeCoreBridge {
                 android.util.Base64.encodeToString(payload, android.util.Base64.NO_WRAP)
             )
         }
+
+    /**
+     * Whether the profile's node has learned an overlay route to [destNodePubKeyHex].
+     * A successful [sendOverlay] alone proves nothing: ironwood only forwards a frame
+     * when its pathfinder has a path entry, otherwise it starts a route lookup and drops
+     * the packet if nobody answers. null when the core could not be queried.
+     */
+    fun hasOverlayRoute(profileId: String, destNodePubKeyHex: String): Boolean? {
+        val result = invoke { nativeOverlayRoute(profileId, destNodePubKeyHex) }
+        if (!result.ok) return null
+        return extractJsonBool(result.rawJson, "hasPath")
+    }
 
     /**
      * Blocks up to [timeoutMs] waiting for one overlay datagram received by the

@@ -500,6 +500,50 @@ func YggGramSendOverlayImpl(profileID, destPubKeyHex, payloadBase64 string) stri
 	return engineJSON(true, map[string]any{"bytes": len(payload), "profileId": profileID})
 }
 
+// YggGramOverlayRouteImpl reports whether the node's pathfinder already knows a
+// route to destPubKeyHex.
+//
+// WriteTo is not proof of anything: ironwood hands the frame to the pathfinder,
+// which forwards it only when an entry exists in its paths table. Otherwise it
+// starts a route lookup and caches the packet as a rumour — and silently drops it
+// if nobody ever answers. So "hasPath" is the only honest way to tell a datagram
+// that is on its way from one that started a search.
+func YggGramOverlayRouteImpl(profileID, destPubKeyHex string) string {
+	engine := lookupEngine(profileID)
+	if engine == nil {
+		return `{"ok":false,"error":"yggdrasil core is not initialized"}`
+	}
+	engine.mu.RLock()
+	node := engine.yggCore
+	engine.mu.RUnlock()
+	if node == nil {
+		return `{"ok":false,"error":"yggdrasil core is not initialized"}`
+	}
+	dest, err := hex.DecodeString(destPubKeyHex)
+	if err != nil || len(dest) != 32 {
+		return `{"ok":false,"error":"recipient Ed25519 public key must be 64 hex chars"}`
+	}
+	destHex := hex.EncodeToString(dest)
+	paths := node.GetPaths()
+	// Mirror the pathfinder's own forwarding condition: it sends whenever an entry for
+	// dest exists. A directly peered node has an entry with an empty path, so keying on
+	// the hop count would call a live route "not found".
+	hasPath := false
+	hops := 0
+	for _, p := range paths {
+		if hex.EncodeToString(p.Key) == destHex {
+			hasPath = true
+			hops = len(p.Path)
+			break
+		}
+	}
+	return engineJSON(true, map[string]any{
+		"hasPath": hasPath,
+		"hops":    hops,
+		"paths":   len(paths),
+	})
+}
+
 // livePeerCount returns the number of public peer links that are currently up.
 func livePeerCount(node *core.Core) int {
 	up := 0
@@ -734,6 +778,18 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeSendOverlay(env *C.JNIEnv
 	C.free(unsafe.Pointer(profileId))
 	C.free(unsafe.Pointer(destKey))
 	C.free(unsafe.Pointer(payload))
+	return C.jni_from_cstring(env, C.CString(result))
+}
+
+//export Java_com_example_engine_YggNativeCoreBridge_nativeOverlayRoute
+func Java_com_example_engine_YggNativeCoreBridge_nativeOverlayRoute(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring, destKeyC C.jstring) C.jstring {
+	profileId := C.jni_to_cstring(env, profileIdC)
+	destKey := C.jni_to_cstring(env, destKeyC)
+	result := guardedCall(func() string {
+		return YggGramOverlayRouteImpl(valueOrEmpty(profileId), valueOrEmpty(destKey))
+	})
+	C.free(unsafe.Pointer(profileId))
+	C.free(unsafe.Pointer(destKey))
 	return C.jni_from_cstring(env, C.CString(result))
 }
 

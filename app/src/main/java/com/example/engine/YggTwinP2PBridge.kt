@@ -215,6 +215,7 @@ class YggTwinP2PBridge(
     private val context: Context? = null,
     private val onPacketReceived: suspend (IncomingTwinPacket) -> Unit,
     private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long) -> Unit,
+    private val onDeliveryAckTimeout: suspend (chatId: String, messageId: String, attempts: Int) -> Unit = { _, _, _ -> },
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
@@ -1135,7 +1136,6 @@ class YggTwinP2PBridge(
                     rttMs = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L),
                     timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis()
                 )
-                sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK")
                 logPacket(
                     direction = "RX <- YGG",
                     summary = "Принят пакет от «${incoming.senderNodeLabel}» через оверлей Yggdrasil (интернет)",
@@ -1143,6 +1143,9 @@ class YggTwinP2PBridge(
                 )
                 onProfileRelayPacketHandled(profileId, "RX_OVERLAY")
                 onPacketReceived(incoming)
+                // Only after the message is in the local database: an ACK sent earlier tells
+                // the sender «Доставлено» for a packet this device may still lose on insert.
+                sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK")
             }
             "ACK" -> {
                 if (map["attachmentChunkAck"] == "1") {
@@ -1557,8 +1560,6 @@ class YggTwinP2PBridge(
                             "sentAt" to sentAt.toString()
                         )
                     )
-                    writer.println(ackFrame)
-
                     val viaInfo = if (routedViaPeer.isNotBlank()) {
                         "через внешний пир Yggdrasil $routedViaPeer ($routedViaRegion, RTT $rtt мс)"
                     } else {
@@ -1567,6 +1568,7 @@ class YggTwinP2PBridge(
                     if (alreadySeen) {
                         // The sender retried because the ACK was lost: confirm again,
                         // but do not show the message twice.
+                        writer.println(ackFrame)
                         logPacket(
                             direction = "RX <- YGG",
                             summary = "Дубликат пакета «${msgId.take(12)}» пропущен (ретрай отправителя)",
@@ -1579,6 +1581,8 @@ class YggTwinP2PBridge(
                             details = "Получатель: $targetIpv6 • AEAD: ${incoming.cipherPayloadHex.take(24)}... • Отправлен крипто-ACK"
                         )
                         onPacketReceived(incoming)
+                        // Ack only once the packet is persisted, as on the overlay path.
+                        writer.println(ackFrame)
                     }
                 }
                 "REACTION" -> {
@@ -2503,15 +2507,41 @@ class YggTwinP2PBridge(
             if (!pendingAck.isCompleted) {
                 logPacket(
                     direction = "ERR • YGG",
-                    summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение ожидает подтверждения",
-                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • нажмите «Повторить» в чате"
+                    summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение возвращено в очередь",
+                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра переподключены, автоповтор через 45 с"
                 )
+                // A path entry outlives the links it was learned on: the frame is then
+                // forwarded into a dead path and vanishes with no error anywhere. Put the
+                // message back in the queue and interrupt the dial backoff, so the next
+                // drain runs over refreshed links instead of the same stale path.
+                YggNativeCoreBridge.retryPeers(senderProfileId)
+                onDeliveryAckTimeout(chatId, messageId, attempt)
             }
+        }
+
+        // WriteTo succeeding is not delivery: without a path entry the pathfinder only
+        // starts a rumour lookup and the frame is dropped if that lookup fails. Say so
+        // instead of promoting the message to «Ожидает доставки».
+        if (YggNativeCoreBridge.hasOverlayRoute(senderProfileId, recipientKeyHex) == false) {
+            logPacket(
+                direction = "ERR • YGG",
+                summary = "Маршрут к узлу «$peerTitle» в оверлее не найден",
+                details = "Пакет запущен в поиск маршрута • ACK не получен • messageId=${messageId.take(12)}"
+            )
+            return@withContext SelfYggdrasilRelayResult(
+                delivered = false,
+                relayEndpointUri = "",
+                relayRegionLabel = "",
+                rttMs = -1L,
+                txBytes = totalOutboundBytes,
+                rxBytes = 0L,
+                errorDetail = "Узел получателя не виден в оверлее: маршрута к его Ed25519-ключу нет, поиск маршрута ответа не дал"
+            )
         }
 
         logPacket(
             direction = "TX -> YGG",
-            summary = "Пакет принят оверлеем; ACK от «$peerTitle» еще не получен",
+            summary = "Пакет ушёл по найденному маршруту; ACK от «$peerTitle» еще не получен",
             details = "Статус: ожидается ACK • повторы идут в фоне"
         )
         return@withContext SelfYggdrasilRelayResult(
