@@ -23,8 +23,8 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 6
-    versionName = "1.5.0-arm64-v8a"
+    versionCode = 7
+    versionName = "1.6.0-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
@@ -43,11 +43,15 @@ android {
   // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      // CI has no upload key: without KEYSTORE_PATH the release build stays unsigned and
+      // the shippable APK is signed locally. The apk-releases/ entry in git is a signed build.
+      val keystorePath = System.getenv("KEYSTORE_PATH")
+      if (keystorePath != null) {
+        storeFile = file(keystorePath)
+        storePassword = System.getenv("STORE_PASSWORD")
+        keyAlias = "upload"
+        keyPassword = System.getenv("KEY_PASSWORD")
+      }
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
@@ -63,9 +67,12 @@ android {
       isMinifyEnabled = true
       isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("release")
+      // Do not remove this signingConfig assignment: it is necessary for Android apps in
+      // AI Studio. AGP refuses to package a release whose config has no storeFile, so it is
+      // only attached when KEYSTORE_PATH points at the upload key — CI builds unsigned.
+      if (System.getenv("KEYSTORE_PATH") != null) {
+        signingConfig = signingConfigs.getByName("release")
+      }
     }
     debug {
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
@@ -106,6 +113,18 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
   @TaskAction
   fun exportReleaseApk() {
     val root = File(rootDirPath.get())
+    val signedRelease = File(releaseApkPath.get())
+    if (!signedRelease.exists() || signedRelease.length() == 0L) {
+      // CI has no upload key, so AGP emits app-release-unsigned.apk there. An unsigned build
+      // must never reach apk-releases/, and the APK already committed stays untouched.
+      val unsigned = File(signedRelease.parentFile, "app-release-unsigned.apk")
+      if (unsigned.exists()) {
+        println("Release APK is unsigned (KEYSTORE_PATH not set): apk-releases/ left unchanged")
+        return
+      }
+      throw GradleException("Signed release APK not found at ${signedRelease.absolutePath}")
+    }
+
     // Remove all extra/legacy APKs from repository root and apk-releases
     listOf(
       File(root, "YggGram-main.apk"),
@@ -119,27 +138,28 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
       }
     }
 
-    val signedRelease = File(releaseApkPath.get())
-    if (signedRelease.exists() && signedRelease.length() > 0L) {
-      // libygggram.so is not tracked in git; a release built without the
-      // native core silently ships «НЕТ ЯДРА» to users. Fail the build instead.
-      ZipFile(signedRelease).use { zip ->
-        val hasCore = zip.entries().asSequence()
-          .any { it.name == "lib/arm64-v8a/libygggram.so" }
-        if (!hasCore) {
-          throw GradleException(
-            "Release APK is missing lib/arm64-v8a/libygggram.so. Rebuild the Go core first: " +
-              "cd core && GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=\"\$NDK/toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android24-clang\" " +
-              "go build -buildmode=c-shared -o ../app/src/main/jniLibs/arm64-v8a/libygggram.so ./cmd/libygggram"
-          )
-        }
+    // libygggram.so is not tracked in git; a release built without the
+    // native core silently ships «НЕТ ЯДРА» to users. Fail the build instead.
+    ZipFile(signedRelease).use { zip ->
+      val entries = zip.entries().asSequence().map { it.name }.toSet()
+      if (!entries.contains("lib/arm64-v8a/libygggram.so")) {
+        throw GradleException(
+          "Release APK is missing lib/arm64-v8a/libygggram.so. Rebuild the Go core first: " +
+            "cd core && GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=\"\$NDK/toolchains/llvm/prebuilt/<host>/bin/aarch64-linux-android24-clang\" " +
+            "go build -buildmode=c-shared -o ../app/src/main/jniLibs/arm64-v8a/libygggram.so ./cmd/libygggram"
+        )
       }
-      val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
-      signedRelease.copyTo(targetFile, overwrite = true)
-      println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
-    } else {
-      throw GradleException("Signed release APK not found at ${signedRelease.absolutePath}")
+      // The file is published under an arm64-v8a name: an -PemuX86 build would also carry
+      // x86_64 libs and would be mislabelled (and twice the size) on the download page.
+      if (entries.any { it.startsWith("lib/x86_64/") }) {
+        throw GradleException(
+          "Refusing to export an APK that contains x86_64 libs. Re-run assembleRelease without -PemuX86."
+        )
+      }
     }
+    val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
+    signedRelease.copyTo(targetFile, overwrite = true)
+    println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
   }
 }
 
