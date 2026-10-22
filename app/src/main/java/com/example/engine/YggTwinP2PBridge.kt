@@ -609,9 +609,12 @@ class YggTwinP2PBridge(
                 initializedNativeProfiles.remove(profileId)
                 return@launch
             }
+            // Go HMACs the raw string; Kotlin derives identity from words joined
+            // by single spaces. Normalize here so both sides always reach the same key.
+            val normalizedMnemonic = mnemonicCsv.split(" ").filter { it.isNotBlank() }.joinToString(" ")
             val initResult = YggNativeCoreBridge.initCore(
                 profileId,
-                mnemonicCsv.replace("\n", " ").trim(),
+                normalizedMnemonic,
                 filesDir
             )
             if (!initResult.ok) {
@@ -622,6 +625,25 @@ class YggTwinP2PBridge(
                     details = "profile=$profileId • ${initResult.error}"
                 )
                 return@launch
+            }
+            // The running node's real key/address are authoritative for routing; if the
+            // stored identity drifted (legacy mnemonic formatting), correct the maps so
+            // frames addressed to the live node are recognized.
+            val corePubKeyHex = YggNativeCoreBridge.extractJsonField(initResult.rawJson, "publicKeyHex").lowercase()
+            val coreIpv6 = YggNativeCoreBridge.extractJsonField(initResult.rawJson, "ipv6Address").lowercase()
+            if (corePubKeyHex.isNotBlank()) {
+                val advertisedKey = profileIdToPubKeyMap[profileId]
+                if (advertisedKey != null && !advertisedKey.equals(corePubKeyHex, ignoreCase = true)) {
+                    logPacket(
+                        direction = "SYS • CORE",
+                        summary = "Ключ ноды профиля исправлен по данным ядра",
+                        details = "profile=$profileId • ожидался ${advertisedKey.take(16)}…, ядро использует ${corePubKeyHex.take(16)}…"
+                    )
+                }
+                profileIdToPubKeyMap[profileId] = corePubKeyHex
+                if (coreIpv6.isNotBlank()) {
+                    ipv6ToProfileIdMap[coreIpv6] = profileId
+                }
             }
             var joinedPeers = 0
             val uniqueUris = peerUris.filter { it.isNotBlank() }.distinctBy { it.lowercase() }.take(16)

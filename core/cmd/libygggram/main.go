@@ -221,6 +221,9 @@ func YggGramInitCoreImpl(profileID, mnemonic, androidFilesDir string) string {
 		if node != nil {
 			node.Stop()
 		}
+		// Stop the old peer-link watchdog, otherwise it keeps calling
+		// RetryPeersNow on the stopped core after re-init.
+		close(existing.done)
 		delete(engines, profileID)
 	}
 
