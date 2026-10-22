@@ -215,6 +215,7 @@ class YggTwinP2PBridge(
     private val context: Context? = null,
     private val onPacketReceived: suspend (IncomingTwinPacket) -> Unit,
     private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long) -> Unit,
+    private val onDeliveryAckTimeout: suspend (chatId: String, messageId: String, attempts: Int) -> Unit = { _, _, _ -> },
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
@@ -2506,9 +2507,15 @@ class YggTwinP2PBridge(
             if (!pendingAck.isCompleted) {
                 logPacket(
                     direction = "ERR • YGG",
-                    summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение ожидает подтверждения",
-                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • нажмите «Повторить» в чате"
+                    summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение возвращено в очередь",
+                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра переподключены, автоповтор через 45 с"
                 )
+                // A path entry outlives the links it was learned on: the frame is then
+                // forwarded into a dead path and vanishes with no error anywhere. Put the
+                // message back in the queue and interrupt the dial backoff, so the next
+                // drain runs over refreshed links instead of the same stale path.
+                YggNativeCoreBridge.retryPeers(senderProfileId)
+                onDeliveryAckTimeout(chatId, messageId, attempt)
             }
         }
 

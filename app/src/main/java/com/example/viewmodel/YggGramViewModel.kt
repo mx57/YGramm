@@ -433,6 +433,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
+        onDeliveryAckTimeout = { chatId, messageId, attempts ->
+            viewModelScope.launch {
+                // Only a message that was claiming «Ожидает доставки» loses that claim:
+                // one rejected up-front for having no route keeps its sharper reason.
+                if (repository.requeueUnacknowledged(messageId) && chatId.isNotBlank()) {
+                    repository.updateConversationRouteStatus(
+                        chatId = chatId,
+                        isOnline = true,
+                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток), автоповтор каждые 45 с"
+                    )
+                }
+            }
+        },
         onTwinReachableChanged = { reachable ->
             _uiState.update { it.copy(isTwinAppReachable = reachable) }
         },
