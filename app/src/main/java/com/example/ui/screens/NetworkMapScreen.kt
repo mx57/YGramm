@@ -149,7 +149,7 @@ fun NetworkMapScreen(
             ipv6 = p.endpointUri,
             countryFlag = p.regionLabel.take(2),
             region = p.regionLabel,
-            type = if (p.whitelistCompatible) "RELAY" else "PEER",
+            type = if (p.isWhitelistCompatible) "RELAY" else "PEER",
             xRatio = x,
             yRatio = y,
             isConnected = p.isConnected,
@@ -167,8 +167,8 @@ fun NetworkMapScreen(
             type = "CONTACT",
             xRatio = 0.82f,
             yRatio = 0.20f + idx * 0.22f,
-            isConnected = c.isOnline,
-            rttMs = if (c.isOnline) 42 else -1
+            isConnected = c.isOnlineInMesh,
+            rttMs = if (c.isOnlineInMesh) 42 else -1
         )
     }
 
@@ -339,8 +339,9 @@ fun NetworkMapScreen(
                         color = MaterialTheme.colorScheme.secondaryContainer,
                         shape = RoundedCornerShape(8.dp)
                     ) {
+                        val livePeerRtt = peers.filter { it.isConnected && it.latencyMs > 0 }.minOfOrNull { it.latencyMs } ?: 35
                         Text(
-                            text = "Пиров: ${peers.count { it.isConnected }}/${peers.size} • RTT: ${uiState.coreMesh.meshRootRttMs.takeIf { it > 0 } ?: 35} мс",
+                            text = "Пиров: ${peers.count { it.isConnected }}/${peers.size} • RTT: $livePeerRtt мс",
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = CyberTealSecondary,
@@ -422,7 +423,7 @@ fun NetworkMapScreen(
                         Column {
                             Text("Узлов в дереве", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
-                                text = "${uiState.coreMesh.knownNodesCount.coerceAtLeast(14)} узлов",
+                                text = "${uiState.coreMesh.knownNodes.coerceAtLeast(14)} узлов",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
