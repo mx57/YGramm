@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.Cursor
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -377,7 +378,7 @@ fun VoiceMessagePlayerCard(
                         )
                     }
                     Text(
-                        text = "${(attachmentSizeBytes / 1024).coerceAtLeast(4)} КБ",
+                        text = formatAttachmentSize(attachmentSizeBytes),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -461,7 +462,7 @@ fun ImageMessagePreviewCard(
                     .padding(8.dp)
             ) {
                 Text(
-                    text = "${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Открыть",
+                    text = "${formatAttachmentSize(sizeBytes)} • Открыть",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White,
                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
@@ -499,7 +500,7 @@ fun ImageMessagePreviewCard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "Размер: ${(sizeBytes / 1024).coerceAtLeast(1)} КБ",
+                                text = "Размер: ${formatAttachmentSize(sizeBytes)}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = CyberTealSecondary
                             )
@@ -583,7 +584,7 @@ fun FileAttachmentBubbleCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "${(sizeBytes / 1024).coerceAtLeast(1)} КБ • Открыть",
+                    text = "${formatAttachmentSize(sizeBytes)} • Открыть",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -664,7 +665,7 @@ fun FileAttachmentBubbleCard(
                     }
 
                     Text(
-                        text = "Размер: $sizeBytes байт (${(sizeBytes / 1024).coerceAtLeast(1)} КБ)",
+                        text = "Размер: ${formatAttachmentSize(sizeBytes)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -834,6 +835,16 @@ fun VoiceRecordingComposerBar(
                         isSaving = true
                         scope.launch {
                             val recorded = YggAudioMediaEngine.finishAndSaveVoiceNote(context)
+                            if (recorded == null) {
+                                Toast.makeText(
+                                    context,
+                                    "Запись не отправлена: микрофон не передал ни одного сэмпла",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                // Keep isSaving true: the recorder is already finalised and a second
+                                // tap would re-enter finishAndSaveVoiceNote on a closed stream.
+                                return@launch
+                            }
                             onFinishAndSendVoice(
                                 recorded.durationSeconds.coerceAtLeast(1),
                                 recorded.waveformCsv,
@@ -1014,10 +1025,11 @@ fun RichAttachmentSheetDialog(
 
 /**
  * Resolves real file name and byte size from a content:// Uri returned by Photo Picker or OpenDocument.
+ * Size is 0 when the provider does not report it; the sender then measures the saved file.
  */
 fun resolveUriFileMetadata(context: Context, uri: Uri, defaultPrefix: String = "attachment"): Pair<String, Long> {
     var name = "${defaultPrefix}_${System.currentTimeMillis() % 10000}"
-    var size = 245_760L
+    var size = 0L
     try {
         val cursor: Cursor? = context.contentResolver.query(uri, null, null, null, null)
         cursor?.use { c ->
@@ -1028,7 +1040,7 @@ fun resolveUriFileMetadata(context: Context, uri: Uri, defaultPrefix: String = "
                     c.getString(nameIdx)?.takeIf { it.isNotBlank() }?.let { name = it }
                 }
                 if (sizeIdx >= 0 && !c.isNull(sizeIdx)) {
-                    size = c.getLong(sizeIdx).coerceAtLeast(1024L)
+                    size = c.getLong(sizeIdx)
                 }
             }
         }
@@ -1036,3 +1048,7 @@ fun resolveUriFileMetadata(context: Context, uri: Uri, defaultPrefix: String = "
     }
     return name to size
 }
+
+/** Real byte size of an attachment; never rounded up to a floor the file does not have. */
+private fun formatAttachmentSize(bytes: Long): String =
+    if (bytes < 1024L) "$bytes байт" else "${bytes / 1024} КБ"

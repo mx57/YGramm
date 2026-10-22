@@ -1950,20 +1950,21 @@ class YggTwinP2PBridge(
                         val readLen = try {
                             sslSocket.inputStream.read(replyBuf)
                         } catch (_: Throwable) {
-                            16
+                            0
                         }
                         if (readLen > 0) rxCount += readLen
                     } catch (_: javax.net.ssl.SSLHandshakeException) {
-                        txCount += 256L
-                        rxCount += 256L
+                        // The TCP socket connected but TLS was refused: report the zero bytes that
+                        // actually crossed the wire instead of inventing a handshake transcript.
                     }
                 } else if (isLocalConcurrentProfile) {
+                    val ping = encodeWireFrame(mapOf("type" to "PING", "sentAt" to System.currentTimeMillis().toString()))
                     val writer = PrintWriter(OutputStreamWriter(rawSocket.getOutputStream(), StandardCharsets.UTF_8), true)
                     val reader = BufferedReader(InputStreamReader(rawSocket.getInputStream(), StandardCharsets.UTF_8))
-                    writer.println(encodeWireFrame(mapOf("type" to "PING", "sentAt" to System.currentTimeMillis().toString())))
-                    reader.readLine()
-                    txCount += 64L
-                    rxCount += 64L
+                    writer.println(ping)
+                    txCount += ping.toByteArray(StandardCharsets.UTF_8).size
+                    val pong = reader.readLine()
+                    if (pong != null) rxCount += pong.toByteArray(StandardCharsets.UTF_8).size
                 } else {
                     val metaBytes = buildYggdrasilMetaHandshakeBytes("")
                     rawSocket.outputStream.write(metaBytes)
@@ -1973,7 +1974,7 @@ class YggTwinP2PBridge(
                     val readLen = try {
                         rawSocket.inputStream.read(replyBuf)
                     } catch (_: Throwable) {
-                        16
+                        0
                     }
                     if (readLen > 0) rxCount += readLen
                 }
@@ -1984,8 +1985,8 @@ class YggTwinP2PBridge(
                 reachable = true,
                 rttMs = elapsedMs,
                 protocolUsed = if (isTls) "TLS" else "TCP",
-                rxBytes = rxCount.coerceAtLeast(128L),
-                txBytes = txCount.coerceAtLeast(128L)
+                rxBytes = rxCount,
+                txBytes = txCount
             )
         } catch (e: Throwable) {
             PeerProbeResult(
@@ -2390,7 +2391,9 @@ class YggTwinP2PBridge(
                         relayRegionLabel = "Интернет • оверлей Yggdrasil",
                         rttMs = ackRtt,
                         txBytes = totalOutboundBytes,
-                        rxBytes = 128L,
+                        // shortcut: the ACK datagram size is only known inside handleOverlayFrame and
+                        // is not plumbed here; a fixed 128 used to inflate the peer traffic counter.
+                        rxBytes = 0L,
                         endToEndConfirmed = true,
                         transport = "YGG_OVERLAY"
                     )
@@ -2435,7 +2438,7 @@ class YggTwinP2PBridge(
                     relayRegionLabel = if (transport == "LAN_DIRECT") "Локальная сеть • прямое TCP" else "Локальный профиль устройства",
                     rttMs = lanRtt,
                     txBytes = totalOutboundBytes,
-                    rxBytes = 128L,
+                    rxBytes = 0L,
                     endToEndConfirmed = true,
                     transport = transport
                 )

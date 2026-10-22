@@ -3,12 +3,6 @@ package com.example.engine
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.LinearGradient
-import android.graphics.Paint
-import android.graphics.Shader
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
@@ -177,8 +171,9 @@ object YggAudioMediaEngine {
                             val normalized = if (maxPeak > 45) {
                                 ((rms / 6500.0).toFloat() + 0.18f).coerceIn(0.18f, 0.98f)
                             } else {
-                                // Visual cadence if emulator mic is silent
-                                (0.24f + 0.65f * abs(sin((tick * 0.45f).toDouble())).toFloat()).coerceIn(0.2f, 0.95f)
+                                // A silent mic must draw a flat bar: this CSV travels inside the
+                                // voice note, so a sine here would fake a waveform the peer never heard.
+                                0f
                             }
                             if (tick % 2 == 0) {
                                 synchronized(recordedAmplitudes) {
@@ -194,12 +189,12 @@ object YggAudioMediaEngine {
                         }
                     } else {
                         delay(80L)
-                        val fallbackAmp = (0.25f + 0.68f * abs(sin((tick * 0.5f).toDouble())).toFloat()).coerceIn(0.2f, 0.96f)
+                        // No AudioRecord handle: nothing was captured, so the meter stays flat.
                         synchronized(recordedAmplitudes) {
-                            recordedAmplitudes.add(fallbackAmp)
+                            recordedAmplitudes.add(0f)
                         }
                         val elapsedSec = ((System.currentTimeMillis() - recordingStartMs) / 1000L).toInt()
-                        onLiveAmplitude(fallbackAmp, elapsedSec)
+                        onLiveAmplitude(0f, elapsedSec)
                         tick++
                     }
                 }
@@ -231,9 +226,10 @@ object YggAudioMediaEngine {
 
     /**
      * Finalizes the voice recording, writes a valid RIFF/WAVE (.wav) file to `filesDir/voice_notes/`,
-     * and returns its metadata and URI.
+     * and returns its metadata and URI. Returns null when the microphone never produced samples:
+     * a note must never be filled with generated audio.
      */
-    suspend fun finishAndSaveVoiceNote(context: Context): RecordedVoiceNoteResult = withContext(Dispatchers.IO) {
+    suspend fun finishAndSaveVoiceNote(context: Context): RecordedVoiceNoteResult? = withContext(Dispatchers.IO) {
         stopVoiceNoteRecordingInternal()
         delay(40L) // allow last read cycle to settle
 
@@ -241,20 +237,14 @@ object YggAudioMediaEngine {
         val rawPcmBytes = synchronized(recordedPcmStream) { recordedPcmStream.toByteArray() }
         val amps = synchronized(recordedAmplitudes) { recordedAmplitudes.toList() }
 
-        val effectiveAmps = if (amps.size >= 8) {
-            downsampleAmplitudes(amps, 24)
-        } else {
-            List(24) { idx ->
-                (0.25f + 0.65f * abs(sin(idx * 0.62f))).coerceIn(0.22f, 0.95f)
-            }
+        if (!hardwareMicCapturedNonZero || rawPcmBytes.size < SAMPLE_RATE) {
+            return@withContext null
         }
+
+        val effectiveAmps = if (amps.size >= 8) downsampleAmplitudes(amps, 24) else List(24) { 0f }
         val waveformCsv = effectiveAmps.joinToString(",") { String.format(Locale.US, "%.2f", it) }
 
-        val finalPcmBytes = if (hardwareMicCapturedNonZero && rawPcmBytes.size >= SAMPLE_RATE) {
-            normalizeOrBoostMicPcm(rawPcmBytes)
-        } else {
-            synthesizeAudibleVoiceCadencePcm(durationSeconds = elapsedSec, amplitudes = effectiveAmps)
-        }
+        val finalPcmBytes = normalizeOrBoostMicPcm(rawPcmBytes)
 
         val voiceDir = File(context.filesDir, "voice_notes").apply { mkdirs() }
         val fileName = "voice_${System.currentTimeMillis() % 1000000}.wav"
@@ -265,7 +255,7 @@ object YggAudioMediaEngine {
             wavFile = wavFile,
             fileUriString = Uri.fromFile(wavFile).toString(),
             fileName = fileName,
-            sizeBytes = wavFile.length().coerceAtLeast(4096L),
+            sizeBytes = wavFile.length(),
             durationSeconds = elapsedSec,
             waveformCsv = waveformCsv,
             usedHardwareMic = hardwareMicCapturedNonZero
@@ -273,8 +263,9 @@ object YggAudioMediaEngine {
     }
 
     /**
-     * Ensures a playable .wav file exists for any voice message (even incoming or older messages),
-     * synthesizing one from its duration and waveform if the file is missing.
+     * Returns the local .wav for a voice message, or null when the audio was never received or
+     * has been deleted. Missing audio is reported to the caller instead of being synthesized from
+     * the duration and waveform bars.
      */
     fun ensurePlayableVoiceFile(
         context: Context,
@@ -282,7 +273,7 @@ object YggAudioMediaEngine {
         attachmentUri: String?,
         durationSec: Int,
         waveformCsv: String?
-    ): File {
+    ): File? {
         if (!attachmentUri.isNullOrBlank()) {
             try {
                 val parsed = Uri.parse(attachmentUri)
@@ -301,14 +292,7 @@ object YggAudioMediaEngine {
         if (fallbackFile.exists() && fallbackFile.length() > 44L) {
             return fallbackFile
         }
-        val amps = waveformCsv
-            ?.split(",")
-            ?.mapNotNull { it.trim().toFloatOrNull() }
-            ?.takeIf { it.isNotEmpty() }
-            ?: List(24) { idx -> (0.28f + 0.62f * abs(sin(idx * 0.6f))).coerceIn(0.2f, 0.95f) }
-        val pcm = synthesizeAudibleVoiceCadencePcm(durationSec.coerceIn(1, 60), amps)
-        writeWavFile(fallbackFile, pcm, SAMPLE_RATE, 1, 16)
-        return fallbackFile
+        return null
     }
 
     /**
@@ -344,7 +328,7 @@ object YggAudioMediaEngine {
             }
 
             val rawBytes = try {
-                wavFile.readBytes()
+                wavFile?.readBytes() ?: ByteArray(0)
             } catch (_: Throwable) {
                 ByteArray(0)
             }
@@ -785,8 +769,9 @@ object YggAudioMediaEngine {
     }
 
     /**
-     * Reads binary bytes from a local Uri (or generates a valid PNG/WAV/Document file if synthetic)
-     * and returns a Pair of (localSavedUriString, urlSafeBase64Payload) for real P2P transmission.
+     * Reads binary bytes from a local `file://` or `content://` Uri and returns a Pair of
+     * (localSavedUriString, urlSafeBase64Payload). An empty payload means the source could not
+     * be read and the caller must not send anything.
      */
     fun prepareAttachmentForP2P(
         context: Context,
@@ -831,40 +816,10 @@ object YggAudioMediaEngine {
             }
         }
 
-        // 2. Materialize real binary file when sending voice, synthetic image, or P2P document
-        return try {
-            when (attachmentType) {
-                "VOICE" -> {
-                    val wavFile = ensurePlayableVoiceFile(
-                        context = context,
-                        messageId = safeName,
-                        attachmentUri = attachmentUri,
-                        durationSec = voiceDurationSec.coerceAtLeast(1),
-                        waveformCsv = voiceWaveformCsv
-                    )
-                    val bytes = wavFile.readBytes()
-                    val capped = if (bytes.size > MAX_P2P_INLINE_BYTES) bytes.copyOf(MAX_P2P_INLINE_BYTES) else bytes
-                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(capped)
-                    Uri.fromFile(wavFile).toString() to b64
-                }
-                "IMAGE" -> {
-                    val imgFile = File(attachDir, "${System.currentTimeMillis()}_$safeName.png")
-                    val pngBytes = generateCyberImagePngBytes(safeName)
-                    imgFile.writeBytes(pngBytes)
-                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(pngBytes)
-                    Uri.fromFile(imgFile).toString() to b64
-                }
-                else -> {
-                    val docFile = File(attachDir, "${System.currentTimeMillis()}_$safeName")
-                    val docBytes = "YggGram P2P Encrypted File Container\nFile: $safeName\nTimestamp: ${System.currentTimeMillis()}\nCipher: XChaCha20-Poly1305 FastCDC".toByteArray()
-                    docFile.writeBytes(docBytes)
-                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(docBytes)
-                    Uri.fromFile(docFile).toString() to b64
-                }
-            }
-        } catch (_: Throwable) {
-            attachmentUri to ""
-        }
+        // Nothing was readable. Generating a PNG, a WAV or a document stub here used to make the
+        // sender see "sent" while the peer received media that never existed, so the caller gets
+        // an empty payload and must report the failure instead.
+        return attachmentUri to ""
     }
 
     /**
@@ -911,7 +866,8 @@ object YggAudioMediaEngine {
             }
         }
 
-        // If no Base64 was present (e.g. legacy frame), ensure a playable WAV for VOICE or return fallbackUri
+        // No Base64 in the frame (legacy or truncated transfer): there is no audio to store,
+        // so report the original Uri rather than writing a synthesized stand-in.
         if (attachmentType == "VOICE") {
             val wavFile = ensurePlayableVoiceFile(
                 context = context,
@@ -920,48 +876,9 @@ object YggAudioMediaEngine {
                 durationSec = voiceDurationSec.coerceAtLeast(1),
                 waveformCsv = voiceWaveformCsv
             )
-            return Uri.fromFile(wavFile).toString()
+            return wavFile?.let { Uri.fromFile(it).toString() } ?: fallbackUri
         }
         return fallbackUri
-    }
-
-    private fun generateCyberImagePngBytes(title: String): ByteArray {
-        val bitmap = Bitmap.createBitmap(480, 300, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val bgPaint = Paint().apply {
-            shader = LinearGradient(
-                0f, 0f, 480f, 300f,
-                intArrayOf(Color.parseColor("#07261E"), Color.parseColor("#0D2B3E"), Color.parseColor("#10B981")),
-                null,
-                Shader.TileMode.CLAMP
-            )
-        }
-        canvas.drawRect(0f, 0f, 480f, 300f, bgPaint)
-
-        val gridPaint = Paint().apply {
-            color = Color.parseColor("#3310B981")
-            strokeWidth = 2f
-        }
-        for (x in 0..480 step 40) {
-            canvas.drawLine(x.toFloat(), 0f, x.toFloat(), 300f, gridPaint)
-        }
-        for (y in 0..300 step 40) {
-            canvas.drawLine(0f, y.toFloat(), 480f, y.toFloat(), gridPaint)
-        }
-
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = 24f
-            isFakeBoldText = true
-        }
-        canvas.drawText("YggGram P2P Media", 32f, 130f, textPaint)
-        textPaint.textSize = 18f
-        textPaint.color = Color.parseColor("#A7F3D0")
-        canvas.drawText(title.take(28), 32f, 170f, textPaint)
-
-        val bos = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 90, bos)
-        return bos.toByteArray()
     }
 
     private fun downsampleAmplitudes(input: List<Float>, targetCount: Int): List<Float> {
@@ -991,41 +908,6 @@ object YggAudioMediaEngine {
             outBuf.putShort(boosted)
         }
         return outBytes
-    }
-
-    /**
-     * Synthesizes a clear, natural-sounding speech-band harmonic cadence modulated by the recorded
-     * waveform bars so voice notes play back with distinct, pleasant audio even in emulators without a mic.
-     */
-    private fun synthesizeAudibleVoiceCadencePcm(
-        durationSeconds: Int,
-        amplitudes: List<Float>
-    ): ByteArray {
-        val safeSec = durationSeconds.coerceIn(1, 60)
-        val totalSamples = SAMPLE_RATE * safeSec
-        val out = ByteArray(totalSamples * 2)
-        val bb = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
-        val bars = if (amplitudes.isNotEmpty()) amplitudes else listOf(0.5f, 0.8f, 0.4f, 0.9f, 0.6f)
-
-        for (i in 0 until totalSamples) {
-            val t = i.toDouble() / SAMPLE_RATE.toDouble()
-            val progress = i.toFloat() / totalSamples.toFloat()
-            val barIdx = (progress * bars.size).toInt().coerceIn(0, bars.lastIndex)
-            val amp = bars[barIdx].coerceIn(0.2f, 1.0f)
-
-            // Syllable envelope (4.2 syllables/sec)
-            val syllableEnv = (0.35 + 0.65 * abs(sin(PI * 4.2 * t)))
-            // Pitch modulation (195 Hz..265 Hz warm vocal fundamental + harmonics)
-            val f0 = 210.0 + 35.0 * sin(2.0 * PI * 1.8 * t)
-            val wave = 0.60 * sin(2.0 * PI * f0 * t) +
-                0.28 * sin(2.0 * PI * (f0 * 2.0) * t) +
-                0.12 * sin(2.0 * PI * (f0 * 3.0) * t)
-
-            val sample = (wave * syllableEnv * amp * 14500.0).toInt()
-                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-            bb.putShort(sample)
-        }
-        return out
     }
 
     private fun writeWavFile(
