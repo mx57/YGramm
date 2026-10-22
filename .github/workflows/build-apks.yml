@@ -27,6 +27,25 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: core/go.sum
+
+      - name: Build native Yggdrasil core (arm64-v8a)
+        run: |
+          # libygggram.so is not tracked in git; without this step every
+          # published APK ships without the core («НЕТ ЯДРА»).
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          test -d "$NDK" || { echo "NDK not found on runner"; exit 1; }
+          cd core
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+            CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            go build -buildmode=c-shared -o ../app/src/main/jniLibs/arm64-v8a/libygggram.so ./cmd/libygggram
+          cd ..
+          ls -la app/src/main/jniLibs/arm64-v8a/
+
       - name: Decode debug.keystore from base64
         run: |
           if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
@@ -41,14 +60,26 @@ jobs:
           mkdir -p apk-releases
           cp app/build/outputs/apk/debug/app-debug.apk apk-releases/YggGram-arm64-v8a.apk
 
+      - name: Verify APK ships the native core
+        run: |
+          unzip -l apk-releases/YggGram-arm64-v8a.apk | grep -q 'lib/arm64-v8a/libygggram.so' \
+            || { echo "APK is missing libygggram.so — refusing to publish a core-less build"; exit 1; }
+          echo "native core present in APK"
+
+      - name: Generate SHA-256 checksum
+        run: |
+          cd apk-releases
+          sha256sum YggGram-arm64-v8a.apk > YggGram-arm64-v8a.apk.sha256
+          cat YggGram-arm64-v8a.apk.sha256
+
       - name: Commit Single Release APK to apk-releases/
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git rm -f --ignore-unmatch YggGram-main.apk YggGram-clone-node2.apk apk-releases/YggGram-main.apk apk-releases/YggGram-clone-node2.apk build-root-apks.sh
-          git add -f apk-releases/YggGram-arm64-v8a.apk
+          git add -f apk-releases/YggGram-arm64-v8a.apk apk-releases/YggGram-arm64-v8a.apk.sha256
           if ! git diff --cached --quiet; then
-            git commit -m "chore(release): build single YggGram-arm64-v8a.apk in apk-releases/ [skip ci]"
+            git commit -m "chore(release): build single YggGram-arm64-v8a.apk with sha256 [skip ci]"
             git push
           fi
 
@@ -58,3 +89,4 @@ jobs:
           name: YggGram-arm64-v8a-APK
           path: |
             apk-releases/YggGram-arm64-v8a.apk
+            apk-releases/YggGram-arm64-v8a.apk.sha256

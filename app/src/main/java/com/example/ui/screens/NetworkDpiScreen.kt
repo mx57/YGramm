@@ -145,9 +145,13 @@ fun NetworkDpiScreen(
     val liveRoutes = if (coreMesh.available) coreMesh.liveLinks else connectedPeersCount
     val totalRoutes = if (coreMesh.available) coreMesh.totalLinks else peers.size
     val coreStatusLine = if (coreMesh.available) {
-        "Ядро в сети: живых линков ${coreMesh.liveLinks} из ${coreMesh.totalLinks} • узлов в routing tree: ${coreMesh.knownNodes} • сессий: ${coreMesh.sessionCount}"
+        val restartSuffix = if (coreMesh.restartCount > 0) " • перезапусков ядра: ${coreMesh.restartCount}" else ""
+        "Ядро в сети: живых линков ${coreMesh.liveLinks} из ${coreMesh.totalLinks} • узлов в routing tree: ${coreMesh.knownNodes} • сессий: ${coreMesh.sessionCount}$restartSuffix"
+    } else if (!com.example.engine.YggNativeCoreBridge.isNativeLibraryLoaded) {
+        "Ядро не загружено: APK собран без libygggram.so — пересоберите Go-ядро из core/"
     } else {
-        null
+        val restartSuffix = if (coreMesh.restartCount > 0) " • перезапусков ядра: ${coreMesh.restartCount}" else ""
+        "Библиотека ядра загружена, но нода профиля ещё не запущена$restartSuffix"
     }
     val activeEndpointSet = remember(peers) { peers.map { it.endpointUri.lowercase() }.toSet() }
 
@@ -397,21 +401,19 @@ fun NetworkDpiScreen(
 
                             Column(modifier = Modifier.padding(14.dp)) {
                                 Text(
-                                    text = coreStatusLine ?: cfg.lastProbeReport,
+                                    text = coreStatusLine,
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn) {
+                                    color = if (!uiState.isNetworkAvailable || uiState.isAirplaneModeOn || !coreMesh.available) {
                                         Color(0xFFEF4444)
                                     } else {
                                         EmeraldPrimary
                                     }
                                 )
-                                if (coreStatusLine != null) {
-                                    Text(
-                                        text = cfg.lastProbeReport,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
+                                Text(
+                                    text = cfg.lastProbeReport,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                                 if (cfg.isProbingRoutes) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     LinearProgressIndicator(
@@ -548,6 +550,8 @@ fun NetworkDpiScreen(
                                         Text(
                                             text = if (coreMesh.available) {
                                                 "Данные читаются напрямую из Go-ядра профиля"
+                                            } else if (!com.example.engine.YggNativeCoreBridge.isNativeLibraryLoaded) {
+                                                "libygggram.so отсутствует в APK — показаны данные TCP/TLS-сканера"
                                             } else {
                                                 "Ядро профиля не запущено — показаны данные TCP/TLS-сканера"
                                             },
@@ -567,8 +571,10 @@ fun NetworkDpiScreen(
                                     Text(
                                         text = if (coreMesh.available) {
                                             if (coreMesh.liveLinks > 0) "В СЕТИ" else "НЕТ ЛИНКОВ"
-                                        } else {
+                                        } else if (!com.example.engine.YggNativeCoreBridge.isNativeLibraryLoaded) {
                                             "НЕТ ЯДРА"
+                                        } else {
+                                            "ЯДРО НЕ ЗАПУЩЕНО"
                                         },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = if (coreMesh.available && coreMesh.liveLinks > 0) {

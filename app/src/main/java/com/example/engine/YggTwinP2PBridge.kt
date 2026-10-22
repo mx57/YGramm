@@ -40,7 +40,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -178,6 +180,17 @@ data class OverlayProbeOutcome(
     val errorDetail: String? = null
 )
 
+/**
+ * What the running node actually did with a peer change: how many live cores accepted
+ * it and the link counts afterwards. Only the node knows whether a link came up.
+ */
+data class PeerApplyOutcome(
+    val applied: Int,
+    val liveLinks: Int,
+    val totalLinks: Int,
+    val errorDetail: String? = null
+)
+
 data class DiscoveredLanNode(
     val displayName: String,
     val yggIpv6: String,
@@ -281,6 +294,17 @@ class YggTwinP2PBridge(
         const val ATTACHMENT_CHUNK_WINDOW = 4
         const val ATTACHMENT_CHUNK_ACK_TIMEOUT_MS = 6_000L
         const val CHUNK_ASSEMBLY_TTL_MS = 10 * 60 * 1000L
+
+        const val CORE_WATCHDOG_INTERVAL_MS = 15_000L
+        const val CORE_RETRY_MIN_BACKOFF_MS = 20_000L
+        const val CORE_RETRY_MAX_BACKOFF_MS = 300_000L
+        const val CORE_START_GRACE_MS = 45_000L
+        const val CORE_DEATH_STRIKES_BEFORE_RESTART = 2
+
+        // Spacing between re-offers of one call-control signal on a cold overlay route.
+        // Shorter than the path-discovery round trip it is waiting for, longer than the
+        // single-slot coalescing cache can be saturated by.
+        const val CALL_SIGNAL_RETRY_MS = 1_800L
     }
 
     @Volatile
@@ -384,6 +408,18 @@ class YggTwinP2PBridge(
                 profileRelayRoleMap[prof.profileId] = prof.nodeRelayRole
                 profileIdToPubKeyMap[prof.profileId] = prof.yggPublicKeyHex
                 pubKeyToProfileIdMap[prof.yggPublicKeyHex.trim().lowercase()] = prof.profileId
+            }
+            // Re-apply what the live cores reported: a stored row can carry a blank or
+            // legacy address, and dropping the node's own address here made the bridge
+            // stop recognising frames addressed to itself.
+            profiles.forEach { prof ->
+                coreIdentityByProfileId[prof.profileId]?.let { (coreKeyHex, coreAddress) ->
+                    if (coreKeyHex.isNotBlank()) {
+                        profileIdToPubKeyMap[prof.profileId] = coreKeyHex
+                        pubKeyToProfileIdMap[coreKeyHex] = prof.profileId
+                    }
+                    if (coreAddress.isNotBlank()) ipv6ToProfileIdMap[coreAddress] = prof.profileId
+                }
             }
 
             // Close sockets for profiles no longer active in background
@@ -530,6 +566,9 @@ class YggTwinP2PBridge(
                     summary = "Мост работает в режиме «только оверлей Yggdrasil»",
                     details = "Межпрофильные и P2P-сообщения доставляются через интернет нодами 0200::/7 (JNI-ядро на каждый профиль)"
                 )
+                if (coreWatchdogJob?.isActive != true) {
+                    coreWatchdogJob = launch { coreWatchdogLoop() }
+                }
             }
 
             launch {
@@ -543,6 +582,16 @@ class YggTwinP2PBridge(
     private val initializedNativeProfiles = ConcurrentHashMap.newKeySet<String>()
     private val nativeCoreStartLock = Any()
     private val overlayRecvJobs = ConcurrentHashMap<String, Job>()
+
+    // Core watchdog: a node that died after a successful init (or whose init
+    // failed, e.g. no network at boot) is restarted from these parameters.
+    private val nativeCoreParams = ConcurrentHashMap<String, Pair<String, List<String>>>()
+    private val coreRestartCounts = ConcurrentHashMap<String, Int>()
+    private val coreNextRetryAt = ConcurrentHashMap<String, Long>()
+    private val coreRetryBackoffMs = ConcurrentHashMap<String, Long>()
+    private val coreStartAttemptAt = ConcurrentHashMap<String, Long>()
+    private val coreDeathStrikes = ConcurrentHashMap<String, Int>()
+    private var coreWatchdogJob: Job? = null
     private val pendingOverlayAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
     // Reaction ACKs must never be confused with message ACKs: a reaction frame carries
     // the id of the message it reacts to, and completing a message ACK with it would
@@ -550,6 +599,9 @@ class YggTwinP2PBridge(
     private val pendingReactionAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
     private val profileIdToPubKeyMap = ConcurrentHashMap<String, String>() // profileId -> Ed25519 node pubkey hex
     private val pubKeyToProfileIdMap = ConcurrentHashMap<String, String>() // Ed25519 node pubkey hex -> profileId
+    // What the running node reported about itself, kept across profile syncs: the stored
+    // profile row can lag behind the live identity.
+    private val coreIdentityByProfileId = ConcurrentHashMap<String, Pair<String, String>>() // profileId -> (Ed25519 hex, IPv6)
 
     /**
      * Resolves the Ed25519 node key the overlay must address.
@@ -612,6 +664,9 @@ class YggTwinP2PBridge(
             // Go HMACs the raw string; Kotlin derives identity from words joined
             // by single spaces. Normalize here so both sides always reach the same key.
             val normalizedMnemonic = mnemonicCsv.split(" ").filter { it.isNotBlank() }.joinToString(" ")
+            val uniqueUris = peerUris.filter { it.isNotBlank() }.distinctBy { it.lowercase() }.take(16)
+            nativeCoreParams[profileId] = normalizedMnemonic to uniqueUris
+            coreStartAttemptAt[profileId] = System.currentTimeMillis()
             val initResult = YggNativeCoreBridge.initCore(
                 profileId,
                 normalizedMnemonic,
@@ -619,13 +674,17 @@ class YggTwinP2PBridge(
             )
             if (!initResult.ok) {
                 initializedNativeProfiles.remove(profileId)
+                scheduleCoreRetryBackoff(profileId)
                 logPacket(
                     direction = "ERR • CORE",
-                    summary = "Нода Yggdrasil профиля не инициализирована",
+                    summary = "Нода Yggdrasil профиля не инициализирована — watchdog повторит попытку",
                     details = "profile=$profileId • ${initResult.error}"
                 )
                 return@launch
             }
+            coreRetryBackoffMs.remove(profileId)
+            coreNextRetryAt.remove(profileId)
+            coreDeathStrikes.remove(profileId)
             // The running node's real key/address are authoritative for routing; if the
             // stored identity drifted (legacy mnemonic formatting), correct the maps so
             // frames addressed to the live node are recognized.
@@ -644,9 +703,9 @@ class YggTwinP2PBridge(
                 if (coreIpv6.isNotBlank()) {
                     ipv6ToProfileIdMap[coreIpv6] = profileId
                 }
+                coreIdentityByProfileId[profileId] = corePubKeyHex to coreIpv6
             }
             var joinedPeers = 0
-            val uniqueUris = peerUris.filter { it.isNotBlank() }.distinctBy { it.lowercase() }.take(16)
             for (peerUri in uniqueUris) {
                 val added = YggNativeCoreBridge.addPeer(profileId, peerUri)
                 if (added.ok) joinedPeers++
@@ -660,7 +719,77 @@ class YggTwinP2PBridge(
         }
     }
 
+    /**
+     * Live public links across the running nodes: 0 means the node has no route to the
+     * overlay, -1 that no core is running to ask. The DB peer flags say neither.
+     */
+    fun coreLiveLinkCount(): Int {
+        var best = -1
+        for (profileId in initializedNativeProfiles.toList()) {
+            val mesh = YggNativeCoreBridge.readMeshState(profileId)
+            if (mesh.available) best = maxOf(best, mesh.liveLinks)
+        }
+        return best
+    }
+
+    /**
+     * Applies a peer add/remove to every running node. Persisting the Room row alone
+     * leaves the live node dialling its old list until the app restarts, so «подключить
+     * пир» used to claim success while no new link ever appeared and calls had no route.
+     */
+    suspend fun applyPeerChangeToCores(
+        peerUri: String,
+        enabled: Boolean
+    ): PeerApplyOutcome = withContext(Dispatchers.IO) {
+        val uri = peerUri.trim()
+        val profiles = initializedNativeProfiles.toList()
+        if (uri.isBlank() || profiles.isEmpty()) {
+            return@withContext PeerApplyOutcome(
+                applied = 0,
+                liveLinks = 0,
+                totalLinks = 0,
+                errorDetail = if (uri.isBlank()) "Пустой адрес пира" else "Нода Yggdrasil не запущена"
+            )
+        }
+        var applied = 0
+        var live = 0
+        var total = 0
+        var failure: String? = null
+        for (profileId in profiles) {
+            val res = if (enabled) {
+                YggNativeCoreBridge.addPeer(profileId, uri)
+            } else {
+                YggNativeCoreBridge.removePeer(profileId, uri)
+            }
+            if (res.ok) applied++ else failure = res.error.ifBlank { "ядро отклонило пир" }
+            val mesh = YggNativeCoreBridge.readMeshState(profileId)
+            live = maxOf(live, mesh.liveLinks)
+            total = maxOf(total, mesh.totalLinks)
+        }
+        if (enabled && applied > 0) {
+            // The core dials new peers on its own backoff timer; interrupt it so the
+            // link the user just asked for is attempted now rather than minutes later.
+            profiles.forEach { YggNativeCoreBridge.retryPeers(it) }
+        }
+        logPacket(
+            direction = if (applied > 0) "SYS • CORE" else "ERR • CORE",
+            summary = when {
+                applied == 0 -> if (enabled) "Пир не добавлен в работающую ноду" else "Пир не удалён из работающей ноды"
+                enabled -> "Пир добавлен в работающую ноду Yggdrasil"
+                else -> "Пир удалён из работающей ноды Yggdrasil"
+            },
+            details = "$uri • живых линков ядра: $live из $total" + (failure?.let { " • $it" } ?: "")
+        )
+        PeerApplyOutcome(applied, live, total, failure)
+    }
+
     fun stopNativeCoreForProfile(profileId: String) {
+        nativeCoreParams.remove(profileId)
+        coreRestartCounts.remove(profileId)
+        coreRetryBackoffMs.remove(profileId)
+        coreNextRetryAt.remove(profileId)
+        coreStartAttemptAt.remove(profileId)
+        coreDeathStrikes.remove(profileId)
         if (!initializedNativeProfiles.remove(profileId)) return
         overlayRecvJobs.remove(profileId)?.cancel()
         scope.launch {
@@ -685,6 +814,7 @@ class YggTwinP2PBridge(
                 if (!pollResult.ok) {
                     if (pollResult.error.contains("not initialized")) {
                         initializedNativeProfiles.remove(profileId)
+                        scheduleCoreRetryBackoff(profileId)
                         break
                     }
                     continue
@@ -696,8 +826,88 @@ class YggTwinP2PBridge(
                 } catch (_: Throwable) {
                 }
             }
+            // Self-cleanup so a watchdog re-init can start a fresh recv loop.
+            overlayRecvJobs.remove(profileId, coroutineContext[Job])
         }
         overlayRecvJobs[profileId] = job
+    }
+
+    fun coreRestartCount(profileId: String): Int = coreRestartCounts[profileId] ?: 0
+
+    /**
+     * Drops every in-memory core bookkeeping so a panic-wipe leaves no profile
+     * that the watchdog could silently bring back. The watchdog loop itself
+     * stays alive and simply finds an empty parameter map.
+     */
+    fun panicResetCoreState() {
+        nativeCoreParams.clear()
+        coreRestartCounts.clear()
+        coreNextRetryAt.clear()
+        coreRetryBackoffMs.clear()
+        coreStartAttemptAt.clear()
+        coreDeathStrikes.clear()
+        overlayRecvJobs.values.forEach { it.cancel() }
+        overlayRecvJobs.clear()
+        initializedNativeProfiles.clear()
+    }
+
+    private fun scheduleCoreRetryBackoff(profileId: String) {
+        val prev = coreRetryBackoffMs[profileId] ?: 0L
+        val next = if (prev <= 0L) {
+            CORE_RETRY_MIN_BACKOFF_MS
+        } else {
+            (prev * 2).coerceAtMost(CORE_RETRY_MAX_BACKOFF_MS)
+        }
+        coreRetryBackoffMs[profileId] = next
+        coreNextRetryAt[profileId] = System.currentTimeMillis() + next
+    }
+
+    /**
+     * The Go node runs in-process, so its disappearance from the core's engine
+     * map (failed init, stop, native error) is the honest death signal. The
+     * watchdog restarts such a node with capped backoff and exposes the exact
+     * restart count to the UI.
+     */
+    private suspend fun coreWatchdogLoop() {
+        while (true) {
+            delay(CORE_WATCHDOG_INTERVAL_MS)
+            currentCoroutineContext().ensureActive()
+            for ((profileId, params) in nativeCoreParams) {
+                if (initializedNativeProfiles.contains(profileId)) {
+                    // A node that just started may not be in the engine map yet.
+                    if (System.currentTimeMillis() - (coreStartAttemptAt[profileId] ?: 0L) < CORE_START_GRACE_MS) continue
+                    if (YggNativeCoreBridge.readMeshState(profileId).available) {
+                        coreDeathStrikes.remove(profileId)
+                        continue
+                    }
+                    // One failed query can be a JNI hiccup; only a second consecutive
+                    // failure is treated as death, because restarting a live node drops
+                    // every overlay session it holds.
+                    val strikes = (coreDeathStrikes[profileId] ?: 0) + 1
+                    coreDeathStrikes[profileId] = strikes
+                    if (strikes < CORE_DEATH_STRIKES_BEFORE_RESTART) continue
+                    coreDeathStrikes.remove(profileId)
+                    initializedNativeProfiles.remove(profileId)
+                    overlayRecvJobs.remove(profileId)?.cancel()
+                    val count = (coreRestartCounts[profileId] ?: 0) + 1
+                    coreRestartCounts[profileId] = count
+                    logPacket(
+                        direction = "SYS • CORE",
+                        summary = "Ядро ноды профиля пропало — перезапуск №$count",
+                        details = "profile=$profileId"
+                    )
+                    synchronized(nativeCoreStartLock) {
+                        ensureNativeCoreForProfile(profileId, params.first, params.second)
+                    }
+                } else {
+                    val nextAt = coreNextRetryAt[profileId] ?: continue
+                    if (System.currentTimeMillis() < nextAt) continue
+                    synchronized(nativeCoreStartLock) {
+                        ensureNativeCoreForProfile(profileId, params.first, params.second)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -1104,12 +1314,15 @@ class YggTwinP2PBridge(
                         )
                     )
                     sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "CALL_ACK")
-                    // A control CALL_ACK is a single datagram over a best-effort
-                    // overlay; repeat it shortly after so one lost packet does not
-                    // make the caller retry RINGING or drop an accepted call.
+                    // A cold overlay route keeps only the last pending datagram per
+                    // destination, so back-to-back copies collapse into one. Re-offering
+                    // the ACK spread over a couple of seconds is what actually survives
+                    // path discovery and stops the caller from retransmitting RINGING.
                     scope.launch {
-                        kotlinx.coroutines.delay(180L)
-                        sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "CALL_ACK (повтор)")
+                        for (delayMs in listOf(400L, 2_000L)) {
+                            kotlinx.coroutines.delay(delayMs)
+                            sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "CALL_ACK (повтор)")
+                        }
                     }
                     logPacket(
                         direction = "RX <- VOIP",
@@ -1143,9 +1356,10 @@ class YggTwinP2PBridge(
             "CALL_ACK" -> {
                 val callId = map["callId"] ?: ""
                 val action = map["signalAction"] ?: ""
-                val sentAt = map["sentAt"]?.toLongOrNull() ?: 0L
-                val rtt = if (sentAt > 0) (System.currentTimeMillis() - sentAt).coerceAtLeast(1L) else 1L
-                pendingCallAcks.remove("$callId:$action")?.complete(rtt)
+                // The arrival time of this device's clock is what the sender turns into a
+                // round trip; the echoed `sentAt` belongs to the other party's clock and
+                // subtracting across two unsynchronised clocks produced a meaningless RTT.
+                pendingCallAcks.remove("$callId:$action")?.complete(System.currentTimeMillis())
             }
         }
     }
@@ -1460,7 +1674,19 @@ class YggTwinP2PBridge(
                     val resolvedProfileId = recipientProfileId.ifBlank {
                         ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
                     }
-                    if (signalAction == "AUDIO") {
+                    // A direct socket answers for whichever device happens to listen on
+                    // that port, and a stale LAN registration can point a call at an
+                    // unrelated node. ACKing a signal meant for someone else told the
+                    // caller their call had been delivered to a phone that never rang.
+                    if (!isCallAddressedToLocalNode(targetIpv6)) {
+                        if (signalAction != "AUDIO") {
+                            logPacket(
+                                direction = "ERR • VOIP",
+                                summary = "Сигнал вызова адресован не этому узлу — отброшен",
+                                details = "$signalAction для $targetIpv6 • LAN ${remoteIp} • профиль ${resolvedProfileId.ifBlank { "чужой" }}"
+                            )
+                        }
+                    } else if (signalAction == "AUDIO") {
                         if (callId.isNotBlank()) {
                             onCallAudioFrameReceived(
                                 IncomingCallAudioPacket(
@@ -2711,69 +2937,12 @@ class YggTwinP2PBridge(
         false
     }
 
-    suspend fun probeVoiceCallChannel(
-        peerIpv6: String,
-        directEndpointHint: String,
-        candidatePeers: List<Triple<String, String, String>>,
-        senderIpv6: String = "",
-        callerName: String = "",
-        chatId: String = "",
-        signalAction: String = "AUDIO_FRAME",
-        audioFrameBytes: Int = 640,
-        allowLanFallback: Boolean = allowDirectLanRouting
-    ): Pair<Boolean, Int> = withContext(Dispatchers.IO) {
-        // Call signalling is only carried over a real direct socket right now. A live
-        // public Yggdrasil peer proves internet connectivity, not delivery to the peer,
-        // so it must never be reported as a working call channel.
-        if (directEndpointHint.isNotBlank()) {
-            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
-        }
-        val directAddr = resolveDirectSocketAddress(
-            peerIpv6 = peerIpv6,
-            directHint = directEndpointHint,
-            senderIpv6 = senderIpv6,
-            allowPassiveLan = allowLanFallback
-        ) ?: return@withContext false to -1
-
-        val t0 = System.nanoTime()
-        return@withContext try {
-            var acknowledged = false
-            Socket().use { s ->
-                s.soTimeout = 2000
-                s.connect(directAddr, 1800)
-                val writer = PrintWriter(OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)
-                val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8))
-                writer.println(
-                    encodeWireFrame(
-                        mapOf(
-                            "type" to "CALL_SIGNAL",
-                            "signalAction" to signalAction,
-                            "callerName" to callerName,
-                            "callerIpv6" to senderIpv6,
-                            "recipientIpv6" to peerIpv6,
-                            "chatId" to chatId,
-                            "bytes" to audioFrameBytes.toString()
-                        )
-                    )
-                )
-                val reply = reader.readLine()?.let { decodeWireFrame(it) }
-                acknowledged = reply?.get("type") == "CALL_ACK"
-            }
-            if (acknowledged) {
-                val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
-                true to rtt
-            } else {
-                false to -1
-            }
-        } catch (_: Exception) {
-            false to -1
-        }
-    }
-
     /**
      * Dispatches one call-control frame (RINGING, ACCEPT, DECLINE, BUSY, BYE, MISSED).
      * The call works through the local profile loopback listener, an explicit LAN
      * endpoint, or the Yggdrasil overlay — whichever actually returns CALL_ACK.
+     * [timeoutMs] bounds the whole signal, not a single attempt: the overlay path
+     * re-offers the frame until the ACK arrives or the deadline passes.
      */
     suspend fun dispatchCallControlSignal(
         chatId: String,
@@ -2786,7 +2955,7 @@ class YggTwinP2PBridge(
         senderX25519PubKeyHex: String,
         directEndpointHint: String = "",
         allowLanFallback: Boolean = allowDirectLanRouting,
-        timeoutMs: Long = 8_000L
+        timeoutMs: Long = 18_000L
     ): CallSignalDispatchResult = withContext(Dispatchers.IO) {
         val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()] ?: ""
         val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
@@ -2833,29 +3002,34 @@ class YggTwinP2PBridge(
         if (recipientKeyHex.isNotBlank() && senderCoreReady && isRealNetworkAvailable()) {
             val livePeers = awaitLivePeer(senderProfileId, waitMs = 8_000L)
             if (livePeers > 0) {
+                // ironwood keeps exactly one pending datagram per destination while it
+                // looks up the path and opens the encrypted session, so a cold overlay
+                // route silently coalesces a burst: only the last frame survives and the
+                // first round trip can take seconds. One deferred therefore stays
+                // registered for the whole signal while the frame is re-offered on a slow
+                // cadence — whichever copy finally reaches the peer, its CALL_ACK confirms
+                // the signal, instead of an early ACK timing out against a later attempt.
+                val ackKey = "$callId:$signalAction"
                 val deferred = kotlinx.coroutines.CompletableDeferred<Long>()
-                pendingCallAcks["$callId:$signalAction"] = deferred
-                if (sendOverlayFrame(senderProfileId, recipientKeyHex, frame, "CALL $signalAction")) {
-                    var rtt = kotlinx.coroutines.withTimeoutOrNull(timeoutMs / 2) { deferred.await() }
-                    if (rtt == null) {
-                        // The first datagram to a fresh overlay session is commonly
-                        // dropped while the encrypted session is being established;
-                        // a second frame right after it is delivered reliably.
-                        if (sendOverlayFrame(senderProfileId, recipientKeyHex, frame, "CALL $signalAction")) {
-                            rtt = kotlinx.coroutines.withTimeoutOrNull(timeoutMs / 2) { deferred.await() }
-                        }
-                    }
-                    pendingCallAcks.remove("$callId:$signalAction", deferred)
-                    if (rtt != null) {
-                        logPacket(
-                            direction = "TX -> VOIP",
-                            summary = "Сигнал $signalAction доставлен через оверлей Yggdrasil (RTT $rtt мс)",
-                            details = "callId=${callId.take(12)} • CALL_ACK от ноды ${recipientKeyHex.take(16)}..."
-                        )
-                        return@withContext CallSignalDispatchResult(true, "YGG_OVERLAY", rtt, null)
-                    }
-                } else {
-                    pendingCallAcks.remove("$callId:$signalAction", deferred)
+                pendingCallAcks[ackKey] = deferred
+                val deadline = System.currentTimeMillis() + timeoutMs
+                val firstOfferAt = System.currentTimeMillis()
+                var rtt: Long? = null
+                while (rtt == null && System.currentTimeMillis() < deadline) {
+                    // The local core rejecting the frame is permanent for this payload
+                    // (oversized, dead node), so retrying it would only spam the log.
+                    if (!sendOverlayFrame(senderProfileId, recipientKeyHex, frame, "CALL $signalAction")) break
+                    val ackedAt = kotlinx.coroutines.withTimeoutOrNull(CALL_SIGNAL_RETRY_MS) { deferred.await() }
+                    if (ackedAt != null) rtt = (ackedAt - firstOfferAt).coerceAtLeast(1L)
+                }
+                pendingCallAcks.remove(ackKey, deferred)
+                if (rtt != null) {
+                    logPacket(
+                        direction = "TX -> VOIP",
+                        summary = "Сигнал $signalAction доставлен через оверлей Yggdrasil (RTT $rtt мс)",
+                        details = "callId=${callId.take(12)} • CALL_ACK от ноды ${recipientKeyHex.take(16)}..."
+                    )
+                    return@withContext CallSignalDispatchResult(true, "YGG_OVERLAY", rtt, null)
                 }
             }
         }
@@ -2924,11 +3098,11 @@ class YggTwinP2PBridge(
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
             writer.println(frame)
             val reply = reader.readLine()?.let { decodeWireFrame(it) }
-            if (reply?.get("type") == "CALL_ACK") {
-                (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
-            } else {
-                null
-            }
+            val echoedAction = reply?.get("signalAction").orEmpty()
+            val ackedThisCall = reply?.get("type") == "CALL_ACK" &&
+                reply["callId"] == callId &&
+                (echoedAction.isBlank() || echoedAction == signalAction)
+            if (ackedThisCall) (System.currentTimeMillis() - startedAt).coerceAtLeast(1L) else null
         }
     } catch (_: Exception) {
         null
@@ -2984,7 +3158,10 @@ class YggTwinP2PBridge(
                 return@withContext CallMediaChannelResult(
                     true,
                     outgoingCallMediaSessions[callId]?.transport.orEmpty(),
-                    1L,
+                    // Zero means "this channel adds no measurement": the caller keeps the
+                    // RTT of the signal that actually round-tripped. A TCP handshake is
+                    // sub-millisecond on a LAN, and reporting it as 1 мс was a made-up number.
+                    0L,
                     null
                 )
             } catch (e: Exception) {
@@ -3130,22 +3307,21 @@ class YggTwinP2PBridge(
         // If the peer belongs to an active local profile, its loopback listener is a real route.
         val localProfileId = ipv6ToProfileIdMap[peer.lowercase()]
         if (localProfileId != null && !isSameIdentity) {
-            activeProfilePortMap[localProfileId]?.let { return InetSocketAddress.createUnresolved("127.0.0.1", it) }
+            activeProfilePortMap[localProfileId]?.let { return resolvedEndpoint("127.0.0.1", it) }
         }
 
         val cleanHint = directHint.trim()
         if (cleanHint.contains(":")) {
             val h = cleanHint.substringBeforeLast(":").removeSurrounding("[", "]")
             val p = cleanHint.substringAfterLast(":").toIntOrNull()
-            val isOwnLoopback = isSameIdentity && (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
-            if (h.isNotBlank() && !isOwnLoopback && p != null && p in 1..65535) {
-                return InetSocketAddress.createUnresolved(h, p)
+            if (h.isNotBlank() && p != null && !dialsOurOwnListener(h, p, senderIpv6)) {
+                resolvedEndpoint(h, p)?.let { return it }
             }
         }
 
         if (allowPassiveLan) {
             directEndpointTable[peer.lowercase()]?.let { registered ->
-                if (!isSameIdentity) return registered
+                if (!isSameIdentity) return resolvedEndpoint(registered.hostString, registered.port) ?: registered
             }
         }
 
@@ -3154,12 +3330,62 @@ class YggTwinP2PBridge(
         if (literal.contains(".") && literal.contains(":")) {
             val h = literal.substringBeforeLast(":")
             val p = literal.substringAfterLast(":").toIntOrNull() ?: 51921
-            val isOwnLoopback = isSameIdentity && (h == "127.0.0.1" || h.equals("localhost", ignoreCase = true)) && p == localTcpPort
-            if (h.isNotBlank() && !isOwnLoopback && p in 1..65535) {
-                return InetSocketAddress.createUnresolved(h, p)
+            if (h.isNotBlank() && p in 1..65535 && !dialsOurOwnListener(h, p, senderIpv6)) {
+                return resolvedEndpoint(h, p)
             }
         }
         return null
+    }
+
+    /**
+     * True when a call frame names an address owned by one of this device's profiles.
+     * Compared through the canonical IPv6 form because a contact can carry the same
+     * address written differently from the profile record.
+     */
+    private fun isCallAddressedToLocalNode(ipv6: String): Boolean {
+        val canonical = YggCryptoEngine.normalizeIpv6Literal(ipv6) ?: return false
+        if (ipv6ToProfileIdMap.keys.any { YggCryptoEngine.normalizeIpv6Literal(it) == canonical }) return true
+        // A profile row can hold no usable address while its node key is correct, and an
+        // overlay address is nothing but that key written differently.
+        return profileIdToPubKeyMap.values.any { YggCryptoEngine.addressMatchesEd25519Key(ipv6, it) }
+    }
+
+    /**
+     * A LAN hint that terminates on the socket the *sending* profile is listening on —
+     * two app instances behind the same NAT address both advertise 10.0.2.15:51921 —
+     * points back at ourselves. Dialling it would let us ACK our own call signal and
+     * report a delivered call the peer never heard about, so such hints are dropped and
+     * the overlay carries the signal instead. Another local profile's port is a real
+     * route, so only the sender's own port counts as self.
+     */
+    private fun dialsOurOwnListener(host: String, port: Int, senderIpv6: String): Boolean {
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()].orEmpty()
+        if (port != (activeProfilePortMap[senderProfileId] ?: localTcpPort)) return false
+        if (host == "127.0.0.1" || host.equals("localhost", ignoreCase = true)) return true
+        val target = try {
+            InetAddress.getByName(host)
+        } catch (_: Exception) {
+            return true
+        }
+        return NetworkInterface.getNetworkInterfaces().asSequence().any { nic ->
+            nic.inetAddresses.asSequence().any { it.address.contentEquals(target.address) }
+        }
+    }
+
+    /**
+     * `Socket.connect` rejects unresolved endpoints with UnknownHostException, so every
+     * address that reaches a send path has to be resolved here. Literal IPs resolve
+     * instantly; a hostname that cannot be resolved yields no route at all instead of a
+     * socket error that would look like a peer outage. Called only on Dispatchers.IO.
+     */
+    private fun resolvedEndpoint(host: String, port: Int): InetSocketAddress? {
+        if (port !in 1..65535) return null
+        val address = try {
+            InetAddress.getByName(host)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return InetSocketAddress(address, port)
     }
 
     /**

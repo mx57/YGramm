@@ -99,7 +99,11 @@ object YggAudioMediaEngine {
     // Mic PCM is handed to the call layer for AEAD encryption and transmission.
     @Volatile private var voipMicFrameListener: ((ByteArray) -> Unit)? = null
     @Volatile private var voipLevelListener: ((Float) -> Unit)? = null
+    @Volatile private var voipMicCapturing = false
     private val voipRemotePcmQueue = java.util.concurrent.ConcurrentLinkedQueue<ByteArray>()
+
+    /** False when the call is transmitting filler because no AudioRecord came up. */
+    fun isVoipMicCapturing(): Boolean = voipMicCapturing
 
     /**
      * Starts real microphone capture using AudioRecord (16kHz, 16-bit PCM Mono).
@@ -517,8 +521,10 @@ object YggAudioMediaEngine {
                 if (candidateRec.state == AudioRecord.STATE_INITIALIZED) {
                     candidateRec.startRecording()
                     inRecord = candidateRec
+                    voipMicCapturing = true
                 } else {
                     candidateRec.release()
+                    voipMicCapturing = false
                 }
 
                 val frameSamples = 640 // 40ms at 16kHz
@@ -581,6 +587,7 @@ object YggAudioMediaEngine {
                 }
             } catch (_: Throwable) {
             } finally {
+                voipMicCapturing = false
                 try {
                     inRecord?.stop()
                 } catch (_: Throwable) {

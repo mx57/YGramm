@@ -286,6 +286,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private companion object {
         const val TYPING_THROTTLE_MS = 4_000L
         const val TYPING_EXPIRY_MS = 6_000L
+
+        // A muted peer still transmits encrypted silence, so this many seconds without a
+        // single decrypted inbound frame can only mean the media path is dead.
+        const val CALL_RX_STALL_SECONDS = 6
     }
 
     private var activeCallJob: kotlinx.coroutines.Job? = null
@@ -324,6 +328,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     // must not ring again or answer an already finished call.
     private val recentlyEndedCallIds = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val callRxFrameCounter = AtomicLong(0L)
+    // Inbound frames that arrived but failed AEAD opening: the channel is alive, the
+    // call keys are not. Without this counter both look identical to the user.
+    private val callRxAeadFailures = AtomicLong(0L)
     private val callMicQueue = Channel<ByteArray>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     @Volatile
@@ -699,7 +706,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val state = withContext(Dispatchers.IO) {
             YggNativeCoreBridge.readMeshState(profileId)
         }
-        _uiState.update { it.copy(coreMesh = state) }
+        _uiState.update {
+            it.copy(coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)))
+        }
     }
 
     private fun applyUserProfileEntityToState(profileEntity: UserProfileEntity) {
@@ -1020,7 +1029,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val allProfs = repository.getAllProfilesNow()
             val activeProfsCount = allProfs.count { it.isActiveInBackground || it.isCurrentPrimary }.coerceAtLeast(1)
-            val alivePeersCount = peers.value.count { it.isConnected }
+            val coreLinks = networkEngine.coreLiveLinkCount()
+            val alivePeersCount = if (coreLinks >= 0) coreLinks else peers.value.count { it.isConnected }
             val portsSummary = networkEngine.getActivePortsSummary()
             _uiState.update { it.copy(activePortsSummary = portsSummary) }
             YggNodeForegroundService.startOrUpdateNodeService(
@@ -1233,6 +1243,56 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             syncForegroundServiceNotification()
+        }
+    }
+
+    /**
+     * Panic-wipe: stops every Go node, deletes all profiles (with their mnemonic
+     * key material), chats, messages, transfers, keys and backups, then boots a
+     * fresh default profile — the device ends in the same state as right after
+     * installation.
+     */
+    fun panicWipeAllData() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                YggNativeCoreBridge.stopAllCores()
+            }
+            networkEngine.panicResetCoreState()
+            repository.panicWipeAllData()
+            clearPacketLogs()
+            val primaryProfile = repository.ensureInitialized(initialIdentity)
+            applyUserProfileEntityToState(primaryProfile)
+            val allProfs = repository.getAllProfilesNow()
+            networkEngine.syncConcurrentProfileListeners(allProfs)
+            _uiState.update {
+                it.copy(
+                    txPacketsCount = 0,
+                    rxPacketsCount = 0,
+                    statusBannerMessage =
+                        "Экстренное стирание выполнено: профили, ключи и переписка удалены с устройства"
+                )
+            }
+            syncForegroundServiceNotification()
+        }
+    }
+
+    /**
+     * Records the user's manual confirmation that the contact's safety number
+     * matched out-of-band. Only the local flag changes — nothing is announced
+     * over the mesh, because the peer cannot prove the match by itself.
+     */
+    fun setContactKeyVerified(chatId: String, verified: Boolean) {
+        viewModelScope.launch {
+            repository.setConversationKeyVerified(chatId, verified)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (verified) {
+                        "Ключ узла помечен верифицированным — сверяйте safety number заново при смене ключа"
+                    } else {
+                        "Пометка верификации ключа снята"
+                    }
+                )
+            }
         }
     }
 
@@ -2176,7 +2236,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         YggRepository.isSelfChatId(newChatId) ->
                             "Распознан ваш собственный QR-код: открыт чат «Избранное • Мой узел Yggdrasil»"
                         hasNodeKey ->
-                            "По QR-коду добавлен контакт «${parsedQr.displayName}» с проверенным Ed25519-ключом"
+                            "По QR-коду добавлен контакт «${parsedQr.displayName}»: Ed25519-ключ совпадает с адресом узла"
                         createdLanHint.isNotBlank() ->
                             "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint), оверлей требует полный ?pub=…"
                         else ->
@@ -2293,7 +2353,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 var deliveredTransport = ""
                 var deliveredRtt = -1L
                 var delivered = false
-                val maxAttempts = 4
+                // One dispatch already re-offers the frame until its CALL_ACK lands, so
+                // two rounds only exist to refresh the status line for the user.
+                val maxAttempts = 2
                 for (attempt in 0 until maxAttempts) {
                     if (_uiState.value.activeVoiceCall?.callId != callId) return@launch
                     if (attempt > 0) {
@@ -2358,12 +2420,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         )
                     )
                 }
-                val answer = withTimeoutOrNull(45_000L) { acceptDeferred.await() }
+                // The callee stops ringing 45 s after the first RINGING lands, which can
+                // be well before this delivery confirmation, so a shorter wait here still
+                // covers the whole remote timer; MISSED/BYE end it even earlier.
+                val answer = withTimeoutOrNull(35_000L) { acceptDeferred.await() }
                 if (pendingCallAccept === acceptDeferred) pendingCallAccept = null
                 if (answer == null) {
                     // Clear the dialing UI first: dispatching MISSED can take tens of
                     // seconds on a lossy overlay, and the phone must not stay "ringing".
-                    finishCallWithError("Абонент «${conv.title}» не ответил за 45 секунд", "MISSED")
+                    finishCallWithError("Абонент «${conv.title}» не ответил", "MISSED")
                     viewModelScope.launch {
                         networkEngine.dispatchCallControlSignal(
                             chatId = conv.chatId,
@@ -2382,20 +2447,26 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
                 when (answer.signalAction.uppercase()) {
                     "ACCEPT" -> {
-                        val peerKey = if (isX25519KeyHex(ctx.peerX25519PubHex)) {
-                            ctx.peerX25519PubHex
-                        } else {
-                            answer.senderX25519PubKeyHex
-                        }
+                        // The key carried by ACCEPT is live proof of who answered. A
+                        // locally pinned key can belong to an identity that was wiped and
+                        // regenerated since, and deriving the media key from it makes every
+                        // audio frame undecryptable while the UI still claims a call.
+                        val announced = answer.senderX25519PubKeyHex.trim().lowercase()
+                        val peerKey = if (isX25519KeyHex(announced)) announced else ctx.peerX25519PubHex
                         if (!isX25519KeyHex(peerKey)) {
                             finishCallWithError("Абонент ответил, но не передал X25519-ключ для E2EE-аудио")
                             return@launch
                         }
+                        val keyChanged = isX25519KeyHex(ctx.peerX25519PubHex) &&
+                            ctx.peerX25519PubHex.trim().lowercase() != peerKey
                         val acceptedCtx = ctx.copy(peerX25519PubHex = peerKey.trim().lowercase())
                         activeCallContext = acceptedCtx
                         val key = deriveCallKey(acceptedCtx)
                         if (key == null) {
-                            finishCallWithError("Не удалось вывести общий E2EE-ключ звонка")
+                            finishCallWithError(
+                                "Не удалось вывести общий E2EE-ключ звонка",
+                                notifyPeer = true
+                            )
                             return@launch
                         }
                         activeCallMediaKey = key
@@ -2413,16 +2484,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             allowLanFallback = allowLan
                         )
                         if (!media.opened) {
+                            // The callee already stopped ringing: without BYE it would sit
+                            // in a call that this side has already left.
                             finishCallWithError(
                                 "Абонент ответил, но голосовой канал не открылся: " +
-                                    (media.errorDetail ?: "нет маршрута")
+                                    (media.errorDetail ?: "нет маршрута"),
+                                notifyPeer = true
                             )
                             return@launch
                         }
                         activateCall(
                             ctx = acceptedCtx,
                             transport = media.transport.ifBlank { deliveredTransport },
-                            rttMs = media.rttMs.takeIf { it > 0 } ?: deliveredRtt
+                            rttMs = media.rttMs.takeIf { it > 0 } ?: deliveredRtt,
+                            note = if (keyChanged) {
+                                "X25519-ключ собеседника сменился с прошлого звонка — сверьте эмодзи SAS"
+                            } else {
+                                ""
+                            }
                         )
                     }
                     "DECLINE" -> finishCallWithError("Абонент «${conv.title}» отклонил вызов", "DECLINED")
@@ -2518,7 +2597,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (recentlyEndedCallIds.containsKey(callSig.callId)) return
         // A retried RINGING for the call we already know must not become BUSY:
         // that used to tear down a call the user had just answered.
-        if (activeCallContext?.callId == callSig.callId) return
+        val own = activeCallContext
+        if (own != null && own.callId == callSig.callId) {
+            if (!own.isIncoming) {
+                // The ring landed back on this device: both legs are profiles of the one
+                // process, which holds a single call slot. Saying "абонент не ответил"
+                // after 35 silent seconds would blame the peer for our own limit.
+                finishCallWithError(
+                    "Звонок между двумя профилями одного устройства не поддерживается: " +
+                        "наберите собеседника на другом устройстве"
+                )
+            }
+            return
+        }
 
         val allProfs = repository.getAllProfilesNow()
         val targetProfile = allProfs.find {
@@ -2697,7 +2788,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
         activeCallJob?.cancel()
         activeCallJob = viewModelScope.launch {
-            var answer = networkEngine.dispatchCallControlSignal(
+            // One dispatch re-offers ACCEPT until the caller's CALL_ACK lands. The return
+            // path over the overlay is cold at this moment (the caller was the only side
+            // transmitting), so this is what turns "the peer answered" into a fact.
+            val answer = networkEngine.dispatchCallControlSignal(
                 chatId = ctx.chatId,
                 callId = ctx.callId,
                 signalAction = "ACCEPT",
@@ -2707,32 +2801,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 senderName = ctx.localName,
                 senderX25519PubKeyHex = ctx.localX25519PubHex,
                 directEndpointHint = ctx.peerLanHint,
-                allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+                allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery,
+                timeoutMs = 25_000L
             )
             if (!answer.delivered) {
-                // The caller keeps ringing while it waits for ACCEPT, so a second
-                // attempt is safe and rescues a lost datagram on a lossy overlay.
-                delay(700L)
-                answer = networkEngine.dispatchCallControlSignal(
-                    chatId = ctx.chatId,
-                    callId = ctx.callId,
-                    signalAction = "ACCEPT",
-                    peerIpv6 = ctx.peerIpv6,
-                    recipientNodePubKeyHex = ctx.peerNodeKeyHex,
-                    senderIpv6 = ctx.localIpv6,
-                    senderName = ctx.localName,
-                    senderX25519PubKeyHex = ctx.localX25519PubHex,
-                    directEndpointHint = ctx.peerLanHint,
-                    allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery
+                finishCallWithError(
+                    "Не удалось подтвердить вызов: ${answer.errorDetail ?: "нет маршрута"}",
+                    notifyPeer = true
                 )
-            }
-            if (!answer.delivered) {
-                finishCallWithError("Не удалось подтвердить вызов: ${answer.errorDetail ?: "нет маршрута"}")
                 return@launch
             }
             val key = activeCallMediaKey ?: deriveCallKey(ctx)
             if (key == null) {
-                finishCallWithError("Не удалось вывести общий E2EE-ключ звонка")
+                finishCallWithError("Не удалось вывести общий E2EE-ключ звонка", notifyPeer = true)
                 return@launch
             }
             activeCallMediaKey = key
@@ -2748,7 +2829,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
             if (!media.opened) {
                 finishCallWithError(
-                    "Голосовой канал не открылся: " + (media.errorDetail ?: "нет маршрута")
+                    "Голосовой канал не открылся: " + (media.errorDetail ?: "нет маршрута"),
+                    notifyPeer = true
                 )
                 return@launch
             }
@@ -2764,7 +2846,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         finishCallWithError("Входящий вызов от «${ctx.peerTitle}» отклонён", "DECLINED")
     }
 
-    private fun activateCall(ctx: CallSessionContext, transport: String, rttMs: Long) {
+    private fun activateCall(ctx: CallSessionContext, transport: String, rttMs: Long, note: String = "") {
         val app = getApplication<Application>()
         val call = _uiState.value.activeVoiceCall ?: return
         if (call.callId != ctx.callId) return
@@ -2774,7 +2856,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
         val effectiveTransport = transport.ifBlank { "YGG_OVERLAY" }
         val effectiveRtt = rttMs.takeIf { it > 0 } ?: 0L
+        val channelLine = "Зашифрованный аудиопоток AES-256-GCM • $effectiveTransport" +
+            (if (effectiveRtt > 0) " • RTT $effectiveRtt мс" else "") +
+            // Silent filler frames keep the counters moving without a capture device, so
+            // the call UI has to say that nothing real is leaving this side.
+            (if (YggAudioMediaEngine.isVoipMicCapturing()) "" else " • микрофон не захвачен: уходит тишина")
         callRxFrameCounter.set(0)
+        callRxAeadFailures.set(0)
         callLastLevelEmitAt = 0L
         while (callMicQueue.tryReceive().isSuccess) {
         }
@@ -2814,8 +2902,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             state.copy(
                 activeVoiceCall = active.copy(
                     callStatus = "ACTIVE_ENCRYPTED",
-                    statusSubtext = "Зашифрованный аудиопоток AES-256-GCM • $effectiveTransport" +
-                        if (effectiveRtt > 0) " • RTT $effectiveRtt мс" else "",
+                    statusSubtext = if (note.isBlank()) channelLine else "$note • $channelLine",
                     transport = effectiveTransport,
                     mediaEncrypted = true,
                     liveRttMs = effectiveRtt.toInt(),
@@ -2862,6 +2949,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         callTickerJob = viewModelScope.launch {
             var elapsed = 0
             var lastRx = callRxFrameCounter.get()
+            var silentSeconds = 0
             while (true) {
                 delay(1_000L)
                 val active = _uiState.value.activeVoiceCall ?: break
@@ -2870,6 +2958,23 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 val rxNow = callRxFrameCounter.get()
                 val rxDelta = (rxNow - lastRx).coerceAtLeast(0L)
                 lastRx = rxNow
+                silentSeconds = if (rxDelta == 0L) silentSeconds + 1 else 0
+                if (silentSeconds >= CALL_RX_STALL_SECONDS) {
+                    // The peer transmits encrypted silence while muted, so nothing has
+                    // arrived at all: the "encrypted call" the timer shows is not real.
+                    val failures = callRxAeadFailures.get()
+                    finishCallWithError(
+                        if (failures > 0) {
+                            "Аудио собеседника не расшифровывается ($failures кадров): " +
+                                "E2EE-ключи звонка не совпадают"
+                        } else {
+                            "Голосовой канал прерван: от собеседника не пришёл ни один аудиокадр"
+                        },
+                        outcome = "FAILED",
+                        notifyPeer = true
+                    )
+                    break
+                }
                 _uiState.update { state ->
                     val current = state.activeVoiceCall ?: return@update state
                     if (current.callId != ctx.callId || current.callStatus != "ACTIVE_ENCRYPTED") {
@@ -2896,7 +3001,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (packet.ivBase64.isBlank() || packet.cipherBase64.isBlank()) return
         val pcm = runCatching {
             YggCryptoEngine.openCallMediaFrame(key, packet.ivBase64, packet.cipherBase64, packet.callId)
-        }.getOrNull() ?: return
+        }.getOrElse {
+            callRxAeadFailures.incrementAndGet()
+            return
+        }
         if (pcm.isEmpty()) return
         YggAudioMediaEngine.enqueueVoipRemotePcm(pcm)
         callRxFrameCounter.incrementAndGet()
@@ -2993,17 +3101,25 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     senderX25519PubKeyHex = ctx.localX25519PubHex,
                     directEndpointHint = ctx.peerLanHint,
                     allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery || ctx.peerLanHint.isNotBlank(),
-                    timeoutMs = 5_000L
+                    timeoutMs = 12_000L
                 )
             }
         }
     }
 
-    private fun finishCallWithError(message: String?, outcome: String? = null) {
+    private fun finishCallWithError(
+        message: String?,
+        outcome: String? = null,
+        notifyPeer: Boolean = false
+    ) {
         val app = getApplication<Application>()
         val ctx = activeCallContext
         val endedCall = _uiState.value.activeVoiceCall
         val startedAt = activeCallStartedAt
+        // A locally detected failure (dead media path, channel that never opened) leaves
+        // the peer sitting in a call that has already ended here; without BYE it only
+        // finds out from its own stall timeout.
+        if (notifyPeer && ctx != null) sendCallControlSignalAsync(ctx, "BYE")
         YggCallAlertController.stop()
         ctx?.callId?.takeIf { it.isNotBlank() }?.let { callId ->
             YggNotificationCenter.cancelIncomingCall(app, callId)
@@ -3027,6 +3143,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         activeCallStartedAt = 0L
         activeCallMediaKey = null
         callRxFrameCounter.set(0)
+        callRxAeadFailures.set(0)
         callLastLevelEmitAt = 0L
         while (callMicQueue.tryReceive().isSuccess) {
         }
@@ -3451,7 +3568,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     statusBannerMessage = when {
                         YggRepository.isSelfChatId(newChatId) ->
                             "Открыт чат «Избранное • Мой узел Yggdrasil» (маршрутизация через внешние пиры)"
-                        hasNodeKey -> "Добавлен контакт «$effectiveTitle» с проверенным Ed25519-ключом"
+                        hasNodeKey -> "Добавлен контакт «$effectiveTitle»: Ed25519-ключ совпадает с адресом узла"
                         createdLanHint.isNotBlank() ->
                             "Контакт «$effectiveTitle» добавлен: доступен только прямой LAN-маршрут ($createdLanHint), для оверлея нужен полный идентификатор с ?pub=…"
                         else ->
@@ -3526,12 +3643,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 isConnected = probe.reachable,
                 whitelistCompatible = whitelistCompatible
             )
+            val core = networkEngine.applyPeerChangeToCores(endpointUri.trim(), enabled = true)
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = if (probe.reachable) {
-                        "Пир $endpointUri проверен и подключен (RTT: ${probe.rttMs} мс)"
-                    } else {
-                        "Пир $endpointUri добавлен, но сейчас недоступен (${probe.errorDetail ?: "offline"})"
+                    statusBannerMessage = when {
+                        core.applied == 0 ->
+                            "Пир $endpointUri сохранён, но живая нода его не приняла: " +
+                                (core.errorDetail ?: "нет активной ноды Yggdrasil")
+                        probe.reachable ->
+                            "Пир $endpointUri добавлен в ноду (TCP-пинг ${probe.rttMs} мс • " +
+                                "линков ядра: ${core.liveLinks} из ${core.totalLinks})"
+                        else ->
+                            "Пир $endpointUri добавлен в ноду, но TCP-пинг не прошёл " +
+                                "(${probe.errorDetail ?: "узел недоступен"}) • линков ядра: ${core.liveLinks} из ${core.totalLinks}"
                     }
                 )
             }
@@ -3554,14 +3678,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     rxDelta = probe.rxBytes,
                     txDelta = probe.txBytes
                 )
-                if (!probe.reachable) {
-                    _uiState.update {
-                        it.copy(statusBannerMessage = "Не удалось подключиться к ${peer.endpointUri}: ${probe.errorDetail ?: "узел недоступен"}")
-                    }
-                } else {
-                    _uiState.update {
-                        it.copy(statusBannerMessage = "Пир ${peer.endpointUri} подключен (RTT: ${probe.rttMs} мс)")
-                    }
+                val core = networkEngine.applyPeerChangeToCores(peer.endpointUri, enabled = true)
+                // Reachability of the port says nothing about the Yggdrasil link: only
+                // the node can say whether it actually brought the peer up.
+                val linkLine = if (core.applied > 0) " • линков ядра: ${core.liveLinks} из ${core.totalLinks}" else ""
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            !probe.reachable ->
+                                "Не удалось подключиться к ${peer.endpointUri}: ${probe.errorDetail ?: "узел недоступен"}"
+                            core.applied == 0 ->
+                                "${peer.endpointUri} сохранён, но нода его не приняла: ${core.errorDetail ?: "нет активной ноды"}"
+                            else ->
+                                "Пир ${peer.endpointUri} добавлен в ноду (RTT: ${probe.rttMs} мс$linkLine)"
+                        }
+                    )
                 }
             } else {
                 repository.updatePeerProbeStatus(
@@ -3569,6 +3700,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     reachable = false,
                     latencyMs = -1
                 )
+                networkEngine.applyPeerChangeToCores(peer.endpointUri, enabled = false)
             }
             syncForegroundServiceNotification()
         }
@@ -3576,7 +3708,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun removePeer(peerId: String) {
         viewModelScope.launch {
+            val uri = peers.value.find { it.peerId == peerId }?.endpointUri.orEmpty()
             repository.deletePeer(peerId)
+            if (uri.isNotBlank()) networkEngine.applyPeerChangeToCores(uri, enabled = false)
             syncForegroundServiceNotification()
         }
     }

@@ -41,6 +41,11 @@ class YggRepository(
     suspend fun getConversationTitle(chatId: String): String? =
         dao.getConversationById(chatId)?.title
 
+    suspend fun setConversationKeyVerified(chatId: String, verified: Boolean) {
+        val conv = dao.getConversationById(chatId) ?: return
+        dao.upsertConversation(conv.copy(isVerified = verified))
+    }
+
     suspend fun recordCallLog(entry: CallLogEntity) = dao.upsertCallLog(entry)
 
     /**
@@ -183,6 +188,8 @@ class YggRepository(
     }
 
     suspend fun getAllProfilesNow(): List<UserProfileEntity> = dao.getAllProfilesNow()
+
+    suspend fun panicWipeAllData() = dao.wipeAllUserData()
 
     suspend fun createNewUserProfile(
         displayName: String,
@@ -1001,7 +1008,7 @@ class YggRepository(
                     }
                     ?: "",
                 protocolType = "YGG_X25519_AESGCM",
-                isVerified = true,
+                isVerified = false,
                 sealedSenderEnabled = true,
                 disappearingTtlSeconds = 0,
                 unreadCount = 0,
@@ -1324,7 +1331,9 @@ class YggRepository(
             yggIpv6Address = cleanIpv6,
             publicKeyHex = effectivePubKey,
             protocolType = "YGG_X25519_AESGCM",
-            isVerified = true,
+            // Only a second profile of this device is verified by construction; a remote
+            // contact's key needs the out-of-band safety-number check in the chat inspector.
+            isVerified = localTargetProfile != null,
             sealedSenderEnabled = true,
             disappearingTtlSeconds = disappearingSeconds,
             unreadCount = 0,

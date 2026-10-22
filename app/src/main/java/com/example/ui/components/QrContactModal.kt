@@ -128,6 +128,11 @@ fun QrContactModal(
         YggQrCodeCodec.renderQrBitmap(myContactUri, sizePx = 560)
     }
 
+    val ownSafetyNumber = remember(uiState.identity.yggNodePublicKeyHex) {
+        com.example.engine.YggCryptoEngine.safetyNumber(uiState.identity.yggNodePublicKeyHex)
+            .ifBlank { "Ключ узла ещё не вычислен" }
+    }
+
     var scannerStatus by remember { mutableStateOf("Камера не активна") }
     var scannerStatusError by remember { mutableStateOf(false) }
 
@@ -353,6 +358,27 @@ fun QrContactModal(
                                     color = CyberTealSecondary,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "Ключевое число вашего узла (safety number)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = ownSafetyNumber,
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = EmeraldPrimary,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("my_safety_number_text")
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "Собеседник сверяет это число с инспектором ключей в вашем чате на своём устройстве.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }

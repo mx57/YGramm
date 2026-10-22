@@ -1,7 +1,6 @@
 // File: app/src/main/java/com/example/ui/screens/NetworkMapScreen.kt
 package com.example.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -12,7 +11,11 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,19 +32,15 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AltRoute
+import androidx.compose.material.icons.automirrored.filled.AltRoute
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.HourglassTop
-import androidx.compose.material.icons.filled.Hub
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Route
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -55,6 +54,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,8 +67,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -78,11 +79,14 @@ import androidx.compose.ui.unit.sp
 import com.example.data.ConversationEntity
 import com.example.data.MessageEntity
 import com.example.data.YggPeerEntity
-import com.example.engine.YggLivePacketLogEntry
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.YggGramUiState
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.sqrt
 
 data class MapNodeItem(
     val id: String,
@@ -105,7 +109,7 @@ data class MessageRouteTrack(
     val plainText: String,
     val deliveryStatus: String, // "CONFIRMED_ACK", "SENT_OVERLAY", "QUEUED_SF"
     val hops: List<String>,
-    val rttMs: Long,
+    val rttMs: Long, // -1 when the app never measured a real round trip
     val cipherPayloadHex: String,
     val hashcashPow: String,
     val transport: String
@@ -125,19 +129,25 @@ fun NetworkMapScreen(
     var viewMode by remember { mutableStateOf("MAP") } // "MAP" or "LIST"
     var selectedFilter by remember { mutableStateOf("ALL") } // "ALL", "CONFIRMED", "QUEUED"
     var selectedTrackForInspection by remember { mutableStateOf<MessageRouteTrack?>(null) }
+    var selectedMapNode by remember { mutableStateOf<MapNodeItem?>(null) }
 
-    // Synthesize nodes for map rendering
+    val core = uiState.coreMesh
+
     val localNode = MapNodeItem(
         id = "local_node",
         label = uiState.userProfile.displayName,
         ipv6 = uiState.identity.yggIpv6Address,
         countryFlag = "📱",
-        region = "Локальный узел (Порт :${uiState.localUdpPort})",
+        region = if (core.available) {
+            val restartSuffix = if (core.restartCount > 0) " • перезапусков ${core.restartCount}" else ""
+            "Go-ядро: линков ${core.liveLinks}/${core.totalLinks} • сессий ${core.sessionCount}$restartSuffix"
+        } else {
+            "Ядро недоступно"
+        },
         type = "LOCAL",
         xRatio = 0.22f,
         yRatio = 0.52f,
-        isConnected = uiState.isNetworkAvailable,
-        rttMs = 1
+        isConnected = core.available && core.liveLinks > 0
     )
 
     val activePeers = peers.take(6).mapIndexed { idx, p ->
@@ -168,70 +178,48 @@ fun NetworkMapScreen(
             xRatio = 0.82f,
             yRatio = 0.20f + idx * 0.22f,
             isConnected = c.isOnlineInMesh,
-            rttMs = if (c.isOnlineInMesh) 42 else -1
+            rttMs = -1 // per-contact RTT is only known from a real ping
         )
     }
 
     val allMapNodes = listOf(localNode) + activePeers + contactNodes
 
-    // Synthesize message tracks from real messages
-    val sampleTracks = remember(allMessages, conversations) {
-        val tracks = mutableListOf<MessageRouteTrack>()
-        allMessages.take(12).forEach { msg ->
+    val tracks = remember(allMessages, conversations, core.liveLinks) {
+        val formatter = SimpleDateFormat("HH:mm", Locale.getDefault())
+        allMessages.take(12).mapNotNull { msg ->
+            if (msg.deliveryState == "LOCAL_NOTE") return@mapNotNull null
             val conv = conversations.find { it.chatId == msg.chatId }
             val recipName = conv?.title ?: "Узел Yggdrasil"
             val status = when (msg.deliveryState) {
-                "DELIVERED_ACK" -> "CONFIRMED_ACK"
+                "DELIVERED", "READ" -> "CONFIRMED_ACK"
                 "SENT_P2P" -> "SENT_OVERLAY"
                 else -> "QUEUED_SF"
             }
-            val hopList = listOf(
-                "1. Мой узел (${uiState.identity.yggIpv6Address.take(12)}...)",
-                "2. Транзитный пир Yggdrasil 0200::/7",
-                "3. Целевой узел «$recipName» (${conv?.yggIpv6Address?.take(12) ?: "0200::"}...)"
-            )
-            tracks.add(
-                MessageRouteTrack(
-                    messageId = msg.messageId,
-                    senderName = if (msg.isOutgoing) uiState.userProfile.displayName else recipName,
-                    recipientName = if (msg.isOutgoing) recipName else uiState.userProfile.displayName,
-                    timestampFormatted = "Сегодня",
-                    plainText = msg.plainText,
-                    deliveryStatus = status,
-                    hops = hopList,
-                    rttMs = if (status == "CONFIRMED_ACK") 38L else 0L,
-                    cipherPayloadHex = msg.cipherPayloadHex.ifBlank { "e3a890b214c7823f..." },
-                    hashcashPow = msg.hashcashPowToken.ifBlank { "hc1:10:pow_valid" },
-                    transport = if (status == "CONFIRMED_ACK") "YGG_OVERLAY (0200::/7)" else "STORE_AND_FORWARD"
-                )
-            )
-        }
-        if (tracks.isEmpty()) {
-            tracks.add(
-                MessageRouteTrack(
-                    messageId = "demo_track_01",
-                    senderName = uiState.userProfile.displayName,
-                    recipientName = "Узел Мимир",
-                    timestampFormatted = "Сейчас",
-                    plainText = "Тестовый пакетированный трафик оверлея Yggdrasil",
-                    deliveryStatus = "CONFIRMED_ACK",
-                    hops = listOf(
-                        "1. Мой узел (51921)",
-                        "2. Публичный пир static-mon.yandex.net",
-                        "3. Пир helsinki1.ygg",
-                        "4. Целевой узел Мимир"
-                    ),
-                    rttMs = 45L,
-                    cipherPayloadHex = "9f41a08c273b6501e849201c73d6a9021f384e55",
-                    hashcashPow = "hc1:10:1729200001:7:0000",
-                    transport = "YGG_OVERLAY 0200::/7"
-                )
+            MessageRouteTrack(
+                messageId = msg.messageId,
+                senderName = if (msg.isOutgoing) uiState.userProfile.displayName else recipName,
+                recipientName = if (msg.isOutgoing) recipName else uiState.userProfile.displayName,
+                timestampFormatted = formatter.format(Date(msg.timestamp)),
+                plainText = msg.plainText,
+                deliveryStatus = status,
+                hops = listOf(
+                    "Мой узел (${uiState.identity.yggIpv6Address.take(12)}…)",
+                    "Оверлей 0200::/7 • живых линков ядра: ${core.liveLinks}",
+                    "Узел «$recipName» (${conv?.yggIpv6Address?.take(12) ?: "0200::"}…)"
+                ),
+                rttMs = -1,
+                cipherPayloadHex = msg.cipherPayloadHex,
+                hashcashPow = msg.hashcashPowToken,
+                transport = when (status) {
+                    "CONFIRMED_ACK" -> "YGG_OVERLAY (0200::/7), ACK получателя"
+                    "SENT_OVERLAY" -> "YGG_OVERLAY (0200::/7), ACK не приходил"
+                    else -> "ОЧЕРЕДЬ ДОСТАВКИ"
+                }
             )
         }
-        tracks
     }
 
-    val filteredTracks = sampleTracks.filter { track ->
+    val filteredTracks = tracks.filter { track ->
         when (selectedFilter) {
             "CONFIRMED" -> track.deliveryStatus == "CONFIRMED_ACK"
             "QUEUED" -> track.deliveryStatus == "QUEUED_SF"
@@ -274,7 +262,7 @@ fun NetworkMapScreen(
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = "Визуализация оверлейных хопов 0200::/7, пингов и треков пакетов",
+                                text = "Топология читается из Go-ядра и TCP/TLS-сканера без выдуманных значений",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -307,12 +295,16 @@ fun NetworkMapScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
                         FilterChip(
                             selected = viewMode == "MAP",
                             onClick = { viewMode = "MAP" },
@@ -326,8 +318,8 @@ fun NetworkMapScreen(
                         FilterChip(
                             selected = viewMode == "LIST",
                             onClick = { viewMode = "LIST" },
-                            label = { Text("Треки сообщений (${sampleTracks.size})", fontSize = 12.sp) },
-                            leadingIcon = { Icon(Icons.Default.AltRoute, contentDescription = null, modifier = Modifier.size(14.dp)) },
+                            label = { Text("Треки сообщений (${tracks.size})", fontSize = 12.sp) },
+                            leadingIcon = { Icon(Icons.AutoMirrored.Filled.AltRoute, contentDescription = null, modifier = Modifier.size(14.dp)) },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                                 selectedLabelColor = CyberTealSecondary
@@ -335,42 +327,54 @@ fun NetworkMapScreen(
                         )
                     }
 
+                    val scannedLive = peers.count { it.isConnected }
+                    val bestRtt = peers.filter { it.isConnected && it.latencyMs > 0 }.minOfOrNull { it.latencyMs }
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer,
                         shape = RoundedCornerShape(8.dp)
                     ) {
-                        val livePeerRtt = peers.filter { it.isConnected && it.latencyMs > 0 }.minOfOrNull { it.latencyMs } ?: 35
                         Text(
-                            text = "Пиров: ${peers.count { it.isConnected }}/${peers.size} • RTT: $livePeerRtt мс",
+                            text = if (core.available) {
+                                "Ядро: ${core.liveLinks}/${core.totalLinks} линков • сканер: $scannedLive/${peers.size}" +
+                                    (bestRtt?.let { " • $it мс" } ?: "") +
+                                    (if (core.restartCount > 0) " • перезапусков ${core.restartCount}" else "")
+                            } else {
+                                "Ядро недоступно • сканер: $scannedLive/${peers.size}"
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
-                            color = CyberTealSecondary,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            color = if (core.available && core.liveLinks > 0) CyberTealSecondary else AmberShieldTertiary,
+                            modifier = Modifier
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .testTag("map_core_status_badge")
                         )
                     }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
-
-        if (viewMode == "MAP") {
+        LazyColumn(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(top = 10.dp, bottom = 4.dp)
+        ) {
+            if (viewMode == "MAP") {
+            item(key = "mesh_map") {
             // World Map & Interactive Topology Canvas
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(280.dp),
+                    .height(300.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF09141D)),
                 shape = RoundedCornerShape(16.dp)
             ) {
                 Box(modifier = Modifier.fillMaxSize()) {
                     YggNetworkMeshCanvas(
                         mapNodes = allMapNodes,
-                        onNodeClick = { node ->
-                            if (node.type == "CONTACT") {
-                                onPingChatRoute(node.id)
-                            }
-                        }
+                        selectedNodeId = selectedMapNode?.id,
+                        onNodeClick = { node -> selectedMapNode = node }
                     )
 
                     // Map Overlay Badge
@@ -389,11 +393,11 @@ fun NetworkMapScreen(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(EmeraldPrimary)
+                                    .background(if (core.available && core.liveLinks > 0) EmeraldPrimary else AmberShieldTertiary)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Интерактивная карта 0200::/7 • Нажмите узел для пинга",
+                                text = "Оверлей 0200::/7 • нажмите узел для подробностей",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color.White
                             )
@@ -401,9 +405,62 @@ fun NetworkMapScreen(
                     }
                 }
             }
+            }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            // Selected node detail
+            selectedMapNode?.let { node ->
+                item(key = "node_detail") {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "${node.countryFlag} ${node.label}",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = node.region,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = node.ipv6 + if (node.rttMs > 0) " • ${node.rttMs} мс" else "",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = CyberTealSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        if (node.type == "CONTACT") {
+                            TextButton(
+                                onClick = { onPingChatRoute(node.id) },
+                                modifier = Modifier.testTag("map_ping_contact_${node.id}")
+                            ) {
+                                Text("Пинг маршрута", fontSize = 12.sp)
+                            }
+                        }
+                        IconButton(onClick = { selectedMapNode = null }) {
+                            Icon(Icons.Default.Close, contentDescription = "Скрыть", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+                }
+            }
 
+            item(key = "mesh_stats") {
             // Quick Stats Row
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -423,7 +480,7 @@ fun NetworkMapScreen(
                         Column {
                             Text("Узлов в дереве", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
-                                text = "${uiState.coreMesh.knownNodes.coerceAtLeast(14)} узлов",
+                                text = if (core.available) "${core.knownNodes} узлов" else "нет данных",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
@@ -456,17 +513,18 @@ fun NetworkMapScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            }
         }
 
-        // Filter Bar for Message Tracks
+            // Filter Bar for Message Tracks
+            item(key = "filter_bar") {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "Детальные Треки Сообщений:",
+                text = "Треки сообщений:",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
@@ -490,20 +548,36 @@ fun NetworkMapScreen(
                 )
             }
         }
-
-        Spacer(modifier = Modifier.height(6.dp))
+        }
 
         // Message Tracks List
-        LazyColumn(
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
+        if (filteredTracks.isEmpty()) {
+            item(key = "tracks_empty") {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(
+                    text = if (tracks.isEmpty()) {
+                        "Пока нет отправленных сообщений — трек маршрута появится после первой отправки."
+                    } else {
+                        "Нет треков с выбранным статусом."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(14.dp)
+                )
+            }
+            }
+        } else {
             items(filteredTracks, key = { it.messageId }) { track ->
                 MessageTrackItemCard(
                     track = track,
                     onClick = { selectedTrackForInspection = track }
                 )
             }
+        }
         }
     }
 
@@ -519,6 +593,7 @@ fun NetworkMapScreen(
 @Composable
 fun YggNetworkMeshCanvas(
     mapNodes: List<MapNodeItem>,
+    selectedNodeId: String?,
     onNodeClick: (MapNodeItem) -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -532,11 +607,37 @@ fun YggNetworkMeshCanvas(
         label = "particle"
     )
 
+    val labelPaint = remember {
+        android.graphics.Paint().apply {
+            isAntiAlias = true
+            textSize = 26f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+    }
+    val rttPaint = remember {
+        android.graphics.Paint().apply {
+            isAntiAlias = true
+            textSize = 20f
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+    }
+
     Canvas(
         modifier = Modifier
             .fillMaxSize()
-            .clickable {
-                // Click nearest node
+            .pointerInput(mapNodes) {
+                detectTapGestures { tap ->
+                    val nearest = mapNodes.minByOrNull { node ->
+                        val dx = node.xRatio * size.width - tap.x
+                        val dy = node.yRatio * size.height - tap.y
+                        sqrt(dx * dx + dy * dy)
+                    }
+                    if (nearest != null) {
+                        val dx = nearest.xRatio * size.width - tap.x
+                        val dy = nearest.yRatio * size.height - tap.y
+                        if (sqrt(dx * dx + dy * dy) < 90f) onNodeClick(nearest)
+                    }
+                }
             }
     ) {
         val width = size.width
@@ -575,9 +676,11 @@ fun YggNetworkMeshCanvas(
             val nodeOffset = Offset(node.xRatio * width, node.yRatio * height)
             val linkColor = when {
                 !node.isConnected -> Color(0xFF5A2A2A)
-                node.type == "CONTACT" -> AmberShieldTertiary
-                node.type == "RELAY" -> CyberTealSecondary
-                else -> EmeraldPrimary.copy(alpha = 0.6f)
+                node.rttMs in 1..119 -> EmeraldPrimary.copy(alpha = 0.75f)
+                node.rttMs in 120..399 -> CyberTealSecondary.copy(alpha = 0.75f)
+                node.rttMs >= 400 -> AmberShieldTertiary.copy(alpha = 0.75f)
+                node.type == "CONTACT" -> AmberShieldTertiary.copy(alpha = 0.6f)
+                else -> CyberTealSecondary.copy(alpha = 0.5f)
             }
 
             // Curved Arc
@@ -592,7 +695,7 @@ fun YggNetworkMeshCanvas(
                 path = path,
                 color = linkColor,
                 style = Stroke(
-                    width = if (node.isConnected) 2f else 1f,
+                    width = if (node.isConnected) 2.5f else 1f,
                     pathEffect = if (!node.isConnected) PathEffect.dashPathEffect(floatArrayOf(8f, 8f)) else null
                 )
             )
@@ -609,14 +712,23 @@ fun YggNetworkMeshCanvas(
             }
         }
 
-        // Draw Nodes
+        // Draw Nodes with labels
         mapNodes.forEach { node ->
             val center = Offset(node.xRatio * width, node.yRatio * height)
             val nodeColor = when (node.type) {
                 "LOCAL" -> EmeraldPrimary
-                "CONTACT" -> AmberShieldTertiary
+                "CONTACT" -> if (node.isConnected) AmberShieldTertiary else Color(0xFF7A8A96)
                 "RELAY" -> CyberTealSecondary
                 else -> if (node.isConnected) Color(0xFF2FB5D1) else Color(0xFF7A8A96)
+            }
+
+            if (node.id == selectedNodeId) {
+                drawCircle(
+                    color = Color.White,
+                    radius = if (node.type == "LOCAL") 24f else 18f,
+                    center = center,
+                    style = Stroke(width = 3f)
+                )
             }
 
             // Glow Aura
@@ -638,6 +750,25 @@ fun YggNetworkMeshCanvas(
                 radius = 2.5f,
                 center = center
             )
+
+            labelPaint.color = android.graphics.Color.rgb(220, 232, 240)
+            val label = node.label.take(14)
+            val labelY = (center.y + if (node.type == "LOCAL") 34f else 28f).coerceAtMost(height - 8f)
+            drawContext.canvas.nativeCanvas.drawText(label, center.x.coerceIn(60f, width - 60f), labelY, labelPaint)
+
+            if (node.rttMs > 0) {
+                rttPaint.color = when {
+                    node.rttMs < 120 -> android.graphics.Color.rgb(46, 204, 113)
+                    node.rttMs < 400 -> android.graphics.Color.rgb(41, 182, 246)
+                    else -> android.graphics.Color.rgb(255, 179, 0)
+                }
+                drawContext.canvas.nativeCanvas.drawText(
+                    "${node.rttMs} мс",
+                    center.x.coerceIn(60f, width - 60f),
+                    (labelY + 22f).coerceAtMost(height - 4f),
+                    rttPaint
+                )
+            }
         }
     }
 }
@@ -663,9 +794,13 @@ fun MessageTrackItemCard(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        Icons.Default.AltRoute,
+                        Icons.AutoMirrored.Filled.AltRoute,
                         contentDescription = null,
-                        tint = if (track.deliveryStatus == "CONFIRMED_ACK") EmeraldPrimary else AmberShieldTertiary,
+                        tint = when (track.deliveryStatus) {
+                            "CONFIRMED_ACK" -> EmeraldPrimary
+                            "SENT_OVERLAY" -> CyberTealSecondary
+                            else -> AmberShieldTertiary
+                        },
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
@@ -678,14 +813,26 @@ fun MessageTrackItemCard(
                 }
 
                 Surface(
-                    color = if (track.deliveryStatus == "CONFIRMED_ACK") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.tertiaryContainer,
+                    color = when (track.deliveryStatus) {
+                        "CONFIRMED_ACK" -> MaterialTheme.colorScheme.primaryContainer
+                        "SENT_OVERLAY" -> MaterialTheme.colorScheme.secondaryContainer
+                        else -> MaterialTheme.colorScheme.tertiaryContainer
+                    },
                     shape = RoundedCornerShape(6.dp)
                 ) {
                     Text(
-                        text = if (track.deliveryStatus == "CONFIRMED_ACK") "ACK ${track.rttMs} мс" else "В очереди S&F",
+                        text = when (track.deliveryStatus) {
+                            "CONFIRMED_ACK" -> "ACK получен"
+                            "SENT_OVERLAY" -> "Отправлено"
+                            else -> "В очереди S&F"
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
-                        color = if (track.deliveryStatus == "CONFIRMED_ACK") EmeraldPrimary else AmberShieldTertiary,
+                        color = when (track.deliveryStatus) {
+                            "CONFIRMED_ACK" -> EmeraldPrimary
+                            "SENT_OVERLAY" -> CyberTealSecondary
+                            else -> AmberShieldTertiary
+                        },
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
@@ -709,15 +856,18 @@ fun MessageTrackItemCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Хопов: ${track.hops.size} • ${track.transport}",
+                    text = track.transport,
                     style = MaterialTheme.typography.labelSmall,
                     color = CyberTealSecondary,
-                    fontSize = 10.sp
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "Нажмите для инспекции ➔",
+                    text = " ${track.timestampFormatted}",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 10.sp
                 )
             }
@@ -759,7 +909,7 @@ fun PacketInspectorModal(
                             Icon(Icons.Default.Analytics, contentDescription = null, tint = EmeraldPrimary)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Инспектор Пакетного Трафика Yggdrasil",
+                                text = "Инспектор пакета",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
@@ -776,7 +926,7 @@ fun PacketInspectorModal(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         item {
-                            Text("Маршрутный путь (Multi-Hop Trail):", style = MaterialTheme.typography.labelMedium, color = CyberTealSecondary)
+                            Text("Путь пакета (по данным ядра):", style = MaterialTheme.typography.labelMedium, color = CyberTealSecondary)
                             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                                 Column(modifier = Modifier.padding(10.dp)) {
                                     track.hops.forEach { hop ->
@@ -791,12 +941,12 @@ fun PacketInspectorModal(
                         }
 
                         item {
-                            Text("Криптографический конверт (AES-256-GCM + X25519):", style = MaterialTheme.typography.labelMedium, color = CyberTealSecondary)
+                            Text("Криптографический конверт:", style = MaterialTheme.typography.labelMedium, color = CyberTealSecondary)
                             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
                                 Column(modifier = Modifier.padding(10.dp)) {
                                     Text("Cipher Payload Hex:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Text(
-                                        track.cipherPayloadHex,
+                                        track.cipherPayloadHex.ifBlank { "не сохранилось в базе" },
                                         style = MaterialTheme.typography.labelSmall,
                                         fontFamily = FontFamily.Monospace,
                                         color = EmeraldPrimary,
@@ -804,9 +954,9 @@ fun PacketInspectorModal(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Spacer(modifier = Modifier.height(6.dp))
-                                    Text("Proof-of-Work Hashcash Stamp:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("Proof-of-Work штамп:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     Text(
-                                        track.hashcashPow,
+                                        track.hashcashPow.ifBlank { "не приложен" },
                                         style = MaterialTheme.typography.labelSmall,
                                         fontFamily = FontFamily.Monospace,
                                         color = AmberShieldTertiary
@@ -823,6 +973,20 @@ fun PacketInspectorModal(
                                         text = track.plainText,
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+
+                        item {
+                            Text("Доставка:", style = MaterialTheme.typography.labelMedium, color = CyberTealSecondary)
+                            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(track.transport, style = MaterialTheme.typography.labelSmall)
+                                    Text(
+                                        text = "Время: ${track.timestampFormatted}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
