@@ -24,10 +24,10 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 13
+    versionCode = 14
     // The suffix is the only thing that tells a tester whether the node on the screen can
     // be the shipped one: an emulator build carries the x86_64 core, a release build arm64.
-    versionName = "1.6.6" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
+    versionName = "1.6.7" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
@@ -40,6 +40,14 @@ android {
     }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    // -PupdateRepo=owner/Name lets a fork check its own releases without editing source; the
+    // updater trusts nothing but this slug plus the pinned signing certificate.
+    buildConfigField(
+      "String",
+      "UPDATE_REPO",
+      "\"" + providers.gradleProperty("updateRepo").getOrElse("mx57/YGramm") + "\""
+    )
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -152,18 +160,18 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
 
     // Remove all extra/legacy APKs from repository root and apk-releases
     listOf(
-      File(root, "YggGram-main.apk"),
-      File(root, "YggGram-clone-node2.apk")
+      File(root, "YGramm-main.apk"),
+      File(root, "YGramm-clone-node2.apk")
     ).forEach { if (it.exists()) it.delete() }
 
     val releaseDir = File(root, "apk-releases").apply { mkdirs() }
     releaseDir.listFiles()?.forEach { file ->
-      if (file.name != "YggGram-arm64-v8a.apk") {
+      if (file.name != "YGramm-arm64-v8a.apk") {
         file.delete()
       }
     }
 
-    val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
+    val targetFile = File(releaseDir, "YGramm-arm64-v8a.apk")
     signedRelease.copyTo(targetFile, overwrite = true)
     println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
 

@@ -1,4 +1,4 @@
-name: Build and test YggGram arm64-v8a
+name: Build and test YGramm arm64-v8a
 
 on:
   push:
@@ -89,7 +89,7 @@ jobs:
         # tree, so a refused upload is reported but must not redden the pipeline.
         continue-on-error: true
         with:
-          name: YggGram-arm64-v8a-debug-test
+          name: YGramm-arm64-v8a-debug-test
           path: app/build/outputs/apk/debug/app-debug.apk
           # An APK is ~40 MB and the repository artifact quota is shared and small.
           # Without this the quota fills, and a run that built and tested everything

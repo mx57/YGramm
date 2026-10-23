@@ -197,39 +197,18 @@ class NetworkDpiController(
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {
+        if (!preset.implemented) {
+            onBannerMessage("Профиль «${preset.title}» не реализован в этой сборке")
+            return
+        }
         val current = _antiDpiConfig.value
         val updatedConfig = when (preset) {
             CensorshipPreset.RU_WHITELIST_CDN -> current.copy(
                 activePreset = preset,
                 whitelistCdnWssEnabled = true,
-                vlessRealityEnabled = true,
-                shadowTlsV3Enabled = false,
-                quicPaddingEnabled = true,
-                utlsProfile = "HelloChrome_128_Auto",
-                lastProbeReport = "Выбран профиль обхода Белых списков (SNI: ${current.whitelistSniDomain})"
+                lastProbeReport = "Применен профиль обхода Белых списков (SNI: ${current.whitelistSniDomain})"
             )
-            CensorshipPreset.TSPU_VLESS_SHADOWTLS -> current.copy(
-                activePreset = preset,
-                whitelistCdnWssEnabled = true,
-                vlessRealityEnabled = true,
-                shadowTlsV3Enabled = true,
-                quicPaddingEnabled = true,
-                utlsProfile = "HelloIOS_18_Auto",
-                lastProbeReport = "Выбран профиль VLESS Reality + ShadowTLS v3 (uTLS iOS 18)"
-            )
-            CensorshipPreset.QUIC_UDP_OBFUSCATION -> current.copy(
-                activePreset = preset,
-                quicPaddingEnabled = true,
-                quicPaddingMTU = 1400,
-                utlsProfile = "QUIC_v1_Padded_Jitter",
-                lastProbeReport = "Выбрана обфускация QUIC UDP (выравнивание пакетов до 1400 байт)"
-            )
-            CensorshipPreset.AUTONOMOUS_DHT_DOH -> current.copy(
-                activePreset = preset,
-                dhtBep44BootstrapEnabled = true,
-                whitelistCdnWssEnabled = true,
-                lastProbeReport = "Выбран автономный поиск входных узлов через DHT BEP-44 и DoH"
-            )
+            else -> current
         }
         _antiDpiConfig.value = updatedConfig
         onBannerMessage("Применен профиль: ${preset.title}")
@@ -237,8 +216,7 @@ class NetworkDpiController(
         scope.launch {
             repository.updatePeersTransportProfile(
                 whitelistMode = updatedConfig.whitelistCdnWssEnabled,
-                preferredSni = updatedConfig.whitelistSniDomain,
-                utlsProfile = updatedConfig.utlsProfile
+                preferredSni = updatedConfig.whitelistSniDomain
             )
         }
     }
@@ -254,8 +232,7 @@ class NetworkDpiController(
             val cfg = _antiDpiConfig.value
             repository.updatePeersTransportProfile(
                 whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = domain,
-                utlsProfile = cfg.utlsProfile
+                preferredSni = domain
             )
         }
     }
@@ -264,15 +241,7 @@ class NetworkDpiController(
         _antiDpiConfig.update { state ->
             state.copy(
                 utlsProfile = fingerprint,
-                lastProbeReport = "Установлен профиль uTLS: $fingerprint"
-            )
-        }
-        scope.launch {
-            val cfg = _antiDpiConfig.value
-            repository.updatePeersTransportProfile(
-                whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = cfg.whitelistSniDomain,
-                utlsProfile = fingerprint
+                lastProbeReport = "Профиль uTLS сохранён: $fingerprint (ядро его не применяет)"
             )
         }
     }
@@ -281,10 +250,6 @@ class NetworkDpiController(
         _antiDpiConfig.update { state ->
             when (flagName) {
                 "WHITELIST_WSS" -> state.copy(whitelistCdnWssEnabled = !state.whitelistCdnWssEnabled)
-                "SHADOWTLS" -> state.copy(shadowTlsV3Enabled = !state.shadowTlsV3Enabled)
-                "VLESS" -> state.copy(vlessRealityEnabled = !state.vlessRealityEnabled)
-                "QUIC_PAD" -> state.copy(quicPaddingEnabled = !state.quicPaddingEnabled)
-                "DHT_BEP44" -> state.copy(dhtBep44BootstrapEnabled = !state.dhtBep44BootstrapEnabled)
                 else -> state
             }
         }

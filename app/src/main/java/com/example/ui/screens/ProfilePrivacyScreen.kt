@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -70,6 +71,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -100,6 +102,8 @@ import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
+import com.example.update.YGrammUpdateController
+import com.example.update.YGrammUpdateEngine
 import com.example.viewmodel.YggGramUiState
 
 private fun hasNotificationPermission(context: Context): Boolean =
@@ -885,7 +889,7 @@ fun ProfilePrivacyScreen(
 
                     PrivacyToggleItem(
                         title = "Всплывающие уведомления в приложении",
-                        subtitle = "Карточка-баннер внутри YggGram при новом сообщении, голосовом или вызове",
+                        subtitle = "Карточка-баннер внутри YGramm при новом сообщении, голосовом или вызове",
                         checked = uiState.privacyMatrix.inAppNotificationsEnabled,
                         tag = "notif_in_app_switch",
                         onCheckedChange = {
@@ -1050,7 +1054,8 @@ fun ProfilePrivacyScreen(
 
                     PrivacyToggleItem(
                         title = "Удаление сетевых метаданных и EXIF при P2P-передаче",
-                        subtitle = "Автоматическая очистка заголовков файлов и маскировка локальных портов при обмене чанками",
+                        subtitle = "Не реализовано: EXIF из вложений не вырезается, переключатель сохраняет только " +
+                            "намерение и на передачу не влияет",
                         checked = privacy.stripNetworkMetadata,
                         tag = "privacy_strip_metadata_switch",
                         onCheckedChange = {
@@ -1155,17 +1160,131 @@ fun ProfilePrivacyScreen(
                         Icon(Icons.Default.Code, contentDescription = null, tint = CyberTealSecondary)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Открытый исходный код и Архитектура YggGram",
+                            text = "Открытый исходный код и Архитектура YGramm",
                             style = MaterialTheme.typography.titleMedium
                         )
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "• Сетевое ядро: Userspace Yggdrasil v0.5 (200::/7) + gVisor Netstack без создания системного TUN и без прав Root/Администратора.\n" +
-                            "• Анти-DPI / Обход Белых списков: uTLS (Chrome/iOS), CDN WebSocket (wss://), VLESS Reality, ShadowTLS v3, QUIC UDP Padding, DHT BEP-44.\n" +
-                            "• Криптография: BIP-39 -> HMAC-SHA512, Ed25519 для адреса узла, X25519 + HKDF-SHA256 + AES-256-GCM для сообщений и медиа звонков (статический ECDH, без прямой секретности).\n" +
-                            "• Лицензия: Open-Source GPLv3 / воспроизводимая сборка.",
+                        text = "• Сетевое ядро: Go-сборка Yggdrasil v0.5.14 (LINKS/ironwood) как libygggram.so через JNI. Системный VPN, TUN и root не используются: оверлей идёт по обычным сокетам приложения.\n" +
+                            "• Обход блокировок: пиры подключаются по tls:// и wss:// на 443 (включая пути через CDN). Пир считается подтверждённым только после реального TLS-handshake с подменой SNI и ответа по протоколу Yggdrasil — открытого порта мало. uTLS-подмена фингерпринта, VLESS Reality, ShadowTLS v3 и DHT BEP-44 в этой сборке НЕ реализованы: такие схемы встречаются только как метки в каталоге пиров.\n" +
+                            "• Криптография: BIP-39 -> HMAC-SHA512 для узла, Ed25519 для адреса IPv6 в 0200::/7, X25519 + HKDF-SHA256 + AES-256-GCM для сообщений и медиа звонков (статический ECDH, без прямой секретности).\n" +
+                            "• Доставка: ACK на каждое сообщение, очередь S&F с повтором при изменении mesh, подтверждение по каждому участнику группы.\n" +
+                            "• Обновления: релиз на GitHub, проверка sha256 и подписи APK по закреплённому ключу, установка системным установщиком.\n" +
+                            "• Лицензия: GPL-3.0 (файл LICENSE в репозитории); шрифты — см. LICENSE-fonts.md.",
                         style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        // 5.5 Auto-update from GitHub Releases
+        item {
+            val updateState by YGrammUpdateController.state.collectAsState()
+            val available = updateState.available
+            Card(
+                modifier = Modifier.fillMaxWidth().testTag("auto_update_card"),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.SystemUpdate,
+                            contentDescription = null,
+                            tint = CyberTealSecondary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Обновления приложения",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Установлена версия ${updateState.runningVersionLabel} • " +
+                            "репозиторий ${updateState.repoSlug} • " +
+                            "последняя проверка: ${updateState.lastCheckedLabel}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        YggSwitch(
+                            checked = updateState.autoCheckEnabled,
+                            onCheckedChange = { enabled ->
+                                YGrammUpdateController.setAutoCheckEnabled(context, enabled)
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Проверять релиз на GitHub автоматически",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = updateState.statusLine,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (updateState.statusLine.startsWith("Проверка не удалась") ||
+                            updateState.statusLine.startsWith("Скачивание отменено")
+                        ) Color(0xFFEF4444) else EmeraldPrimary
+                    )
+                    if (available != null) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = available.releaseNotes.take(400),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 8,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { YGrammUpdateController.checkNow() },
+                            enabled = !updateState.busy,
+                            modifier = Modifier.testTag("update_check_button")
+                        ) {
+                            Text(if (updateState.busy) "Проверяю…" else "Проверить сейчас")
+                        }
+                        if (available != null && updateState.downloadedApkPath == null) {
+                            Button(
+                                onClick = { YGrammUpdateController.downloadUpdate() },
+                                enabled = !updateState.busy,
+                                modifier = Modifier.testTag("update_download_button")
+                            ) {
+                                Text(
+                                    if (updateState.downloadPercent >= 0)
+                                        "Скачиваю ${updateState.downloadPercent}%"
+                                    else "Скачать ${available.assetSizeBytes / 1024 / 1024} МБ"
+                                )
+                            }
+                        }
+                        if (updateState.downloadedApkPath != null) {
+                            Button(
+                                onClick = { YGrammUpdateController.installUpdate() },
+                                modifier = Modifier.testTag("update_install_button")
+                            ) {
+                                Text("Установить")
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Скачанный файл проверяется по sha256 из манифеста релиза и по подписи: " +
+                            "APK должен быть подписан релизным ключом ${YGrammUpdateEngine.PINNED_RELEASE_CERT_SHA256_HEX.take(16)}…, " +
+                            "иначе файл удаляется и установка не предлагается. " +
+                            if (updateState.installPermissionMissing)
+                                "\nРазрешение на установку из неизвестных источников не выдано — " +
+                                "при нажатии «Установить» откроются системные настройки."
+                            else
+                                "\nУстановку выполняет системный установщик Android, приложение не ставит APK само.",
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -1323,7 +1442,7 @@ private fun CreateNewDecentralizedProfileModal(
         nodeRelayRole: String
     ) -> Unit
 ) {
-    var name by rememberSaveable { mutableStateOf("Узел YggGram #$nextIndex") }
+    var name by rememberSaveable { mutableStateOf("Узел YGramm #$nextIndex") }
     var handle by rememberSaveable { mutableStateOf("@node$nextIndex.ygg") }
     var bio by rememberSaveable {
         mutableStateOf("Независимый крипто-профиль #$nextIndex в сети Yggdrasil • Прямой P2P")

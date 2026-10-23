@@ -20,6 +20,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "YggGram"
+rootProject.name = "YGramm"
 
 include(":app")

@@ -20,8 +20,8 @@ debug.keystore
 
 # Force-include compiled APKs in project root for main branch and PR
 !*.apk
-!/YggGram-main.apk
-!/YggGram-clone-node2.apk
+!/YGramm-main.apk
+!/YGramm-clone-node2.apk
 !/apk-releases/
 !/apk-releases/*.apk
 

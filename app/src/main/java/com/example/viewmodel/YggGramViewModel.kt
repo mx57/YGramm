@@ -57,6 +57,7 @@ import com.example.service.YggNotificationCenter
 import com.example.service.YggPopupNotificationItem
 import com.example.service.YggQuickReplyBus
 import com.example.ui.components.PendingProfileSwitchRequest
+import com.example.update.YGrammUpdateController
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
@@ -89,26 +90,35 @@ enum class YggNavTab {
     PROFILE_PRIVACY
 }
 
-enum class CensorshipPreset(val title: String, val badge: String, val summary: String) {
+enum class CensorshipPreset(
+    val title: String,
+    val badge: String,
+    val summary: String,
+    val implemented: Boolean = true
+) {
     RU_WHITELIST_CDN(
         title = "Обход Белых Списков (CDN WSS + RU SNI)",
         badge = "WHITELIST WSS",
-        summary = "Маскировка трафика Yggdrasil под HTTPS WebSocket через разрешенные инфраструктурные домены и CDN"
+        summary = "Пиры с транспортом wss:// и tls://: ядро подставляет выбранный разрешённый SNI-домен " +
+            "в ClientHello реального TLS-рукопожатия. Это единственная маска, которая уходит в трафик."
     ),
     TSPU_VLESS_SHADOWTLS(
         title = "ТСПУ Анти-Зондирование (VLESS + ShadowTLS v3)",
         badge = "VLESS + uTLS",
-        summary = "Туннелирование с отпечатками uTLS Chrome 128 / iOS 18 и защитой от активного пробинга ТСПУ"
+        summary = "Не реализовано",
+        implemented = false
     ),
     QUIC_UDP_OBFUSCATION(
         title = "Анти-Сигнатурный UDP (QUIC Padding + Jitter)",
         badge = "QUIC PADDED",
-        summary = "Выравнивание размеров датаграмм и шумовые префиксы против блокировки сигнатур Yggdrasil"
+        summary = "Не реализовано",
+        implemented = false
     ),
     AUTONOMOUS_DHT_DOH(
         title = "Шатдаун / Автономный Поиск (DHT BEP-44 + DoH)",
         badge = "DHT + DoH",
-        summary = "Бессерверный поиск входных пиров через BitTorrent Mainline DHT и подписанные Ed25519 списки"
+        summary = "Не реализовано",
+        implemented = false
     )
 }
 
@@ -135,11 +145,6 @@ data class AntiDpiConfigState(
         "ozone.ru"
     ),
     val utlsProfile: String = "HelloChrome_128_Auto",
-    val shadowTlsV3Enabled: Boolean = true,
-    val vlessRealityEnabled: Boolean = true,
-    val quicPaddingEnabled: Boolean = true,
-    val quicPaddingMTU: Int = 1360,
-    val dhtBep44BootstrapEnabled: Boolean = true,
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
     val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil..."
@@ -147,7 +152,7 @@ data class AntiDpiConfigState(
 
 data class DecentralizedUserProfile(
     val profileId: String = YggRepository.DEFAULT_PROFILE_ID,
-    val displayName: String = "Узел YggGram #1",
+    val displayName: String = "Узел YGramm #1",
     val handle: String = "@node1.ygg",
     val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
     val statusText: String = "В оверлее 200::/7 (Порт 51921)",
@@ -674,6 +679,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     )
 
     init {
+        YGrammUpdateController.attach(application)
         viewModelScope.launch {
             networkDpiController.antiDpiConfig.collect { cfg ->
                 _uiState.update { it.copy(antiDpiConfig = cfg) }
@@ -4252,7 +4258,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = "Создан зашифрованный бэкап ${snapshot.archiveFileName} (${snapshot.chunkCountFastCdc} чанков FastCDC)"
+                    statusBannerMessage = "Сохранён снимок метаданных ${snapshot.archiveFileName}. " +
+                        "Файла архива на диске нет: экспорт шифрованной базы ещё не реализован"
                 )
             }
         }
@@ -4260,9 +4267,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun verifyOrRestoreBackup(snapshot: BackupSnapshotEntity, isRestore: Boolean) {
         val msg = if (isRestore) {
-            "Восстановлено состояние из архива ${snapshot.archiveFileName} (Merkle SHA-256: ${snapshot.merkleRootHex.take(12)}...)"
+            "Восстановление из ${snapshot.archiveFileName} выполнено быть не может: реального архива нет, " +
+                "изменены только записи об этом снимке"
         } else {
-            "Проверка полинома Poly1305 и дерева Merkle для ${snapshot.archiveFileName} пройдена успешно"
+            "Сводка ${snapshot.archiveFileName} посчитана по метаданным снимка: ни Poly1305, " +
+                "ни дерево Merkle от файла архива не проверялись — самого файла нет"
         }
         _uiState.update { it.copy(statusBannerMessage = msg) }
     }

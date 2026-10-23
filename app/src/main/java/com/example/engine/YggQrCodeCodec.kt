@@ -31,7 +31,7 @@ data class ParsedYggContactQr(
 )
 
 /**
- * YggGram contact-card codec built on the standard QR Code Model 2 format (ZXing).
+ * YGramm contact-card codec built on the standard QR Code Model 2 format (ZXing).
  * The rendered code is readable by any third-party QR scanner, and the in-app
  * camera/gallery scanner decodes standard QR frames with rotation and perspective
  * correction instead of sampling a hand-drawn matrix.
@@ -50,7 +50,7 @@ object YggQrCodeCodec {
         x25519PubKeyHex: String = ""
     ): String {
         val encodedName = try {
-            URLEncoder.encode(displayName.trim().ifBlank { "Узел YggGram" }, StandardCharsets.UTF_8.name())
+            URLEncoder.encode(displayName.trim().ifBlank { "Узел YGramm" }, StandardCharsets.UTF_8.name())
         } catch (_: Exception) {
             "YggNode"
         }

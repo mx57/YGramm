@@ -39,7 +39,7 @@ class ExampleRobolectricTest {
     fun `read string from context matches YggGram`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("YggGram", appName)
+        assertEquals("YGramm", appName)
     }
 
     @Test

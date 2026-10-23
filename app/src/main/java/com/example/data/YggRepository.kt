@@ -61,7 +61,7 @@ class YggRepository(
         val primaryProfile = if (existingProfiles.isEmpty()) {
             val created = UserProfileEntity(
                 profileId = DEFAULT_PROFILE_ID,
-                displayName = "Узел YggGram #1",
+                displayName = "Узел YGramm #1",
                 handle = "@node1.ygg",
                 bio = "Основной децентрализованный профиль в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
                 statusText = "В оверлее 200::/7 (Порт 51921)",
@@ -213,7 +213,7 @@ class YggRepository(
         val palette = listOf("#10B981", "#06B6D4", "#F59E0B", "#8B5CF6", "#EC4899")
         val avatarHex = palette[(index - 1) % palette.size]
 
-        val cleanName = displayName.trim().ifBlank { "Узел YggGram #$index" }
+        val cleanName = displayName.trim().ifBlank { "Узел YGramm #$index" }
         val cleanHandle = handle.trim().ifBlank { "@node$index.ygg" }.let {
             if (it.startsWith("@")) it else "@$it"
         }
@@ -1745,16 +1745,12 @@ class YggRepository(
 
     suspend fun updatePeersTransportProfile(
         whitelistMode: Boolean,
-        preferredSni: String,
-        utlsProfile: String
+        preferredSni: String
     ) {
         val all = dao.getAllPeersNow()
         val updated = all.map { p ->
             val newSni = if (whitelistMode && p.isWhitelistCompatible) preferredSni else p.sniDomain
-            p.copy(
-                sniDomain = newSni,
-                utlsFingerprint = if (p.transportType == "QUIC_UDP_PADDING") p.utlsFingerprint else utlsProfile
-            )
+            p.copy(sniDomain = newSni)
         }
         dao.insertPeers(updated)
     }

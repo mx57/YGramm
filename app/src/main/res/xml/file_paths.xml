@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only files/updates is shared: the encrypted database and key material stay unreachable
+     through the FileProvider even if another app guesses the authority. -->
+<paths>
+    <files-path name="updates" path="update/" />
+</paths>

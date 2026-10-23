@@ -153,7 +153,7 @@ fun QrContactModal(
         } else {
             scannerStatusError = true
             val preview = rawText.trim().take(48).ifBlank { "пустой код" }
-            scannerStatus = "QR найден, но это не визитка YggGram: $preview"
+            scannerStatus = "QR найден, но это не визитка YGramm: $preview"
         }
     }
 
@@ -341,7 +341,7 @@ fun QrContactModal(
                         }
 
                         Text(
-                            text = "Стандартный QR-код: читается камерой YggGram и любым сторонним сканером",
+                            text = "Стандартный QR-код: читается камерой YGramm и любым сторонним сканером",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -396,7 +396,7 @@ fun QrContactModal(
                             Button(
                                 onClick = {
                                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    clipboard.setPrimaryClip(ClipData.newPlainText("YggGram QR URI", myContactUri))
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("YGramm QR URI", myContactUri))
                                     Toast.makeText(context, "Ссылка-визитка ygggram:// скопирована", Toast.LENGTH_SHORT).show()
                                 },
                                 modifier = Modifier
@@ -412,11 +412,11 @@ fun QrContactModal(
                                 onClick = {
                                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                         type = "text/plain"
-                                        putExtra(Intent.EXTRA_SUBJECT, "YggGram • ${uiState.userProfile.displayName}")
+                                        putExtra(Intent.EXTRA_SUBJECT, "YGramm • ${uiState.userProfile.displayName}")
                                         putExtra(Intent.EXTRA_TEXT, myContactUri)
                                     }
                                     context.startActivity(
-                                        Intent.createChooser(shareIntent, "Поделиться визиткой YggGram")
+                                        Intent.createChooser(shareIntent, "Поделиться визиткой YGramm")
                                     )
                                 },
                                 modifier = Modifier.testTag("share_qr_uri_button")

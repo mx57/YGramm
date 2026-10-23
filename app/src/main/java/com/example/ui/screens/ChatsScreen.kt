@@ -1016,7 +1016,7 @@ private fun CleanStartZeroStateCard(
                             TextButton(
                                 onClick = {
                                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    clipboard.setPrimaryClip(ClipData.newPlainText("YggGram URI", contactUri))
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("YGramm URI", contactUri))
                                     Toast.makeText(context, "Ваша визитка ygggram:// скопирована", Toast.LENGTH_SHORT).show()
                                 },
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
@@ -1094,7 +1094,7 @@ private fun CleanStartZeroStateCard(
             ) {
                 Icon(Icons.Default.Radar, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Поиск узлов YggGram в локальной Wi-Fi сети (LAN)")
+                Text("Поиск узлов YGramm в локальной Wi-Fi сети (LAN)")
             }
         }
     }
@@ -1638,7 +1638,7 @@ private fun ChatDetailPane(
                                 } else {
                                     "Группа • " + groupMembers.joinToString(", ") { member ->
                                         // Names repeat because every node owner can call their
-                                        // node «Узел YggGram #1»; the address prefix cannot.
+                                        // node «Узел YGramm #1»; the address prefix cannot.
                                         val wanted = YggCryptoEngine.normalizeIpv6Literal(member.memberIpv6)
                                         val current = groupContactCandidates.firstOrNull { candidate ->
                                             wanted != null &&

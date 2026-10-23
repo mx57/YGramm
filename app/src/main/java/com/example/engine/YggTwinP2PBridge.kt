@@ -1947,7 +1947,7 @@ class YggTwinP2PBridge(
         if (map["type"] == "LAN_ANNOUNCE") {
             val yggIpv6 = map["yggIpv6"] ?: return
             val pubKey = map["pubKey"] ?: ""
-            val name = map["displayName"] ?: "Узел YggGram ($senderIp)"
+            val name = map["displayName"] ?: "Узел YGramm ($senderIp)"
             val port = map["tcpPort"]?.toIntOrNull() ?: 51921
             directEndpointTable[yggIpv6.lowercase()] = InetSocketAddress.createUnresolved(senderIp, port)
             val node = DiscoveredLanNode(

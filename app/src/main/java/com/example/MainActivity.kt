@@ -485,7 +485,7 @@ fun YggGramRootApp(
                                     onClick = {
                                         showProfileQuickMenu = false
                                         viewModel.createNewProfile(
-                                            displayName = "Узел YggGram #${userProfiles.size + 1}",
+                                            displayName = "Узел YGramm #${userProfiles.size + 1}",
                                             handle = "@node${userProfiles.size + 1}.ygg",
                                             bio = "Параллельный профиль Yggdrasil",
                                             runSimultaneouslyInBackground = true,
