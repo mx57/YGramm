@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.net.NetworkRequest
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -34,6 +35,7 @@ import com.example.engine.IncomingCallSignalPacket
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.SelfYggdrasilRelayResult
 import com.example.engine.YggAudioMediaEngine
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
@@ -149,7 +151,9 @@ data class DecentralizedUserProfile(
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
     val relayedPacketsCount: Int = 0,
-    val profileFingerprintHex: String = ""
+    val profileFingerprintHex: String = "",
+    val avatarUri: String = "",
+    val avatarHashHex: String = ""
 )
 
 data class PrivacyMatrixState(
@@ -173,6 +177,7 @@ data class ActiveVoiceCallState(
     val chatId: String,
     val peerTitle: String,
     val peerIpv6: String,
+    val peerAvatarUri: String = "",
     // "DIALING_YGG", "RINGING_INCOMING", "ACTIVE_ENCRYPTED", "OFFLINE_ERROR"
     val callStatus: String,
     val statusSubtext: String,
@@ -354,6 +359,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     activeChatId = _uiState.value.selectedChatId,
                     currentPrimaryProfileId = currentPrimaryId
                 )
+                // After the message, so the conversation row this writes onto already
+                // exists; the picture is checked against its own hash inside the codec.
+                repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
 
                 val targetProfileName = targetProfile?.displayName
                 val profileSuffix = if (targetProfile != null && targetProfile.profileId != currentPrimaryId) {
@@ -811,7 +819,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     isActiveInBackground = profileEntity.isActiveInBackground,
                     nodeRelayRole = profileEntity.nodeRelayRole,
                     relayedPacketsCount = profileEntity.relayedPacketsCount,
-                    profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
+                    profileFingerprintHex = "sha256_fp:${sigHash.take(44)}",
+                    avatarUri = profileEntity.avatarUri,
+                    avatarHashHex = profileEntity.avatarHashHex
                 )
             )
         }
@@ -1806,7 +1816,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentUri = msg.attachmentUri,
                         attachmentBase64 = attachmentBase64,
                         voiceDurationSec = msg.voiceDurationSec,
-                        voiceWaveformCsv = msg.voiceWaveformCsv
+                        voiceWaveformCsv = msg.voiceWaveformCsv,
+                        senderAvatarHash = _uiState.value.userProfile.avatarHashHex,
+                        senderAvatarBase64 = YggAvatarCodec
+                            .base64OfStoredFile(_uiState.value.userProfile.avatarUri).orEmpty()
                     )
                     if (overlayRelay.delivered) {
                         deliveredCount++
@@ -2105,7 +2118,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 voiceDurationSec = voiceDurationSec,
                 voiceWaveformCsv = voiceWaveformCsv,
                 replyToMessageId = wireQuoteId,
-                forwardedFrom = forwardedFrom
+                forwardedFrom = forwardedFrom,
+                senderAvatarHash = currentState.userProfile.avatarHashHex,
+                senderAvatarBase64 = YggAvatarCodec
+                    .base64OfStoredFile(currentState.userProfile.avatarUri).orEmpty()
             )
 
             if (overlayResult.delivered) {
@@ -2420,6 +2436,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         chatId = conv.chatId,
                         peerTitle = conv.title,
                         peerIpv6 = peerIpv6,
+                        peerAvatarUri = conv.avatarUri,
                         callStatus = "DIALING_YGG",
                         statusSubtext = "Отправка зашифрованного сигнала вызова через Yggdrasil...",
                         verificationEmojis = if (peerKeyKnownAtDial) {
@@ -2792,12 +2809,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         activeCallJob?.cancel()
         activeCallJob = null
         val targetIsCurrent = targetProfile.profileId == _uiState.value.currentProfileId
+        val callerAvatarUri = conversations.value
+            .find { it.chatId == conversationChatId }?.avatarUri.orEmpty()
         _uiState.update {
             it.copy(
                 activeVoiceCall = ActiveVoiceCallState(
                     chatId = conversationChatId,
                     peerTitle = callerTitle,
                     peerIpv6 = callSig.callerIpv6,
+                    peerAvatarUri = callerAvatarUri,
                     callStatus = "RINGING_INCOMING",
                     statusSubtext = "Входящий зашифрованный вызов (${callSig.transport}) • примите или отклоните",
                     verificationEmojis = buildCallVerificationEmojis(
@@ -3970,6 +3990,42 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(statusBannerMessage = "Профиль сохранён • отпечаток вычислен по ключу узла")
             }
+        }
+    }
+
+    /**
+     * Setting the profile picture from the gallery.
+     *
+     * Nothing is announced as changed unless the codec produced a file: the avatar travels
+     * inside the message frame, so a picture too large to fit there has no honest delivery
+     * path and must not quietly become a half-cropped one.
+     */
+    fun setProfileAvatar(source: Uri) {
+        viewModelScope.launch {
+            val profileId = _uiState.value.currentProfileId
+            val updated = repository.setProfileAvatar(profileId, source)
+            if (updated != null) {
+                applyUserProfileEntityToState(updated)
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Фото профиля обновлено • будет передано при следующем сообщении")
+                }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Фото не подходит: нужен файл, из которого получится квадрат до ${YggAvatarCodec.MAX_JPEG_BYTES / 1000} КБ"
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearProfileAvatar() {
+        viewModelScope.launch {
+            val profileId = _uiState.value.currentProfileId
+            repository.clearProfileAvatar(profileId)
+            repository.getAllProfilesNow().find { it.profileId == profileId }
+                ?.let { applyUserProfileEntityToState(it) }
+            _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
         }
     }
 

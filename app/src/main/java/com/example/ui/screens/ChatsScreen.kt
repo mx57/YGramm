@@ -132,6 +132,7 @@ import com.example.ui.components.ReactionQuickPickerBar
 import com.example.ui.components.RichAttachmentSheetDialog
 import com.example.ui.components.VoiceMessagePlayerCard
 import com.example.ui.components.VoiceRecordingComposerBar
+import com.example.ui.components.YggAvatar
 import com.example.ui.components.YggSwitch
 import com.example.ui.components.resolveUriFileMetadata
 import com.example.ui.theme.AmberShieldTertiary
@@ -1268,26 +1269,11 @@ private fun ConversationRowCard(
                 .padding(horizontal = 10.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(42.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
-                contentAlignment = Alignment.Center
-            ) {
-                when {
-                    isSelfChat -> Icon(
-                        Icons.Default.Bookmark,
-                        contentDescription = "Избранное Yggdrasil",
-                        tint = EmeraldPrimary
-                    )
-                    else -> Text(
-                        text = conversation.title.take(2).uppercase(),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = EmeraldPrimary
-                    )
-                }
-            }
+            YggAvatar(
+                avatarUri = conversation.avatarUri,
+                name = conversation.title,
+                placeholderIcon = if (isSelfChat) Icons.Default.Bookmark else null
+            )
 
             Spacer(modifier = Modifier.width(10.dp))
 
@@ -1528,6 +1514,12 @@ private fun ChatDetailPane(
                             )
                         }
                     }
+                    YggAvatar(
+                        avatarUri = conversation.avatarUri,
+                        name = conversation.title,
+                        size = 34.dp
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(

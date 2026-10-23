@@ -20,7 +20,12 @@ data class UserProfileEntity(
     val avatarColorHex: String,
     val createdAt: Long,
     val nodeRelayRole: String = "PEER_RELAY", // "CLIENT_ONLY", "PEER_RELAY", "SF_BLIND_RELAY"
-    val relayedPacketsCount: Int = 0
+    val relayedPacketsCount: Int = 0,
+    // Local file:// path of this profile's own picture, and the hash the other nodes
+    // last saw from us. The hash is what decides whether a message has to carry the
+    // bytes again.
+    val avatarUri: String = "",
+    val avatarHashHex: String = ""
 )
 
 @Entity(tableName = "conversations")
@@ -41,7 +46,12 @@ data class ConversationEntity(
     val bioStatus: String,
     val routeTransportSummary: String,
     val ownerProfileId: String = "profile_primary",
-    val peerX25519PublicKeyHex: String = ""
+    val peerX25519PublicKeyHex: String = "",
+    // The contact's picture as it reached us over the overlay, plus the hash it arrived
+    // with. Empty avatarUri means "never received one", which the UI must show as
+    // initials — not as a placeholder image someone could mistake for the real thing.
+    val avatarUri: String = "",
+    val avatarHashHex: String = ""
 )
 
 @Entity(tableName = "messages")

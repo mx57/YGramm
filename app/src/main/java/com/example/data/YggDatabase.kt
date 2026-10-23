@@ -25,7 +25,7 @@ import java.io.FileInputStream
         CryptoKeyRecordEntity::class,
         CallLogEntity::class
     ],
-    version = 8,
+    version = 9,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -86,6 +86,15 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE ygg_profiles ADD COLUMN avatarUri TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE ygg_profiles ADD COLUMN avatarHashHex TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE conversations ADD COLUMN avatarUri TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE conversations ADD COLUMN avatarHashHex TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -109,7 +118,7 @@ abstract class YggDatabase : RoomDatabase() {
                 encryptPlaintextDatabase(dbFile, passphrase)
             }
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
-                .addMigrations(MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+                .addMigrations(MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
                 .build()

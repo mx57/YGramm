@@ -819,7 +819,9 @@ fun YggGramRootApp(
                                 onAddContactFromQr = { payload ->
                                     viewModel.addContactFromQrPayload(payload)
                                     viewModel.selectTab(YggNavTab.CHATS)
-                                }
+                                },
+                                onPickProfileAvatar = viewModel::setProfileAvatar,
+                                onClearProfileAvatar = viewModel::clearProfileAvatar
                             )
                         }
                     }

@@ -7,6 +7,7 @@ import android.util.Log
 import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import java.io.File
 import java.util.UUID
@@ -352,6 +353,58 @@ class YggRepository(
         )
         dao.upsertProfile(updated)
         return updated
+    }
+
+    /**
+     * Installing a picture the user picked as this profile's avatar.
+     *
+     * @return the updated row, or null when the source is not a readable image or will not
+     *         compress into a message frame; the previous avatar is kept in that case,
+     *         because showing the user a face they did not choose is worse than telling
+     *         them this one did not fit.
+     */
+    suspend fun setProfileAvatar(profileId: String, source: Uri): UserProfileEntity? {
+        val context = appContext ?: return null
+        val existing = dao.getProfileById(profileId) ?: return null
+        val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
+        if (stored.hashHex != existing.avatarHashHex) {
+            YggAvatarCodec.forget(context, existing.avatarUri)
+            dao.updateProfileAvatar(profileId, stored.localUri, stored.hashHex)
+        }
+        return dao.getProfileById(profileId)
+    }
+
+    suspend fun clearProfileAvatar(profileId: String) {
+        val context = appContext ?: return
+        val existing = dao.getProfileById(profileId) ?: return
+        if (existing.avatarUri.isBlank() && existing.avatarHashHex.isBlank()) return
+        YggAvatarCodec.forget(context, existing.avatarUri)
+        dao.updateProfileAvatar(profileId, "", "")
+    }
+
+    suspend fun profileAvatarBase64(profileId: String): String =
+        dao.getProfileById(profileId)?.avatarUri
+            ?.let(YggAvatarCodec::base64OfStoredFile)
+            .orEmpty()
+
+    /**
+     * Saving a contact's avatar received over the overlay.
+     *
+     * Runs after the message itself is persisted and as a partial UPDATE: the conversation
+     * row is re-saved from a copy elsewhere, and a full upsert there would drop the picture
+     * again the moment the contact sent their next message.
+     */
+    suspend fun storeIncomingAvatar(chatId: String, avatarHashHex: String, avatarBase64: String) {
+        val context = appContext ?: return
+        if (chatId.isBlank() || avatarHashHex.isBlank() || avatarBase64.isBlank()) return
+        val conv = dao.getConversationById(chatId) ?: return
+        if (conv.avatarHashHex.equals(avatarHashHex, ignoreCase = true)) return
+        val stored = YggAvatarCodec.storeIncoming(
+            avatarBase64,
+            avatarHashHex,
+            YggAvatarCodec.avatarDir(context)
+        ) ?: return
+        dao.updateConversationAvatar(chatId, stored.localUri, stored.hashHex)
     }
 
     suspend fun deleteSecondaryProfile(profileId: String): List<UserProfileEntity> {

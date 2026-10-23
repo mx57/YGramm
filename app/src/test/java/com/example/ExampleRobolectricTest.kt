@@ -3,11 +3,15 @@ package com.example
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.YggDatabase
 import com.example.data.YggRepository
 import com.example.engine.IncomingReactionPacket
 import com.example.engine.IncomingTwinPacket
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggPeerScannerCatalog
@@ -431,5 +435,139 @@ class ExampleRobolectricTest {
             2,
             logs.count { it.summary.contains("потерян") }
         )
+    }
+
+    @Test
+    fun `avatar crosses the p2p link once and the recipient stores only verified bytes`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val sourceFile = java.io.File(app.filesDir, "face_source.png").apply {
+            val bitmap = Bitmap.createBitmap(240, 240, Bitmap.Config.ARGB_8888)
+            Canvas(bitmap).drawColor(android.graphics.Color.parseColor("#7E57C2"))
+            java.io.FileOutputStream(this).use { out ->
+                assertTrue("Test image must encode", bitmap.compress(Bitmap.CompressFormat.PNG, 100, out))
+            }
+            bitmap.recycle()
+        }
+        val sourceUri = Uri.fromFile(sourceFile)
+
+        // 1. The codec turns the picked file into an overlay-sized, hash-named JPEG.
+        val stored = YggAvatarCodec.storeFromUri(app, sourceUri)
+        assertNotNull("A real image must become an avatar that fits one frame", stored)
+        requireNotNull(stored)
+        assertTrue(
+            "Stored avatar must stay inside the frame budget",
+            stored.jpegBytes in 1..YggAvatarCodec.MAX_JPEG_BYTES
+        )
+        val avatarBase64 = YggAvatarCodec.base64OfStoredFile(stored.localUri)
+        assertTrue("The stored file must read back for the wire", !avatarBase64.isNullOrBlank())
+
+        // 2. Owning profile keeps it across the database.
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao(), app)
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        repo.ensureInitialized(identity)
+        val profileId = repo.getAllProfilesNow().first().profileId
+        val updatedProfile = repo.setProfileAvatar(profileId, sourceUri)
+        assertEquals(stored.hashHex, updatedProfile?.avatarHashHex)
+        assertTrue(updatedProfile?.avatarUri?.startsWith("file://") == true)
+
+        // 3. Real P2P roundtrip: the picture rides the MSG frame of an ordinary message.
+        val packets = java.util.concurrent.ConcurrentLinkedQueue<IncomingTwinPacket>()
+        val receiverNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { packets.add(it) },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val senderNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        try {
+            receiverNode.start()
+            senderNode.start()
+            kotlinx.coroutines.delay(150)
+
+            val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
+            val chatId = repo.createNewConversation(
+                title = "Аватар Пир",
+                yggIpv6Input = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+                disappearingSeconds = 0,
+                directEndpointHint = receiverEndpoint
+            )
+
+            suspend fun send(text: String, id: String): Boolean =
+                senderNode.dispatchOutgoingMessageThroughYggdrasil(
+                    chatId = chatId,
+                    messageId = id,
+                    peerTitle = "Аватар Пир",
+                    peerIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+                    directEndpointHint = receiverEndpoint,
+                    senderNodeLabel = "Узел YggGram #1",
+                    senderIpv6 = identity.yggIpv6Address,
+                    senderPubKeyHex = identity.yggNodePublicKeyHex,
+                    plainText = text,
+                    cipherPayloadHex = "aabbccdd",
+                    hashcashToken = "1:10:test",
+                    attachmentName = null,
+                    attachmentSizeBytes = 0L,
+                    senderAvatarHash = stored.hashHex,
+                    senderAvatarBase64 = avatarBase64.orEmpty()
+                )
+
+            assertTrue("First message must be ACKed", send("Первое сообщение", "msg_avatar_1"))
+            withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+            }
+            val first = packets.poll()
+            requireNotNull(first)
+            assertEquals(stored.hashHex, first.senderAvatarHash)
+            assertEquals(avatarBase64, first.senderAvatarData)
+
+            // 4. The recipient re-hashes the payload: a face is only stored when the
+            //    bytes match the hash the sender claimed under its own key.
+            repo.storeIncomingAvatar(chatId, first.senderAvatarHash, first.senderAvatarData)
+            val storedConv = repo.conversations.first().find { it.chatId == chatId }
+            assertEquals(stored.hashHex, storedConv?.avatarHashHex)
+            assertNotNull(YggAvatarCodec.fileFor(storedConv?.avatarUri.orEmpty()))
+
+            val forgedChatId = repo.createNewConversation(
+                title = "Подозрительный Пир",
+                yggIpv6Input = "0202:8f4e:3b12:90a4:55d1:c209:7e11:44a9",
+                disappearingSeconds = 0,
+                directEndpointHint = ""
+            )
+            repo.storeIncomingAvatar(forgedChatId, "0".repeat(64), first.senderAvatarData)
+            assertEquals(
+                "Bytes that do not hash to the claimed digest must never reach the disk",
+                "",
+                repo.conversations.first().find { it.chatId == forgedChatId }?.avatarHashHex
+            )
+
+            // 5. After the ACK the sender stops repeating 12 KB on every message.
+            assertTrue("Second message must be ACKed", send("Второе сообщение", "msg_avatar_2"))
+            withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+            }
+            val second = packets.poll()
+            requireNotNull(second)
+            assertEquals("The hash still identifies the picture", stored.hashHex, second.senderAvatarHash)
+            assertEquals("Confirmed avatars must not ride every frame", "", second.senderAvatarData)
+        } finally {
+            receiverNode.stop()
+            senderNode.stop()
+        }
     }
 }

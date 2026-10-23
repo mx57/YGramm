@@ -119,21 +119,12 @@ fun VoiceCallOverlaySheet(
                 }
 
                 // Avatar Circle
-                Box(
-                    modifier = Modifier
-                        .size(80.dp)
-                        .clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.primaryContainer)
-                        .border(2.dp, EmeraldPrimary, CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = callState.peerTitle.take(2).uppercase(),
-                        style = MaterialTheme.typography.headlineLarge,
-                        color = EmeraldPrimary,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+                YggAvatar(
+                    avatarUri = callState.peerAvatarUri,
+                    name = callState.peerTitle,
+                    size = 80.dp,
+                    modifier = Modifier.border(2.dp, EmeraldPrimary, CircleShape)
+                )
 
                 // Peer Title & IPv6
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {

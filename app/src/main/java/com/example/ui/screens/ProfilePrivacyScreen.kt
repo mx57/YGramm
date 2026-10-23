@@ -12,10 +12,12 @@ import android.os.Build
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -93,6 +95,7 @@ import com.example.engine.ParsedYggContactQr
 import com.example.service.YggAlertCategory
 import com.example.service.YggForegroundServiceState
 import com.example.ui.components.QrContactModal
+import com.example.ui.components.YggAvatar
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
@@ -146,7 +149,9 @@ fun ProfilePrivacyScreen(
         voiceNotificationsEnabled: Boolean?,
         callNotificationsEnabled: Boolean?
     ) -> Unit = { _, _, _, _, _, _ -> },
-    onAddContactFromQr: (ParsedYggContactQr) -> Unit = {}
+    onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
+    onPickProfileAvatar: (Uri) -> Unit = {},
+    onClearProfileAvatar: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
@@ -202,6 +207,14 @@ fun ProfilePrivacyScreen(
     val profile = uiState.userProfile
     val privacy = uiState.privacyMatrix
 
+    // The gallery, not the camera: the picture is resized on-device into the 12 KB the
+    // overlay frame can carry, and the user must see which photo that will be.
+    val avatarPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) onPickProfileAvatar(uri)
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -225,13 +238,28 @@ fun ProfilePrivacyScreen(
                             modifier = Modifier
                                 .size(64.dp)
                                 .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primaryContainer),
+                                .testTag("profile_avatar_picker")
+                                .clickable {
+                                    avatarPickerLauncher.launch(
+                                        PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly
+                                        )
+                                    )
+                                },
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                text = profile.displayName.take(2).uppercase(),
-                                style = MaterialTheme.typography.headlineMedium,
-                                color = EmeraldPrimary
+                            YggAvatar(
+                                avatarUri = profile.avatarUri,
+                                name = profile.displayName,
+                                size = 64.dp
+                            )
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Выбрать фотографию профиля",
+                                tint = Color.White,
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .size(18.dp)
                             )
                         }
                         Spacer(modifier = Modifier.width(14.dp))
@@ -254,6 +282,20 @@ fun ProfilePrivacyScreen(
                                 style = MaterialTheme.typography.labelMedium,
                                 color = CyberTealSecondary
                             )
+                        }
+                    }
+
+                    if (profile.avatarUri.isNotBlank()) {
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            Spacer(modifier = Modifier.weight(1f))
+                            TextButton(
+                                onClick = onClearProfileAvatar,
+                                colors = ButtonDefaults.textButtonColors(
+                                    contentColor = AmberShieldTertiary
+                                )
+                            ) {
+                                Text("Убрать фото")
+                            }
                         }
                     }
 
@@ -448,11 +490,10 @@ fun ProfilePrivacyScreen(
                                                 .background(MaterialTheme.colorScheme.primaryContainer),
                                             contentAlignment = Alignment.Center
                                         ) {
-                                            Text(
-                                                text = itemProfile.displayName.take(2).uppercase(),
-                                                style = MaterialTheme.typography.titleSmall,
-                                                color = EmeraldPrimary,
-                                                fontWeight = FontWeight.Bold
+                                            YggAvatar(
+                                                avatarUri = itemProfile.avatarUri,
+                                                name = itemProfile.displayName,
+                                                size = 38.dp
                                             )
                                         }
                                         Spacer(modifier = Modifier.width(10.dp))

@@ -86,6 +86,21 @@ interface YggDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertConversation(conversation: ConversationEntity)
 
+    // An avatar is written on its own because an incoming frame must not have to re-save
+    // the whole conversation to carry one: the re-save path rebuilds the row from a copy
+    // and used to drop fields the writer never looked at.
+    @Query(
+        "UPDATE conversations SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex " +
+            "WHERE chatId = :chatId"
+    )
+    suspend fun updateConversationAvatar(chatId: String, avatarUri: String, avatarHashHex: String)
+
+    @Query(
+        "UPDATE ygg_profiles SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex " +
+            "WHERE profileId = :profileId"
+    )
+    suspend fun updateProfileAvatar(profileId: String, avatarUri: String, avatarHashHex: String)
+
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp ASC")
     fun observeMessagesForChat(chatId: String): Flow<List<MessageEntity>>
 
