@@ -156,6 +156,8 @@ fun YggGramRootApp(
     val allMessages by viewModel.allMessages.collectAsStateWithLifecycle()
     val callLog by viewModel.callLog.collectAsStateWithLifecycle()
     val messageSearchResults by viewModel.messageSearchResults.collectAsStateWithLifecycle()
+    val activeGroupMembers by viewModel.activeGroupMembers.collectAsStateWithLifecycle()
+    val groupMemberCounts by viewModel.groupMemberCounts.collectAsStateWithLifecycle()
     val peers by viewModel.peers.collectAsStateWithLifecycle()
     val linkedDevices by viewModel.linkedDevices.collectAsStateWithLifecycle()
     val backupSnapshots by viewModel.backupSnapshots.collectAsStateWithLifecycle()
@@ -721,6 +723,8 @@ fun YggGramRootApp(
                                 allMessages = allMessages,
                                 callLog = callLog,
                                 messageSearchResults = messageSearchResults,
+                                activeGroupMembers = activeGroupMembers,
+                                groupMemberCounts = groupMemberCounts,
                                 queuedOfflineCount = queuedOfflineCount,
                                 onSelectChat = viewModel::selectChat,
                                 onSearchQueryChange = viewModel::updateSearchQuery,
@@ -737,7 +741,9 @@ fun YggGramRootApp(
                                 onToggleReaction = viewModel::toggleMessageReaction,
                                 onStartVoiceCall = viewModel::startVoiceCall,
                                 onAddContactFromQr = viewModel::addContactFromQrPayload,
-                                onCreateNewChat = viewModel::createNewChatOrGroup,
+                                onCreateNewChat = viewModel::createNewChat,
+                                onCreateGroup = viewModel::createGroup,
+                                onAddContactsToGroup = viewModel::addContactsToGroup,
                                 onDeleteChat = viewModel::deleteChat,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
                                 onOpenSelfYggdrasilChat = { runOverlayProbe ->

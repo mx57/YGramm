@@ -23,9 +23,10 @@ import java.io.FileInputStream
         LinkedDeviceEntity::class,
         BackupSnapshotEntity::class,
         CryptoKeyRecordEntity::class,
-        CallLogEntity::class
+        CallLogEntity::class,
+        GroupMemberEntity::class
     ],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -95,6 +96,26 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `group_members` (" +
+                        "`chatId` TEXT NOT NULL, `memberIpv6` TEXT NOT NULL, " +
+                        "`memberPubKeyHex` TEXT NOT NULL, `memberName` TEXT NOT NULL, " +
+                        "`addedAt` INTEGER NOT NULL, PRIMARY KEY (`chatId`, `memberIpv6`))"
+                )
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN chatType TEXT NOT NULL DEFAULT 'DIRECT'"
+                )
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN groupId TEXT NOT NULL DEFAULT ''"
+                )
+                db.execSQL(
+                    "ALTER TABLE messages ADD COLUMN deliveredMemberCsv TEXT NOT NULL DEFAULT ''"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -118,7 +139,9 @@ abstract class YggDatabase : RoomDatabase() {
                 encryptPlaintextDatabase(dbFile, passphrase)
             }
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
-                .addMigrations(MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+                .addMigrations(
+                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10
+                )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
                 .build()

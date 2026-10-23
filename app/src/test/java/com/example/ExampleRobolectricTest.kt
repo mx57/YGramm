@@ -570,4 +570,188 @@ class ExampleRobolectricTest {
             senderNode.stop()
         }
     }
+
+    @Test
+    fun `group roster rides an ordinary message and only a full ack set counts as delivered`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val senderDb = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val peerDb = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val senderRepo = YggRepository(senderDb.yggDao())
+        val peerRepo = YggRepository(peerDb.yggDao())
+
+        val senderIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        val peerIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "glacier", "helium", "cascade", "nebula", "cobalt", "lattice",
+                "photon", "quartz", "onyx", "harbor", "vertex", "cedar"
+            ),
+            epoch = 1
+        )
+        senderRepo.ensureInitialized(senderIdentity)
+        peerRepo.ensureInitialized(peerIdentity)
+
+        val memberOneIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+        val memberTwoIpv6 = "0202:11be:77c4:0d35:9a08:5ef2:31b7:cc09"
+        val chatOne = senderRepo.createNewConversation(
+            title = "Узел А", yggIpv6Input = memberOneIpv6, disappearingSeconds = 0
+        )
+        val chatTwo = senderRepo.createNewConversation(
+            title = "Узел Б", yggIpv6Input = memberTwoIpv6, disappearingSeconds = 0
+        )
+
+        // 1. A group is local bookkeeping: an identifier, a type and a roster of addresses.
+        val groupChatId = senderRepo.createNewGroup(
+            title = "Полигон 0200::/7",
+            memberContactChatIds = listOf(chatOne, chatTwo),
+            ownerProfileId = YggRepository.DEFAULT_PROFILE_ID,
+            localIdentity = senderIdentity
+        )
+        val group = senderRepo.getConversation(groupChatId)
+        requireNotNull(group)
+        assertEquals("GROUP", group.chatType)
+        assertTrue(group.groupId.startsWith("grp_"))
+        assertEquals(2, senderRepo.getGroupMembers(groupChatId).size)
+
+        val outgoing = senderRepo.sendEncryptedMessage(
+            chatId = groupChatId,
+            plainText = "Привет группе",
+            senderIpv6 = senderIdentity.yggIpv6Address,
+            isOfflineMode = false,
+            sealedSenderGlobal = false,
+            powDifficultyBits = 1
+        )
+        requireNotNull(outgoing)
+
+        // 2. Send it over a real socket. The roster is advertised inside the message frame,
+        //    including the peer's own address, which it must refuse to store as a member.
+        val packets = CopyOnWriteArrayList<IncomingTwinPacket>()
+        val receiverNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { packets.add(it) },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val senderNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val roster = listOf(
+            "$memberOneIpv6|",
+            "$memberTwoIpv6|",
+            "${senderIdentity.yggIpv6Address}|${senderIdentity.yggNodePublicKeyHex}",
+            "${peerIdentity.yggIpv6Address}|"
+        ).joinToString(",")
+
+        try {
+            receiverNode.start()
+            senderNode.start()
+            kotlinx.coroutines.delay(150)
+            val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
+
+            val delivered = senderNode.dispatchOutgoingMessageThroughYggdrasil(
+                chatId = groupChatId,
+                messageId = outgoing.messageId,
+                peerTitle = "Узел А",
+                peerIpv6 = memberOneIpv6,
+                directEndpointHint = receiverEndpoint,
+                senderNodeLabel = "Узел YggGram #1",
+                senderIpv6 = senderIdentity.yggIpv6Address,
+                senderPubKeyHex = senderIdentity.yggNodePublicKeyHex,
+                plainText = outgoing.plainText,
+                cipherPayloadHex = outgoing.cipherPayloadHex,
+                hashcashToken = outgoing.hashcashPowToken,
+                attachmentName = null,
+                attachmentSizeBytes = 0L,
+                groupId = group.groupId,
+                groupTitle = group.title,
+                groupMembersCsv = roster
+            )
+            assertTrue("Group frame must reach the peer over the socket", delivered)
+
+            val frame = withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+                packets.first()
+            }
+            assertEquals(group.groupId, frame.groupId)
+            assertEquals(group.title, frame.groupTitle)
+            assertTrue(
+                "The roster has to survive the wire framing",
+                frame.groupMembersCsv.contains(memberTwoIpv6)
+            )
+
+            // 3. The receiving node has never heard of this group. One frame from one
+            //    member is enough to rebuild it — and it must land in the group, not in a
+            //    private chat with whoever relayed it.
+            assertEquals("Узел YggGram #1", frame.senderNodeLabel)
+            val resolvedChatId = peerRepo.recordIncomingTwinMessage(frame, activeChatId = null)
+            val peerConv = peerRepo.getConversation(resolvedChatId)
+            requireNotNull(peerConv)
+            assertEquals("GROUP", peerConv.chatType)
+            assertEquals(group.groupId, peerConv.groupId)
+            assertEquals("Полигон 0200::/7", peerConv.title)
+            assertTrue(
+                "A group frame must not open a 1:1 dialog with its relay",
+                peerRepo.conversations.first().none {
+                    it.chatType != "GROUP" && it.yggIpv6Address == memberOneIpv6
+                }
+            )
+
+            val peerMembers = peerRepo.getGroupMembers(resolvedChatId)
+            assertEquals(
+                "The speaker and the member that never spoke are both known from one frame",
+                3,
+                peerMembers.size
+            )
+            assertTrue(peerMembers.any { it.memberIpv6 == memberTwoIpv6 })
+            // Only the node that actually spoke has a name: the roster carries addresses,
+            // so the other members stay unnamed until they introduce themselves.
+            assertEquals(
+                "Узел YggGram #1",
+                peerMembers.first { it.memberIpv6 == senderIdentity.yggIpv6Address.lowercase() }.memberName
+            )
+            assertEquals(
+                "",
+                peerMembers.first { it.memberIpv6 == memberOneIpv6 }.memberName
+            )
+            assertTrue(
+                "A node never lists its own address as an external member",
+                peerMembers.none { it.memberIpv6 == peerIdentity.yggIpv6Address.lowercase() }
+            )
+
+            // 4. Delivery is counted per member: one acknowledgement of two is not delivery.
+            val (firstAcked, rosterSize) = senderRepo.recordGroupMemberDelivery(
+                outgoing.messageId,
+                memberOneIpv6
+            )
+            assertEquals(2, rosterSize)
+            assertEquals(1, firstAcked)
+            val afterOneAck = senderRepo.getMessage(outgoing.messageId)?.deliveryState
+            assertTrue(
+                "Half a roster must not report DELIVERED, got $afterOneAck",
+                afterOneAck != "DELIVERED"
+            )
+
+            senderRepo.recordGroupMemberDelivery(outgoing.messageId, memberTwoIpv6)
+            val afterAllAcks = senderRepo.getMessage(outgoing.messageId)
+            assertEquals("DELIVERED", afterAllAcks?.deliveryState)
+            assertEquals(2, afterAllAcks?.deliveredMemberCsv?.split(',')?.size)
+        } finally {
+            receiverNode.stop()
+            senderNode.stop()
+        }
+    }
 }

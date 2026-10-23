@@ -73,6 +73,13 @@ data class IncomingTwinPacket(
     // data is only present on the first message after the sender changes it.
     val senderAvatarHash: String = "",
     val senderAvatarData: String = "",
+    // Group identity and roster, advertised by every group message. A member learns who
+    // else is in the group from the messages themselves, so a group needs no separate
+    // sync channel and no server: one frame from any member is enough to rebuild it.
+    val groupId: String = "",
+    val groupTitle: String = "",
+    // "ipv6|ed25519hex,ipv6|ed25519hex" — empty key when the sender only knows the address.
+    val groupMembersCsv: String = "",
     val rttMs: Long,
     val timestamp: Long
 )
@@ -641,6 +648,29 @@ class YggTwinP2PBridge(
         frame["senderAvatarData"].orEmpty().takeIf {
             it.length <= YggAvatarCodec.MAX_JPEG_BYTES * 2 && it.all { c -> c.isLetterOrDigit() || c == '-' || c == '_' }
         }.orEmpty()
+
+    /**
+     * A roster is merged from whatever a peer advertises, so it is capped and shape-
+     * checked: one frame from an unfamiliar node must not be able to plant thousands of
+     * phantom members in a chat list.
+     */
+    private fun rosterOf(frame: Map<String, String>): String =
+        frame["groupMembers"].orEmpty()
+            .split(',')
+            .map { it.trim() }
+            .filter { it.contains(':') }
+            .distinct()
+            .take(64)
+            .joinToString(",")
+
+    /**
+     * A group id ends up inside a primary key, so it is shape-checked and bounded: an
+     * unfamiliar peer must not be able to mint an arbitrarily long identifier.
+     */
+    private fun groupIdOf(frame: Map<String, String>): String =
+        frame["groupId"].orEmpty().trim().lowercase()
+            .takeIf { it.length <= 64 && it.all { c -> c.isLetterOrDigit() || c == '_' || c == '-' } }
+            .orEmpty()
 
     private fun markAvatarAdvertised(messageId: String) {
         pendingAvatarAdverts.remove(messageId)?.let { (chatId, hash) ->
@@ -1248,6 +1278,9 @@ class YggTwinP2PBridge(
                     forwardedFrom = map["forwardedFrom"].orEmpty(),
                     senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
                     senderAvatarData = avatarDataOf(map),
+                    groupId = groupIdOf(map),
+                    groupTitle = map["groupTitle"].orEmpty().trim().take(80),
+                    groupMembersCsv = rosterOf(map),
                     rttMs = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L),
                     timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis()
                 )
@@ -1667,7 +1700,10 @@ class YggTwinP2PBridge(
                         replyToMessageId = map["replyToMessageId"].orEmpty(),
                         forwardedFrom = map["forwardedFrom"].orEmpty(),
                         senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
-                        senderAvatarData = avatarDataOf(map)
+                        senderAvatarData = avatarDataOf(map),
+                        groupId = groupIdOf(map),
+                        groupTitle = map["groupTitle"].orEmpty().trim().take(80),
+                        groupMembersCsv = rosterOf(map)
                     )
 
                     val ackFrame = encodeWireFrame(
@@ -2292,7 +2328,10 @@ class YggTwinP2PBridge(
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
-        senderAvatarBase64: String = ""
+        senderAvatarBase64: String = "",
+        groupId: String = "",
+        groupTitle: String = "",
+        groupMembersCsv: String = ""
     ): SelfYggdrasilRelayResult = withContext(Dispatchers.IO) {
         val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()] ?: ""
         val targetProfileId = ipv6ToProfileIdMap[peerIpv6.trim().lowercase()]
@@ -2491,6 +2530,9 @@ class YggTwinP2PBridge(
             "forwardedFrom" to forwardedFrom,
             "senderAvatarHash" to senderAvatarHash,
             "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+            "groupId" to groupId,
+            "groupTitle" to groupTitle,
+            "groupMembers" to groupMembersCsv,
             "sentAt" to now.toString(),
             "timestamp" to now.toString()
         )
@@ -2732,7 +2774,10 @@ class YggTwinP2PBridge(
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
-        senderAvatarBase64: String = ""
+        senderAvatarBase64: String = "",
+        groupId: String = "",
+        groupTitle: String = "",
+        groupMembersCsv: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (directEndpointHint.isNotBlank() && allowDirectLanRouting) {
             registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
@@ -2802,6 +2847,9 @@ class YggTwinP2PBridge(
                                 advertisedAvatarHashes[chatId] != senderAvatarHash
                             ) senderAvatarBase64 else ""
                             ),
+                        "groupId" to groupId,
+                        "groupTitle" to groupTitle,
+                        "groupMembers" to groupMembersCsv,
                         "sentAt" to now.toString(),
                         "timestamp" to now.toString()
                     )

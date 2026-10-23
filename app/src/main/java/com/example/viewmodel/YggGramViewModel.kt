@@ -20,6 +20,8 @@ import com.example.data.BackupSnapshotEntity
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
 import com.example.data.CryptoKeyRecordEntity
+import com.example.data.GroupMemberCount
+import com.example.data.GroupMemberEntity
 import com.example.data.LinkedDeviceEntity
 import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
@@ -284,6 +286,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         .flatMapLatest { (profileId, query) -> repository.searchMessages(profileId, query) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** Roster of the conversation that is open, empty for a 1:1 dialog. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val activeGroupMembers: StateFlow<List<GroupMemberEntity>> = _uiState
+        .map { it.selectedChatId.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { chatId -> repository.observeGroupMembers(chatId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Member counts behind every group row, so the chat list states a real roster size. */
+    val groupMemberCounts: StateFlow<List<GroupMemberCount>> = repository
+        .observeGroupMemberCounts()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
     private val typingExpiryJobs =
         java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
     private val lastTypingSentAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -426,6 +441,29 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         },
         onDeliveryAckReceived = { chatId, messageId, rttMs ->
             viewModelScope.launch {
+                // The message row is authoritative for which chat an ACK belongs to: a group
+                // message confirmed by one member must not be written as delivered to all.
+                val ackedMsg = repository.getMessage(messageId)
+                val ackedChatId = ackedMsg?.chatId?.takeIf { it.isNotBlank() } ?: chatId
+                if (repository.getConversation(ackedChatId)?.chatType == "GROUP") {
+                    // The fan-out already stores this member in deliveredMemberCsv; the
+                    // callback only reports the running count.
+                    val ackedCount = ackedMsg?.deliveredMemberCsv
+                        ?.split(',').orEmpty().count { it.isNotBlank() }
+                    val memberTotal = repository.getGroupMembers(ackedChatId).size
+                    repository.updateConversationRouteStatus(
+                        chatId = ackedChatId,
+                        isOnline = true,
+                        routeSummary = "Группа • ACK участника (${rttMs} мс): подтверждено $ackedCount из $memberTotal"
+                    )
+                    _uiState.update {
+                        it.copy(
+                            rxPacketsCount = it.rxPacketsCount + 1,
+                            statusBannerMessage = "Участник группы подтвердил доставку ACK (${rttMs} мс): $ackedCount из $memberTotal"
+                        )
+                    }
+                    return@launch
+                }
                 repository.markMessageDelivered(messageId)
                 if (chatId.isNotBlank()) {
                     repository.updateConversationRouteStatus(
@@ -511,8 +549,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
-        onReadReceiptReceived = { _, ids ->
+        onReadReceiptReceived = { chatId, ids ->
             viewModelScope.launch {
+                // A group has no reader-of-record: one member's receipt would mark the
+                // message read for everybody, so group receipts are not applied.
+                if (repository.getConversation(chatId)?.chatType == "GROUP") return@launch
                 ids.forEach { repository.markOutgoingMessageRead(it) }
                 if (ids.isNotEmpty()) {
                     _uiState.update {
@@ -1726,6 +1767,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     private fun isConversationSelfNode(conv: ConversationEntity?, identity: DerivedIdentityHierarchy): Boolean {
         if (conv == null) return false
+        // A group row carries this node's own address as its owner, but it is a set of
+        // external members — sending to it is never a note to ourselves.
+        if (conv.chatType == "GROUP") return false
         return YggRepository.isSelfChatId(conv.chatId) ||
             conv.publicKeyHex.equals(identity.yggNodePublicKeyHex, ignoreCase = true) ||
             sameMeshAddress(conv.yggIpv6Address, identity.yggIpv6Address)
@@ -1746,6 +1790,117 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
             )
         return connectedFirst.map { Triple(it.endpointUri, it.sniDomain, it.regionLabel) }
+    }
+
+    /**
+     * Fan a group note out over the mesh, one frame per roster member.
+     *
+     * Yggdrasil has no multicast and there is no server, so a group is only a set of 1:1
+     * overlay links that all carry the same groupId and the same advertised roster; members
+     * learn the roster from the frames themselves. Acknowledgements are counted per address
+     * and the message turns DELIVERED only when the whole roster has acked, because a group
+     * of five with two nodes offline has not been delivered to.
+     *
+     * @return acknowledged members, members a frame reached, and the roster size.
+     */
+    private suspend fun dispatchGroupMessage(
+        conv: ConversationEntity,
+        msg: MessageEntity,
+        attachmentBase64: String?
+    ): Triple<Int, Int, Int> {
+        val state = _uiState.value
+        val identity = state.identity
+        val members = repository.getGroupMembers(conv.chatId)
+        if (members.isEmpty() || identity.yggIpv6Address.isBlank())
+            return Triple(0, 0, members.size)
+
+        val roster = (members.map { it.memberIpv6.lowercase() to it.memberPubKeyHex.lowercase() } +
+            (identity.yggIpv6Address.lowercase() to identity.yggNodePublicKeyHex.lowercase()))
+            .filter { it.first.contains(":") }
+            .distinctBy { it.first }
+            .take(64)
+        val rosterCsv = roster.joinToString(",") { "${it.first}|${it.second}" }
+        val candidatePeers = buildCandidateExternalPeersList()
+        val avatarBase64 = YggAvatarCodec.base64OfStoredFile(state.userProfile.avatarUri).orEmpty()
+
+        var acked = 0
+        var routed = 0
+        members.forEach { member ->
+            // The member's own contact row is used when it exists: it carries the direct
+            // endpoint hint and the X25519 key pinned by past conversations. A member added
+            // only through someone else's roster notice has no row yet, so it is addressed
+            // by what the frame advertised.
+            val known = conversations.value.firstOrNull {
+                it.ownerProfileId == conv.ownerProfileId &&
+                    it.chatType != "GROUP" &&
+                    sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+            }
+            val memberConv = known
+                ?: conv.copy(
+                    yggIpv6Address = member.memberIpv6,
+                    publicKeyHex = member.memberPubKeyHex,
+                    peerX25519PublicKeyHex = ""
+                )
+            val peerIdentity = repository.resolvePeerNodeIdentity(memberConv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { member.memberIpv6 }
+            if (peerIpv6.isBlank()) return@forEach
+            val result = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
+                chatId = conv.chatId,
+                messageId = msg.messageId,
+                peerTitle = member.memberName.ifBlank { memberConv.title },
+                peerIpv6 = peerIpv6,
+                directEndpointHint = extractDirectEndpointHint(memberConv),
+                senderNodeLabel = state.userProfile.displayName,
+                senderIpv6 = identity.yggIpv6Address,
+                senderPubKeyHex = identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                plainText = msg.plainText,
+                cipherPayloadHex = msg.cipherPayloadHex,
+                hashcashToken = msg.hashcashPowToken,
+                attachmentName = msg.attachmentName,
+                attachmentSizeBytes = msg.attachmentSizeBytes,
+                candidatePeers = candidatePeers,
+                allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery,
+                attachmentType = msg.attachmentType,
+                attachmentUri = msg.attachmentUri,
+                attachmentBase64 = attachmentBase64,
+                voiceDurationSec = msg.voiceDurationSec,
+                voiceWaveformCsv = msg.voiceWaveformCsv,
+                replyToMessageId = msg.replyToMessageId,
+                forwardedFrom = msg.forwardedFrom,
+                senderAvatarHash = state.userProfile.avatarHashHex,
+                senderAvatarBase64 = avatarBase64,
+                groupId = conv.groupId,
+                groupTitle = conv.title,
+                groupMembersCsv = rosterCsv
+            )
+            if (result.delivered) routed++
+            if (result.relayEndpointUri.isNotBlank() && result.rttMs > 0) {
+                repository.updatePeerTrafficByEndpoint(
+                    endpointUri = result.relayEndpointUri,
+                    rttMs = result.rttMs.toInt(),
+                    txDelta = result.txBytes,
+                    rxDelta = result.rxBytes
+                )
+            }
+            if (result.endToEndConfirmed) {
+                repository.recordGroupMemberDelivery(msg.messageId, peerIpv6)
+                acked++
+            } else if (result.delivered) {
+                repository.markMessageSentP2P(msg.messageId)
+            }
+        }
+        repository.updateConversationRouteStatus(
+            chatId = conv.chatId,
+            isOnline = routed > 0,
+            routeSummary = when {
+                acked == members.size -> "Группа • доставлено всем: $acked из ${members.size}"
+                acked > 0 -> "Группа • подтверждено ACK: $acked из ${members.size}"
+                routed > 0 -> "Группа • передано в оверлей: $routed из ${members.size}, ACK пока нет"
+                else -> "Группа • нет подтвержденного маршрута ни к одному участнику"
+            }
+        )
+        return Triple(acked, routed, members.size)
     }
 
     private fun flushQueuedMessagesOverRealNetwork() {
@@ -1792,6 +1947,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     // separately by the overlay probe.
                     repository.markMessageLocalNote(msg.messageId)
                     deliveredCount++
+                } else if (conv.chatType == "GROUP") {
+                    val (acked, routed, total) = dispatchGroupMessage(conv, msg, attachmentBase64)
+                    if (acked == total && total > 0) confirmedCount++
+                    if (routed > 0) deliveredCount++
                 } else {
                     val directHint = extractDirectEndpointHint(conv)
                     val peerIdentity = repository.resolvePeerNodeIdentity(conv)
@@ -1912,6 +2071,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (wireIds.isEmpty()) return
         repository.markIncomingMessagesRead(chatId)
         val conv = repository.getConversation(chatId) ?: return
+        // Receipts and typing are 1:1 frames; a group has no single peer to address and a
+        // receipt sent to one member would claim the whole group read it.
+        if (conv.chatType == "GROUP") return
         val state = _uiState.value
         if (conv.ownerProfileId.isNotBlank() && conv.ownerProfileId != state.currentProfileId) return
         val peerIdentity = repository.resolvePeerNodeIdentity(conv)
@@ -2075,6 +2237,26 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
 
             _uiState.update { it.copy(txPacketsCount = it.txPacketsCount + 1) }
+
+            if (targetConv?.chatType == "GROUP") {
+                val (acked, routed, total) = dispatchGroupMessage(targetConv, savedMsg, attachmentBase64)
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            total == 0 -> "В группе «${targetConv.title}» нет участников — добавьте контакты"
+                            acked == total -> "Группа «${targetConv.title}»: доставлено всем ($acked из $total)"
+                            acked > 0 -> "Группа «${targetConv.title}»: ACK подтверждены только $acked из $total"
+                            routed > 0 ->
+                                "Группа «${targetConv.title}»: передано $routed из $total, ACK пока не получен — нажмите «Повторить»"
+                            else ->
+                                "Группа «${targetConv.title}»: нет подтвержденного маршрута ни к одному участнику, сообщения в очереди S&F"
+                        }
+                    )
+                }
+                syncForegroundServiceNotification()
+                return@launch
+            }
+
             val candidatePeers = buildCandidateExternalPeersList()
 
             // Check if sending to self ("Избранное • Мой узел Yggdrasil" or own IPv6/PubKey)
@@ -2248,6 +2430,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val conv = repository.getConversation(chatId) ?: return@launch
             if (isConversationSelfNode(conv, state.identity)) return@launch
+            // A typing frame is addressed to one node; sending it to a single member would
+            // imply the whole group was notified.
+            if (conv.chatType == "GROUP") return@launch
             val peerIdentity = repository.resolvePeerNodeIdentity(conv)
             val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
             if (peerIpv6.isBlank()) return@launch
@@ -2276,6 +2461,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val conv = repository.getConversation(updated.chatId) ?: return@launch
             // Self-chat notes never leave the device; there is no peer to notify.
             if (YggRepository.isSelfChatId(conv.chatId)) return@launch
+            // A reaction frame reaches one node, so it cannot claim the group reacted.
+            // The local reaction the caller just made stays stored.
+            if (conv.chatType == "GROUP") return@launch
 
             val addedByMe = YggRepository.parseReactionsMap(updated.reactionsJson)[emoji]?.second == true
             // The peer must receive the id its own copy of the message uses.
@@ -2374,6 +2562,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             if (YggRepository.isSelfChatId(conv.chatId) || isConversationSelfNode(conv, current.identity)) {
                 _uiState.update {
                     it.copy(statusBannerMessage = "Нельзя позвонить собственному узлу: выберите чат с собеседником")
+                }
+                return@launch
+            }
+            if (conv.chatType == "GROUP") {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Групповой звонок не поддерживается: вызов идёт на один узел, откройте личный чат участника")
                 }
                 return@launch
             }
@@ -3370,6 +3564,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 repository.markMessageLocalNote(message.messageId)
                 val outcome = networkEngine.probeOverlayRoundTrip(currentState.currentProfileId)
                 applyOverlayProbeOutcome(outcome, conv.chatId)
+            } else if (conv.chatType == "GROUP") {
+                val (acked, routed, total) = dispatchGroupMessage(conv, message, attachmentBase64)
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            total == 0 -> "В группе нет участников: сначала добавьте контакты"
+                            acked == total -> "Повтор в группу: доставлено всем ($acked из $total)"
+                            else -> "Повтор в группу: ACK $acked из $total, кадров передано: $routed"
+                        }
+                    )
+                }
             } else {
                 val peerIdentity = repository.resolvePeerNodeIdentity(conv)
                 val overlayRes = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
@@ -3631,7 +3836,68 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         networkDpiController.connectTopFastestPeersInSelectedCountry()
     }
 
-    fun createNewChatOrGroup(
+    /**
+     * Opening a group from the contacts this profile already has dialogs with.
+     *
+     * Nothing leaves the device yet: on a mesh with no server, the group only becomes real
+     * to the other nodes when the first message goes out, because that frame carries its
+     * identifier and its roster.
+     */
+    fun createGroup(title: String, memberContactChatIds: List<String>) {
+        val picked = memberContactChatIds.filter { it.isNotBlank() }
+        if (picked.isEmpty()) {
+            _uiState.update {
+                it.copy(statusBannerMessage = "Группа не создана: выберите хотя бы один контакт")
+            }
+            return
+        }
+        viewModelScope.launch {
+            val newChatId = withContext(Dispatchers.IO) {
+                repository.createNewGroup(
+                    title = title,
+                    memberContactChatIds = picked,
+                    ownerProfileId = _uiState.value.currentProfileId,
+                    localIdentity = _uiState.value.identity
+                )
+            }
+            if (newChatId.isBlank()) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Группа не создана: у выбранных контактов нет адреса узла в оверлее"
+                    )
+                }
+                return@launch
+            }
+            val rosterSize = withContext(Dispatchers.IO) { repository.getGroupMembers(newChatId).size }
+            _uiState.update {
+                it.copy(
+                    selectedChatId = newChatId,
+                    statusBannerMessage = "Группа создана, участников: ${rosterSize + 1}. " +
+                        "Она станет видима остальным с первым отправленным сообщением"
+                )
+            }
+        }
+    }
+
+    /** @param memberContactChatIds local chat ids of the contacts to fold into the group. */
+    fun addContactsToGroup(chatId: String, memberContactChatIds: List<String>) {
+        viewModelScope.launch {
+            val added = withContext(Dispatchers.IO) {
+                repository.addContactsToGroup(chatId, memberContactChatIds)
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (added > 0) {
+                        "Участников добавлено: $added. Новый состав уйдёт с следующим сообщением в группу"
+                    } else {
+                        "Добавлять нечего: эти контакты уже в группе или у них нет адреса узла"
+                    }
+                )
+            }
+        }
+    }
+
+    fun createNewChat(
         title: String,
         yggIpv6Input: String,
         disappearingSeconds: Int

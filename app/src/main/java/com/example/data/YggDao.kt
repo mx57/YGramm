@@ -101,6 +101,38 @@ interface YggDao {
     )
     suspend fun updateProfileAvatar(profileId: String, avatarUri: String, avatarHashHex: String)
 
+    // Group membership is keyed by the member's mesh address, which is the only form of
+    // identity both sides of the wire agree on. REPLACE makes roster merging idempotent:
+    // the same member advertised twice only refreshes its name.
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertGroupMembers(members: List<GroupMemberEntity>)
+
+    @Query(
+        "SELECT * FROM conversations WHERE groupId = :groupId AND ownerProfileId = :ownerProfileId " +
+            "AND chatType = 'GROUP' LIMIT 1"
+    )
+    suspend fun getGroupConversation(groupId: String, ownerProfileId: String): ConversationEntity?
+
+    @Query("SELECT * FROM group_members WHERE chatId = :chatId ORDER BY addedAt ASC")
+    suspend fun getGroupMembers(chatId: String): List<GroupMemberEntity>
+
+    @Query("SELECT * FROM group_members WHERE chatId = :chatId ORDER BY addedAt ASC")
+    fun observeGroupMembers(chatId: String): Flow<List<GroupMemberEntity>>
+
+    @Query("SELECT chatId AS chatId, COUNT(*) AS memberCount FROM group_members GROUP BY chatId")
+    fun observeGroupMemberCounts(): Flow<List<GroupMemberCount>>
+
+    @Query("DELETE FROM group_members WHERE chatId = :chatId AND memberIpv6 = :memberIpv6")
+    suspend fun removeGroupMember(chatId: String, memberIpv6: String)
+
+    /**
+     * Recording which members acknowledged a group message. Written as a whole because the
+     * caller holds the roster and decides the state: «DELIVERED» is only ever passed here
+     * when the set covers every member.
+     */
+    @Query("UPDATE messages SET deliveredMemberCsv = :deliveredCsv, deliveryState = :deliveryState WHERE messageId = :messageId")
+    suspend fun updateMessageGroupDelivery(messageId: String, deliveredCsv: String, deliveryState: String)
+
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp ASC")
     fun observeMessagesForChat(chatId: String): Flow<List<MessageEntity>>
 
@@ -257,3 +289,6 @@ interface YggDao {
     @Query("SELECT COUNT(*) FROM conversations")
     suspend fun countConversations(): Int
 }
+
+/** Room's row shape for the per-chat member count the chat list needs. */
+data class GroupMemberCount(val chatId: String, val memberCount: Int)

@@ -69,6 +69,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Radar
@@ -84,6 +85,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
@@ -121,6 +123,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
+import com.example.data.GroupMemberCount
+import com.example.data.GroupMemberEntity
 import com.example.data.MessageEntity
 import com.example.data.YggRepository
 import com.example.engine.ParsedYggContactQr
@@ -151,6 +155,8 @@ fun ChatsScreen(
     allMessages: List<MessageEntity>,
     callLog: List<CallLogEntity> = emptyList(),
     messageSearchResults: List<MessageEntity> = emptyList(),
+    activeGroupMembers: List<GroupMemberEntity> = emptyList(),
+    groupMemberCounts: List<GroupMemberCount> = emptyList(),
     queuedOfflineCount: Int,
     onSelectChat: (String?) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -168,6 +174,8 @@ fun ChatsScreen(
     onStartVoiceCall: (String) -> Unit = {},
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
     onCreateNewChat: (String, String, Int) -> Unit,
+    onCreateGroup: (String, List<String>) -> Unit = { _, _ -> },
+    onAddContactsToGroup: (String, List<String>) -> Unit = { _, _ -> },
     onDeleteChat: (String) -> Unit = {},
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
@@ -271,6 +279,7 @@ fun ChatsScreen(
                         callLog = callLog,
                         searchResults = messageSearchResults,
                         conversationTitles = conversationTitles,
+                        groupMemberCounts = groupMemberCounts,
                         queuedOfflineCount = queuedOfflineCount,
                         onSelectChat = onSelectChat,
                         onSearchQueryChange = onSearchQueryChange,
@@ -333,7 +342,12 @@ fun ChatsScreen(
                                     0L
                                 )
                             },
-                            onRetryMessage = onRetryMessage
+                            onRetryMessage = onRetryMessage,
+                            groupMembers = activeGroupMembers,
+                            groupContactCandidates = conversations,
+                            onAddContactsToGroup = { ids ->
+                                onAddContactsToGroup(activeConversation.chatId, ids)
+                            }
                         )
                     } else {
                         EmptyChatSelectionPlaceholder(
@@ -389,7 +403,12 @@ fun ChatsScreen(
                             0L
                         )
                     },
-                    onRetryMessage = onRetryMessage
+                    onRetryMessage = onRetryMessage,
+                    groupMembers = activeGroupMembers,
+                    groupContactCandidates = conversations,
+                    onAddContactsToGroup = { ids ->
+                        onAddContactsToGroup(activeConversation.chatId, ids)
+                    }
                 )
             } else {
                 ChatListPane(
@@ -398,6 +417,7 @@ fun ChatsScreen(
                     callLog = callLog,
                     searchResults = messageSearchResults,
                     conversationTitles = conversationTitles,
+                    groupMemberCounts = groupMemberCounts,
                     queuedOfflineCount = queuedOfflineCount,
                     onSelectChat = onSelectChat,
                     onSearchQueryChange = onSearchQueryChange,
@@ -420,6 +440,7 @@ fun ChatsScreen(
     if (showNewChatDialog) {
         NewChatDialog(
             myIpv6Address = uiState.identity.yggIpv6Address,
+            contacts = conversations,
             onDismiss = { showNewChatDialog = false },
             onOpenQrScanner = {
                 showNewChatDialog = false
@@ -428,6 +449,10 @@ fun ChatsScreen(
             },
             onConfirm = { title, ipv6 ->
                 onCreateNewChat(title, ipv6, uiState.privacyMatrix.defaultDisappearingSeconds)
+                showNewChatDialog = false
+            },
+            onCreateGroup = { title, memberIds ->
+                onCreateGroup(title, memberIds)
                 showNewChatDialog = false
             }
         )
@@ -480,6 +505,7 @@ private fun ChatListPane(
     callLog: List<CallLogEntity>,
     searchResults: List<MessageEntity>,
     conversationTitles: Map<String, String>,
+    groupMemberCounts: List<GroupMemberCount> = emptyList(),
     queuedOfflineCount: Int,
     onSelectChat: (String?) -> Unit,
     onSearchQueryChange: (String) -> Unit,
@@ -637,6 +663,11 @@ private fun ChatListPane(
                     ConversationRowCard(
                         conversation = conv,
                         isSelected = conv.chatId == uiState.selectedChatId,
+                        groupMemberCount = if (conv.chatType == "GROUP") {
+                            groupMemberCounts.firstOrNull { it.chatId == conv.chatId }?.memberCount ?: 0
+                        } else {
+                            0
+                        },
                         onClick = { onSelectChat(conv.chatId) },
                         onDelete = { onDeleteChat(conv.chatId) }
                     )
@@ -1232,6 +1263,7 @@ private fun MeshStatusTopCard(
 private fun ConversationRowCard(
     conversation: ConversationEntity,
     isSelected: Boolean,
+    groupMemberCount: Int = 0,
     onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -1315,6 +1347,26 @@ private fun ConversationRowCard(
                                 contentDescription = "Ключ Ed25519 верифицирован",
                                 tint = EmeraldPrimary,
                                 modifier = Modifier.size(15.dp)
+                            )
+                        }
+                        if (conversation.chatType == "GROUP") {
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Icon(
+                                Icons.Default.Groups,
+                                contentDescription = null,
+                                tint = CyberTealSecondary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            // The roster table only ever holds the other members: a node never
+                            // lists itself, so the group is one person larger than the table.
+                            Text(
+                                text = "${groupMemberCount + 1} участн.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag(
+                                    "group_member_count_${conversation.chatId}"
+                                )
                             )
                         }
                     }
@@ -1421,13 +1473,18 @@ private fun ChatDetailPane(
     onSendReply: (String, String) -> Unit = { _, _ -> },
     onForwardMessage: (String, String) -> Unit = { _, _ -> },
     onTyping: () -> Unit = {},
-    onSetContactVerified: (Boolean) -> Unit = {}
+    onSetContactVerified: (Boolean) -> Unit = {},
+    groupMembers: List<GroupMemberEntity> = emptyList(),
+    groupContactCandidates: List<ConversationEntity> = emptyList(),
+    onAddContactsToGroup: (List<String>) -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
+    var showAddMembersDialog by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
+    var membersToAddCsv by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var replyTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
@@ -1548,6 +1605,21 @@ private fun ChatDetailPane(
                                     modifier = Modifier.size(15.dp)
                                 )
                             }
+                            if (conversation.chatType == "GROUP") {
+                                IconButton(
+                                    onClick = { showAddMembersDialog = true },
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .testTag("group_add_members_button")
+                                ) {
+                                    Icon(
+                                        Icons.Default.PersonAdd,
+                                        contentDescription = "Добавить контакты в группу",
+                                        tint = CyberTealSecondary,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                }
+                            }
                         }
                         Text(
                             text = conversation.routeTransportSummary,
@@ -1556,6 +1628,24 @@ private fun ChatDetailPane(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (conversation.chatType == "GROUP") {
+                            Text(
+                                // The roster is what the mesh actually told us, so an empty
+                                // one is reported as such instead of hiding behind a fake count.
+                                text = if (groupMembers.isEmpty()) {
+                                    "Группа • участники ещё не подтверждены"
+                                } else {
+                                    "Группа • " + groupMembers.joinToString(", ") {
+                                        it.memberName.ifBlank { "узел ${it.memberIpv6.take(13)}" }
+                                    }.take(140)
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("group_members_line")
+                            )
+                        }
                         if (typingLabel != null) {
                             Text(
                                 text = "$typingLabel печатает…",
@@ -1797,6 +1887,7 @@ private fun ChatDetailPane(
                     message = msg,
                     quotedMessage = wireIdIndex[msg.replyToMessageId],
                     showCipherHex = showCipherInspector,
+                    groupMemberTotal = if (conversation.chatType == "GROUP") groupMembers.size else 0,
                     onToggleReaction = { emoji -> onToggleReaction(msg.messageId, emoji) },
                     onReply = { replyTarget = msg },
                     onForward = { forwardTarget = msg },
@@ -1823,6 +1914,96 @@ private fun ChatDetailPane(
                 },
                 dismissButton = {
                     TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                        Text("Отмена")
+                    }
+                }
+            )
+        }
+
+        if (showAddMembersDialog) {
+            val memberAddresses =
+                remember(groupMembers) { groupMembers.map { it.memberIpv6.lowercase() }.toSet() }
+            val candidates = remember(groupContactCandidates, memberAddresses) {
+                groupContactCandidates.filter {
+                    !YggRepository.isSelfChatId(it.chatId) && it.chatType != "GROUP" &&
+                        it.yggIpv6Address.isNotBlank() && it.yggIpv6Address.lowercase() !in memberAddresses
+                }
+            }
+            val pickedToAdd =
+                remember(membersToAddCsv) { membersToAddCsv.split(",").filter { it.isNotBlank() }.toSet() }
+            AlertDialog(
+                onDismissRequest = { showAddMembersDialog = false },
+                title = { Text("Добавить в «${conversation.title}»") },
+                text = {
+                    if (candidates.isEmpty()) {
+                        Text(
+                            text = "Добавлять некого: каждый подходящий контакт уже в группе. " +
+                                "Сначала откройте личный диалог с узлом.",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 260.dp)
+                                .verticalScroll(rememberScrollState())
+                                .testTag("group_add_member_list")
+                        ) {
+                            candidates.forEach { contact ->
+                                val checked = pickedToAdd.contains(contact.chatId)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable {
+                                            val next = pickedToAdd.toMutableSet()
+                                            if (checked) next.remove(contact.chatId) else next.add(contact.chatId)
+                                            membersToAddCsv = next.joinToString(",")
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Checkbox(
+                                        checked = checked,
+                                        onCheckedChange = { isChecked ->
+                                            val next = pickedToAdd.toMutableSet()
+                                            if (isChecked) next.add(contact.chatId) else next.remove(contact.chatId)
+                                            membersToAddCsv = next.joinToString(",")
+                                        }
+                                    )
+                                    YggAvatar(
+                                        avatarUri = contact.avatarUri,
+                                        name = contact.title,
+                                        size = 30.dp
+                                    )
+                                    Text(
+                                        text = contact.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        enabled = pickedToAdd.isNotEmpty(),
+                        onClick = {
+                            onAddContactsToGroup(pickedToAdd.toList())
+                            membersToAddCsv = ""
+                            showAddMembersDialog = false
+                        },
+                        modifier = Modifier.testTag("group_add_members_confirm")
+                    ) {
+                        Text("Добавить")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAddMembersDialog = false }) {
                         Text("Отмена")
                     }
                 }
@@ -2068,6 +2249,7 @@ private fun EncryptedMessageBubble(
     message: MessageEntity,
     quotedMessage: MessageEntity?,
     showCipherHex: Boolean,
+    groupMemberTotal: Int = 0,
     onToggleReaction: (String) -> Unit,
     onReply: () -> Unit,
     onForward: () -> Unit,
@@ -2285,13 +2467,22 @@ private fun EncryptedMessageBubble(
                         )
 
                         if (message.isOutgoing) {
-                            val (statusIcon, statusText, statusTint) = when (message.deliveryState) {
+                            val (statusIcon, statusLabel, statusTint) = when (message.deliveryState) {
                                 "QUEUED_OFFLINE_SF" -> Triple(Icons.Default.Schedule, "В очереди", AmberShieldTertiary)
                                 "SENT_P2P" -> Triple(Icons.Default.Schedule, "Ожидает доставки", AmberShieldTertiary)
                                 "LOCAL_NOTE" -> Triple(Icons.Default.Bookmark, "Заметка", CyberTealSecondary)
                                 "DELIVERED" -> Triple(Icons.Default.DoneAll, "Доставлено", EmeraldPrimary)
                                 "READ" -> Triple(Icons.Default.DoneAll, "Прочитано", CyberTealSecondary)
                                 else -> Triple(Icons.Default.Schedule, "Не подтверждено", MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            // In a group every acknowledgement is per member, so a note is only
+                            // fully delivered when the last roster address has acked.
+                            val ackedInGroup = message.deliveredMemberCsv
+                                .split(',').map { it.trim() }.count { it.isNotBlank() }
+                            val statusText = if (groupMemberTotal > 0 && ackedInGroup < groupMemberTotal) {
+                                "$statusLabel $ackedInGroup из $groupMemberTotal"
+                            } else {
+                                statusLabel
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
@@ -2394,24 +2585,142 @@ private fun EmptyChatSelectionPlaceholder(
 @Composable
 private fun NewChatDialog(
     myIpv6Address: String,
+    contacts: List<ConversationEntity>,
     onDismiss: () -> Unit,
     onOpenQrScanner: () -> Unit,
-    onConfirm: (String, String) -> Unit
+    onConfirm: (String, String) -> Unit,
+    onCreateGroup: (String, List<String>) -> Unit
 ) {
     var title by rememberSaveable { mutableStateOf("") }
     var ipv6Input by rememberSaveable { mutableStateOf("") }
     var directHostPort by rememberSaveable { mutableStateOf("") }
+    var groupMode by rememberSaveable { mutableStateOf(false) }
+    // A comma-separated string, because that is the only shape rememberSaveable can persist.
+    var pickedCsv by rememberSaveable { mutableStateOf("") }
+    val picked = remember(pickedCsv) { pickedCsv.split(",").filter { it.isNotBlank() }.toSet() }
+    val selectableContacts = remember(contacts) {
+        contacts.filter { !YggRepository.isSelfChatId(it.chatId) && it.chatType != "GROUP" }
+    }
+    fun togglePicked(chatId: String, add: Boolean) {
+        val next = picked.toMutableSet()
+        if (add) next.add(chatId) else next.remove(chatId)
+        pickedCsv = next.joinToString(",")
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = "Добавить контакт Yggdrasil / Mimir",
+                text = if (groupMode) "Новая группа" else "Добавить контакт Yggdrasil / Mimir",
                 style = MaterialTheme.typography.titleLarge
             )
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { groupMode = false },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Контакт", style = MaterialTheme.typography.labelMedium)
+                    }
+                    OutlinedButton(
+                        onClick = { groupMode = true },
+                        colors = if (groupMode) {
+                            ButtonDefaults.outlinedButtonColors(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                            )
+                        } else {
+                            ButtonDefaults.outlinedButtonColors()
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("dialog_new_group_tab")
+                    ) {
+                        Icon(Icons.Default.Groups, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Группа", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+
+                if (groupMode) {
+                    OutlinedTextField(
+                        value = title,
+                        onValueChange = { title = it },
+                        label = { Text("Название группы") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("new_group_title_input")
+                    )
+                    if (selectableContacts.isEmpty()) {
+                        Text(
+                            text = "Группу можно собрать только из уже добавленных контактов. " +
+                                "Сначала откройте диалог с узлом на вкладке «Контакт».",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Text(
+                            text = "Участников: ${picked.size} (плюс вы). Без сервера в оверлее группа " +
+                                "передаётся как набор адресов — увидите, кто ответил.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 220.dp)
+                                .verticalScroll(rememberScrollState())
+                                .testTag("new_group_member_list")
+                        ) {
+                            selectableContacts.forEach { contact ->
+                                val isSelected = picked.contains(contact.chatId)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { togglePicked(contact.chatId, !isSelected) }
+                                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Checkbox(
+                                        checked = isSelected,
+                                        onCheckedChange = { checked -> togglePicked(contact.chatId, checked) }
+                                    )
+                                    YggAvatar(
+                                        avatarUri = contact.avatarUri,
+                                        name = contact.title,
+                                        size = 30.dp
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = contact.title,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = contact.yggIpv6Address,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -2471,12 +2780,17 @@ private fun NewChatDialog(
                         .fillMaxWidth()
                         .testTag("new_chat_direct_endpoint_input")
                 )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    if (title.isNotBlank() || ipv6Input.isNotBlank()) {
+                    if (groupMode) {
+                        if (picked.isNotEmpty()) {
+                            onCreateGroup(title.ifBlank { "Группа на ${picked.size + 1}" }, picked.toList())
+                        }
+                    } else if (title.isNotBlank() || ipv6Input.isNotBlank()) {
                         val combined = if (directHostPort.isNotBlank()) {
                             "${ipv6Input.trim()} | ${directHostPort.trim()}"
                         } else {
@@ -2485,9 +2799,10 @@ private fun NewChatDialog(
                         onConfirm(title.ifBlank { "Контакт Yggdrasil" }, combined)
                     }
                 },
+                enabled = if (groupMode) picked.isNotEmpty() else title.isNotBlank() || ipv6Input.isNotBlank(),
                 modifier = Modifier.testTag("confirm_new_chat_button")
             ) {
-                Text("Открыть чат")
+                Text(if (groupMode) "Создать группу" else "Открыть чат")
             }
         },
         dismissButton = {
