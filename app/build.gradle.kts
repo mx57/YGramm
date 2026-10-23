@@ -1,6 +1,7 @@
 // File: app/build.gradle.kts
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.io.File
+import java.security.MessageDigest
 import java.util.zip.ZipFile
 import org.gradle.api.DefaultTask
 import org.gradle.api.provider.Property
@@ -23,8 +24,8 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 11
-    versionName = "1.6.4-arm64-v8a"
+    versionCode = 12
+    versionName = "1.6.5-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
@@ -163,6 +164,22 @@ abstract class ExportSingleArm64ReleaseApkTask : DefaultTask() {
     val targetFile = File(releaseDir, "YggGram-arm64-v8a.apk")
     signedRelease.copyTo(targetFile, overwrite = true)
     println("Exported signed release APK (${signedRelease.length()} bytes) -> ${targetFile.absolutePath}")
+
+    // The cleanup above deletes every other file in apk-releases/, including a checksum
+    // published by an earlier release: write the new one here or the download page ships
+    // an APK with no way to verify it.
+    val digest = MessageDigest.getInstance("SHA-256")
+    targetFile.inputStream().use { stream ->
+      val buffer = ByteArray(1 shl 16)
+      while (true) {
+        val read = stream.read(buffer)
+        if (read < 0) break
+        digest.update(buffer, 0, read)
+      }
+    }
+    val checksum = digest.digest().joinToString("") { "%02x".format(it) }
+    File(releaseDir, "${targetFile.name}.sha256").writeText("$checksum  ${targetFile.name}\n")
+    println("Published sha256 -> ${targetFile.name}.sha256 ($checksum)")
   }
 }
 
