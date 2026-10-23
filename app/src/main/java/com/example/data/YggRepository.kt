@@ -1571,6 +1571,12 @@ class YggRepository(
         }
         if (existingForProfile != null) {
             var repaired = existingForProfile
+            // The card is authored by the node owner, so a re-import is their rename.
+            // Without this the chat keeps the name from the first card and the second
+            // import looks like it silently did nothing.
+            if (title.isNotBlank() && existingForProfile.title != title.trim()) {
+                repaired = repaired.copy(title = title.trim())
+            }
             if (!sameMeshAddress(existingForProfile.yggIpv6Address, cleanIpv6)) {
                 repaired = repaired.copy(yggIpv6Address = cleanIpv6)
             }

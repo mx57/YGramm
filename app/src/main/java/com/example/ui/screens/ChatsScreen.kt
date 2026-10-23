@@ -128,6 +128,7 @@ import com.example.data.GroupMemberEntity
 import com.example.data.MessageEntity
 import com.example.data.YggRepository
 import com.example.engine.ParsedYggContactQr
+import com.example.engine.YggCryptoEngine
 import com.example.ui.components.FileAttachmentBubbleCard
 import com.example.ui.components.ImageMessagePreviewCard
 import com.example.ui.components.MessageReactionsRow
@@ -1635,9 +1636,19 @@ private fun ChatDetailPane(
                                 text = if (groupMembers.isEmpty()) {
                                     "Группа • участники ещё не подтверждены"
                                 } else {
-                                    "Группа • " + groupMembers.joinToString(", ") {
-                                        it.memberName.ifBlank { "узел ${it.memberIpv6.take(13)}" }
-                                    }.take(140)
+                                    "Группа • " + groupMembers.joinToString(", ") { member ->
+                                        // Names repeat because every node owner can call their
+                                        // node «Узел YggGram #1»; the address prefix cannot.
+                                        val wanted = YggCryptoEngine.normalizeIpv6Literal(member.memberIpv6)
+                                        val current = groupContactCandidates.firstOrNull { candidate ->
+                                            wanted != null &&
+                                                YggCryptoEngine.normalizeIpv6Literal(candidate.yggIpv6Address) == wanted
+                                        }?.title?.trim().orEmpty()
+                                        val name = current.ifBlank { member.memberName }
+                                        val prefix = member.memberIpv6.lowercase()
+                                            .split(":").filter { it.isNotBlank() }.take(2).joinToString(":")
+                                        "${name.ifBlank { "узел" }} ($prefix…)"
+                                    }.take(160)
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -13,6 +13,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.NetworkRequest
+import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -775,15 +776,37 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 delay(45_000L)
                 if (repository.getQueuedMessages().isEmpty()) continue
                 if (!networkEngine.isRealNetworkAvailable()) continue
-                flushQueuedMessagesOverRealNetwork()
+                flushQueuedMessagesOverRealNetwork("таймер 45 с")
             }
         }
 
         // The peer card must reflect the real Go core: only the core knows which
         // public links are up and which remote nodes its routing tree reached.
         viewModelScope.launch {
+            var lastMeshSignature = ""
+            var lastMeshChangeFlushAt = 0L
             while (true) {
                 refreshCoreMeshState()
+                // A new live link or a routing tree that grew is the moment a queued
+                // message can finally leave; waiting for the 45 s tick made the user
+                // watch «в очереди» long after the overlay had recovered. Debounced
+                // because a flapping peer changes the signature every few seconds.
+                val mesh = _uiState.value.coreMesh
+                if (mesh.available) {
+                    val signature = "${mesh.liveLinks}/${mesh.knownNodes}/" +
+                        mesh.upPeers.keys.sorted().joinToString(",")
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (signature != lastMeshSignature) {
+                        lastMeshSignature = signature
+                        if (now - lastMeshChangeFlushAt >= 12_000L &&
+                            networkEngine.isRealNetworkAvailable() &&
+                            repository.getQueuedMessages().isNotEmpty()
+                        ) {
+                            lastMeshChangeFlushAt = now
+                            flushQueuedMessagesOverRealNetwork("изменение mesh")
+                        }
+                    }
+                }
                 delay(8_000L)
             }
         }
@@ -1762,7 +1785,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         if (!nextOffline) {
-            flushQueuedMessagesOverRealNetwork()
+            flushQueuedMessagesOverRealNetwork("выход из офлайна")
         }
     }
 
@@ -1904,7 +1927,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         return Triple(acked, routed, members.size)
     }
 
-    private fun flushQueuedMessagesOverRealNetwork() {
+    private fun flushQueuedMessagesOverRealNetwork(trigger: String = "внешний вызов") {
         viewModelScope.launch {
             updateConnectivitySnapshot()
             val hasInternet = networkEngine.isRealNetworkAvailable()
@@ -1915,6 +1938,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
             val app = getApplication<Application>()
             val queued = repository.getQueuedMessages()
+            // Which trigger fired matters when a queue drains late: in logcat the 45 s
+            // timer and the mesh-change path are otherwise indistinguishable.
+            Log.d("YggSF", "flush(${trigger}): сообщений в очереди ${queued.size}")
             var deliveredCount = 0
             var confirmedCount = 0
             var unreadableAttachments = 0
@@ -2519,6 +2545,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             Toast.makeText(getApplication(), reason, Toast.LENGTH_LONG).show()
             return
         }
+        val knownChatIdsBefore = conversations.value.map { it.chatId }.toSet()
         viewModelScope.launch {
             val newChatId = withContext(Dispatchers.IO) {
                 repository.createNewConversation(
@@ -2532,6 +2559,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     peerEd25519PublicKeyHex = parsedQr.ed25519PubKeyHex
                 )
             }
+            // A card for a node that is already a contact reuses that chat, so say so
+            // instead of reporting a second contact the user will never find in the list.
+            val wasAlreadyInContacts = newChatId in knownChatIdsBefore
             if (parsedQr.directLanHint.isNotBlank()) {
                 withContext(Dispatchers.IO) {
                     networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
@@ -2548,7 +2578,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         YggRepository.isSelfChatId(newChatId) ->
                             "Распознан ваш собственный QR-код: открыт чат «Избранное • Мой узел Yggdrasil»"
                         hasNodeKey ->
-                            "По QR-коду добавлен контакт «${parsedQr.displayName}»: Ed25519-ключ совпадает с адресом узла"
+                            (if (wasAlreadyInContacts)
+                                "Контакт «${parsedQr.displayName}» уже был в списке: визитка обновила его имя, адрес и ключ"
+                            else
+                                "По QR-коду добавлен контакт «${parsedQr.displayName}»") +
+                                ": Ed25519-ключ совпадает с адресом ${createdConv?.yggIpv6Address.orEmpty()}"
                         createdLanHint.isNotBlank() ->
                             "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint). " +
                                 parsedQr.nodeKeyProblem.ifBlank { "Оверлей требует полный ?pub=…" }

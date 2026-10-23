@@ -572,6 +572,36 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `reimporting a contact card renames the chat it already owns`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao())
+        try {
+            val peerIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+            val first = repo.createNewConversation(
+                title = "Узел YggGram #1",
+                yggIpv6Input = peerIpv6,
+                disappearingSeconds = 0
+            )
+            val second = repo.createNewConversation(
+                title = "Узел YggGram #2",
+                yggIpv6Input = peerIpv6,
+                disappearingSeconds = 0
+            )
+            assertEquals("A card for a node that is already a contact must not create a second chat", first, second)
+            assertEquals(
+                "The newest card is the node owner's rename, and it must reach the chat list",
+                "Узел YggGram #2",
+                repo.conversations.first().find { it.chatId == first }?.title
+            )
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
     fun `group roster rides an ordinary message and only a full ack set counts as delivered`() = runBlocking {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val senderDb = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)

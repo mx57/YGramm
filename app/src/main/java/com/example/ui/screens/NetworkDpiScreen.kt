@@ -634,6 +634,28 @@ fun NetworkDpiScreen(
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    // One click for the whole table: the per-peer copy could not keep up
+                                    // with a set that changes while the user is still selecting rows.
+                                    clipboard.setPrimaryClip(
+                                        ClipData.newPlainText(
+                                            "Yggdrasil Peers",
+                                            peers.joinToString("\n") { it.endpointUri }
+                                        )
+                                    )
+                                    Toast.makeText(context, "Скопировано пиров: ${peers.size}", Toast.LENGTH_SHORT).show()
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("copy_all_peers_button")
+                            ) {
+                                Icon(
+                                    Icons.Default.ContentCopy,
+                                    contentDescription = "Скопировать все пиры",
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            OutlinedButton(
                                 onClick = { showBulkImportDialog = true },
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                                 modifier = Modifier.testTag("open_bulk_import_peers_button")
