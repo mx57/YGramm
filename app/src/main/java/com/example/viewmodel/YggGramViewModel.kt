@@ -2507,6 +2507,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun addContactFromQrPayload(
         parsedQr: com.example.engine.ParsedYggContactQr
     ) {
+        // A damaged ?pub= never addresses a node on the overlay, so a card without any
+        // other usable route is refused instead of becoming a chat that queues forever.
+        if (parsedQr.nodeKeyProblem.isNotBlank() && parsedQr.directLanHint.isBlank()) {
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "${parsedQr.nodeKeyProblem}. Контакт «${parsedQr.displayName}» не добавлен: " +
+                        "попросите владельца узла экспортировать визитку заново"
+                )
+            }
+            return
+        }
         viewModelScope.launch {
             val newChatId = withContext(Dispatchers.IO) {
                 repository.createNewConversation(
@@ -2538,7 +2549,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         hasNodeKey ->
                             "По QR-коду добавлен контакт «${parsedQr.displayName}»: Ed25519-ключ совпадает с адресом узла"
                         createdLanHint.isNotBlank() ->
-                            "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint), оверлей требует полный ?pub=…"
+                            "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint). " +
+                                parsedQr.nodeKeyProblem.ifBlank { "Оверлей требует полный ?pub=…" }
                         else ->
                             "Контакт «${parsedQr.displayName}» добавлен без Ed25519-ключа: сообщения через оверлей недоставимы, нужен полный идентификатор"
                     }

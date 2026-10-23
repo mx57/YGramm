@@ -152,6 +152,32 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun qrUriParser_flagsTruncatedNodeKeyInsteadOfSilentlyDroppingIt() {
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        val truncated = identity.yggNodePublicKeyHex.dropLast(1)
+        assertEquals(63, truncated.length)
+
+        val brokenCard = YggQrCodeCodec.parseContactString(
+            "ygggram://${identity.yggIpv6Address}?pub=$truncated&name=Y"
+        )
+        assertNotNull(brokenCard)
+        assertEquals("", brokenCard?.ed25519PubKeyHex)
+        assertTrue(brokenCard?.nodeKeyProblem?.contains("63") == true)
+
+        val cleanCard = YggQrCodeCodec.parseContactString(
+            "ygggram://${identity.yggIpv6Address}?pub=${identity.yggNodePublicKeyHex}&name=Y"
+        )
+        assertEquals("", cleanCard?.nodeKeyProblem)
+        assertEquals(identity.yggNodePublicKeyHex.lowercase(), cleanCard?.ed25519PubKeyHex)
+    }
+
+    @Test
     fun peerScannerCatalog_filtersByCountryAndWhitelist() {
         val ruPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "RU" }
         val fiPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "FI" }

@@ -138,6 +138,12 @@ fun QrContactModal(
 
     fun deliverScannedText(rawText: String) {
         val parsed = YggQrCodeCodec.parseDecodedQrText(rawText)
+        if (parsed != null && parsed.nodeKeyProblem.isNotBlank() && parsed.directLanHint.isBlank()) {
+            scannerStatusError = true
+            scannerStatus = "${parsed.nodeKeyProblem}. Контакт не добавлен: без полного ключа ноды сообщения не доставимы"
+            Toast.makeText(context, scannerStatus, Toast.LENGTH_LONG).show()
+            return
+        }
         if (parsed != null) {
             scannerStatusError = false
             scannerStatus = "Распознан контакт: ${parsed.displayName}"
