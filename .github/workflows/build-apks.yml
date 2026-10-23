@@ -83,6 +83,11 @@ jobs:
 
       - name: Upload installable debug test APK
         uses: actions/upload-artifact@v4
+        # The account-wide artifact quota is shared by every repository and is
+        # recalculated every 6-12 hours, so an upload can fail on a run that built
+        # and tested everything correctly. Deliverables live in apk-releases/ in the
+        # tree, so a refused upload is reported but must not redden the pipeline.
+        continue-on-error: true
         with:
           name: YggGram-arm64-v8a-debug-test
           path: app/build/outputs/apk/debug/app-debug.apk
