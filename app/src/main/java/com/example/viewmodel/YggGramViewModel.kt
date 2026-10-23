@@ -13,6 +13,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.NetworkRequest
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -2510,12 +2511,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         // A damaged ?pub= never addresses a node on the overlay, so a card without any
         // other usable route is refused instead of becoming a chat that queues forever.
         if (parsedQr.nodeKeyProblem.isNotBlank() && parsedQr.directLanHint.isBlank()) {
-            _uiState.update {
-                it.copy(
-                    statusBannerMessage = "${parsedQr.nodeKeyProblem}. Контакт «${parsedQr.displayName}» не добавлен: " +
-                        "попросите владельца узла экспортировать визитку заново"
-                )
-            }
+            val reason = "${parsedQr.nodeKeyProblem}. Контакт «${parsedQr.displayName}» не добавлен: " +
+                "попросите владельца узла экспортировать визитку заново"
+            _uiState.update { it.copy(statusBannerMessage = reason) }
+            // The banner slot is shared with routine autopilot notices that replace it
+            // within seconds, so the refusal reason is shown on its own as well.
+            Toast.makeText(getApplication(), reason, Toast.LENGTH_LONG).show()
             return
         }
         viewModelScope.launch {
