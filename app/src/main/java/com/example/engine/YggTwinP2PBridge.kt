@@ -592,6 +592,7 @@ class YggTwinP2PBridge(
     private val initializedNativeProfiles = ConcurrentHashMap.newKeySet<String>()
     private val nativeCoreStartLock = Any()
     private val overlayRecvJobs = ConcurrentHashMap<String, Job>()
+    private val overlayDropCounts = ConcurrentHashMap<String, AtomicLong>()
 
     // Core watchdog: a node that died after a successful init (or whose init
     // failed, e.g. no network at boot) is restarted from these parameters.
@@ -813,7 +814,7 @@ class YggTwinP2PBridge(
     }
 
     private fun startOverlayRecvLoop(profileId: String) {
-        if (overlayRecvJobs.containsKey(profileId)) return
+        if (overlayRecvJobs[profileId]?.isActive == true) return
         val job = scope.launch {
             while (isActive && initializedNativeProfiles.contains(profileId)) {
                 val pollResult = try {
@@ -829,11 +830,19 @@ class YggTwinP2PBridge(
                     }
                     continue
                 }
-                val decoded = YggNativeCoreBridge.decodeOverlayPayload(pollResult.rawJson) ?: continue
+                val decoded = YggNativeCoreBridge.decodeOverlayPayload(pollResult.rawJson)
+                if (decoded == null) {
+                    noteOverlayDrop(profileId, "payload оверлея не раскодирован")
+                    continue
+                }
                 val (payload, senderPubKeyHex) = decoded
                 try {
                     handleOverlayFrame(profileId, payload, senderPubKeyHex)
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    noteOverlayDrop(
+                        profileId,
+                        "обработка кадра упала: ${t.javaClass.simpleName}${t.message?.let { ": $it" } ?: ""}"
+                    )
                 }
             }
             // Self-cleanup so a watchdog re-init can start a fresh recv loop.
@@ -842,7 +851,33 @@ class YggTwinP2PBridge(
         overlayRecvJobs[profileId] = job
     }
 
+    /**
+     * Frames the node received but the app could not use. Without this the drops are
+     * invisible: every counter keeps counting only what survived parsing, so a link
+     * that loses half its traffic still looks perfectly healthy.
+     */
+    internal fun noteOverlayDrop(profileId: String, reason: String) {
+        val counter = overlayDropCounts.getOrPut(profileId) { AtomicLong() }
+        val total = counter.incrementAndGet()
+        // A broken link would flood the journal one line per frame; the first drop and
+        // then every tenth carry the running number the operator actually needs.
+        if (total == 1L || total % 10L == 0L) {
+            logPacket(
+                direction = "ERR • YGG",
+                summary = "Кадр оверлея потерян — всего потерь: $total",
+                details = "profile=$profileId • $reason"
+            )
+        }
+    }
+
     fun coreRestartCount(profileId: String): Int = coreRestartCounts[profileId] ?: 0
+
+    /**
+     * Frames the nodes received but the app could not use, summed over profiles.
+     * The RX counter only counts what survived parsing; without this number a link
+     * that loses traffic looks identical to one that does not.
+     */
+    fun overlayDropTotal(): Long = overlayDropCounts.values.sumOf { it.get() }
 
     /**
      * Drops every in-memory core bookkeeping so a panic-wipe leaves no profile
@@ -858,6 +893,7 @@ class YggTwinP2PBridge(
         coreDeathStrikes.clear()
         overlayRecvJobs.values.forEach { it.cancel() }
         overlayRecvJobs.clear()
+        overlayDropCounts.clear()
         initializedNativeProfiles.clear()
     }
 
@@ -888,6 +924,16 @@ class YggTwinP2PBridge(
                     if (System.currentTimeMillis() - (coreStartAttemptAt[profileId] ?: 0L) < CORE_START_GRACE_MS) continue
                     if (YggNativeCoreBridge.readMeshState(profileId).available) {
                         coreDeathStrikes.remove(profileId)
+                        // A dead reader is invisible everywhere else: the node reports
+                        // live links while incoming frames pile up unread in the core.
+                        if (overlayRecvJobs[profileId]?.isActive != true) {
+                            logPacket(
+                                direction = "ERR • YGG",
+                                summary = "Приёмник оверлея профиля не работал — перезапущен",
+                                details = "profile=$profileId • потерь кадров на сейчас: ${overlayDropCounts[profileId]?.get() ?: 0L}"
+                            )
+                            startOverlayRecvLoop(profileId)
+                        }
                         continue
                     }
                     // One failed query can be a JNI hiccup; only a second consecutive

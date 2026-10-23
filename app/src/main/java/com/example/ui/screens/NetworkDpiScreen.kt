@@ -375,7 +375,8 @@ fun NetworkDpiScreen(
                                             shape = RoundedCornerShape(8.dp)
                                         ) {
                                             Text(
-                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $liveRoutes",
+                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $liveRoutes" +
+                                                    if (uiState.overlayDrops > 0) " • Потери кадров: ${uiState.overlayDrops}" else "",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = CyberTealSecondary,
                                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)

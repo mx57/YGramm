@@ -220,6 +220,7 @@ data class YggGramUiState(
     val antiDpiConfig: AntiDpiConfigState = AntiDpiConfigState(),
     val peerScanner: PeerScannerState = PeerScannerState(),
     val coreMesh: YggNativeCoreBridge.CoreMeshState = YggNativeCoreBridge.CoreMeshState(available = false),
+    val overlayDrops: Long = 0L,
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
     val privacyMatrix: PrivacyMatrixState = PrivacyMatrixState(),
     val activeVoiceCall: ActiveVoiceCallState? = null,
@@ -744,7 +745,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             YggNativeCoreBridge.readMeshState(profileId)
         }
         _uiState.update {
-            it.copy(coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)))
+            it.copy(
+                coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)),
+                overlayDrops = networkEngine.overlayDropTotal()
+            )
         }
         applyCoreLinkStatusToPeers(state)
     }

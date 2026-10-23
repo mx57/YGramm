@@ -413,4 +413,23 @@ class ExampleRobolectricTest {
             com.example.engine.YggNativeCoreBridge.readCoreUpPeers("{not json").isEmpty()
         )
     }
+
+    @Test
+    fun `lost overlay frames are counted instead of vanishing silently`() {
+        val logs = CopyOnWriteArrayList<YggLivePacketLogEntry>()
+        val node = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = { logs.add(it) }
+        )
+        repeat(12) { node.noteOverlayDrop("profile_test", "payload оверлея не раскодирован") }
+        assertEquals(12L, node.overlayDropTotal())
+        assertEquals(
+            "A flooded journal buries the signal: only the first drop and every tenth are written",
+            2,
+            logs.count { it.summary.contains("потерян") }
+        )
+    }
 }
