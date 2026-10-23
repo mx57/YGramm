@@ -11,6 +11,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -269,5 +270,41 @@ class ExampleUnitTest {
                 YggNativeCoreBridge.corePeerUri("tls://185.22.172.110:443", junk)
             )
         }
+    }
+
+    @Test
+    fun the_first_links_a_node_dials_are_the_ones_that_name_a_host() {
+        assertFalse(
+            "tls://IP with an IP sniDomain still has no server name",
+            YggNativeCoreBridge.sendsHostnameSni("tls://95.217.35.148:443", "95.217.35.148")
+        )
+        assertTrue(
+            "tls://IP with a hostname sniDomain names that host",
+            YggNativeCoreBridge.sendsHostnameSni("tls://95.217.35.148:443", "ygg.example.net")
+        )
+        assertTrue(
+            "tls:// by domain already sends the name as ServerName",
+            YggNativeCoreBridge.sendsHostnameSni("tls://ygg.zbin.eu:7743", "ygg.zbin.eu")
+        )
+        assertTrue(
+            "wss:// by domain does too",
+            YggNativeCoreBridge.sendsHostnameSni("wss://host.example:443/api/v2/socket", "")
+        )
+        assertFalse(
+            "tcp:// has no TLS at all",
+            YggNativeCoreBridge.sendsHostnameSni("tcp://95.217.35.148:9317", "ygg.example.net")
+        )
+        assertFalse(
+            "an IPv6 literal in brackets is not a hostname",
+            YggNativeCoreBridge.sendsHostnameSni("tls://[2a00:1748:100:252::a]:443", "")
+        )
+
+        // A node only dials the first sixteen peers, so this ordering is what decides
+        // whether the uplink looks like HTTPS or like an unnamed TLS hello.
+        val dialOrder = YggPeerScannerCatalog.initialCatalog
+            .sortedByDescending { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+            .take(16)
+        val naming = dialOrder.count { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+        assertEquals("the whole dial list must name a host", 16, naming)
     }
 }

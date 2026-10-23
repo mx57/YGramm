@@ -1481,11 +1481,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     /**
      * Peers the nodes dial at boot. Connected ones come first because the core caps
      * the dial list — a stored peer that answered the last scan must not be pushed
-     * out by catalog entries that were never verified.
+     * out by catalog entries that were never verified. Among equals, the ones whose
+     * handshake names a host outrank the bare ones: on a filtered uplink those are the
+     * links that get through, and a capped list full of dropped handshakes has no route
+     * to the overlay at all.
      */
     private suspend fun storedPeerUrisForBoot(): List<String> =
         repository.getAllPeersNow()
-            .sortedByDescending { it.isConnected }
+            .sortedWith(
+                compareByDescending<YggPeerEntity> { it.isConnected }
+                    .thenByDescending { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+            )
             .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
 
     /**

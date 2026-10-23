@@ -514,12 +514,18 @@ class YggTwinP2PBridge(
             // even while another profile is in the foreground.
             // Stored peers outrank catalog guesses: a node dialled only from the
             // hardcoded list ignored the verified peers in the database and came up
-            // with zero live links. The catalog stays as the first-run fallback.
+            // with zero live links. The catalog stays as the first-run fallback, and a
+            // node only dials the first sixteen of them, so the ones whose hello names
+            // a host go first — those are the links a filtering provider is least likely
+            // to drop, and a fallback that reaches nothing is worth less than a slower
+            // one that reaches the overlay at all.
             val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
                 .ifEmpty {
-                    YggPeerScannerCatalog.initialCatalog.map {
-                        YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain)
-                    }
+                    YggPeerScannerCatalog.initialCatalog
+                        .sortedByDescending {
+                            YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain)
+                        }
+                        .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
                 }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
