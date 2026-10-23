@@ -228,7 +228,7 @@ data class DiscoveredLanNode(
 class YggTwinP2PBridge(
     private val context: Context? = null,
     private val onPacketReceived: suspend (IncomingTwinPacket) -> Unit,
-    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long) -> Unit,
+    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long, ackSenderPubKeyHex: String) -> Unit,
     private val onDeliveryAckTimeout: suspend (chatId: String, messageId: String, attempts: Int) -> Unit = { _, _, _ -> },
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
@@ -243,6 +243,15 @@ class YggTwinP2PBridge(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
     private var lanDiscoverySocket: DatagramSocket? = null
+
+    // The primary listener is kept alive by its own job: without it a single closed
+    // ServerSocket — a transient accept error, the OS resetting the socket — left the node
+    // unable to receive anything until the app was restarted.
+    private var tcpListenerJob: Job? = null
+
+    // @Volatile: read from the listener loop on the IO dispatcher, written by start/stop.
+    @Volatile
+    private var listenersRequested = false
 
     // Concurrent secondary profile TCP listeners: profileId -> Pair(ServerSocket, Job)
     private val secondaryProfileSockets = ConcurrentHashMap<String, Pair<ServerSocket, Job>>()
@@ -517,6 +526,10 @@ class YggTwinP2PBridge(
                                     handleIncomingTcpConnection(client, recipientProfileId = prof.profileId, recipientIpv6 = prof.yggIpv6Address)
                                 }
                             } catch (_: Exception) {
+                                // Transient accept error: wait instead of spinning on accept().
+                                // A closed socket leaves the loop, and the next profile sync
+                                // re-binds it.
+                                delay(300)
                             }
                         }
                     }
@@ -562,43 +575,10 @@ class YggTwinP2PBridge(
     }
 
     fun start() {
+        listenersRequested = true
         scope.launch {
-            if (tcpServerSocket != null && tcpServerSocket?.isClosed == false) return@launch
-            var boundServer: ServerSocket? = null
-            for (candidatePort in 51921..51930) {
-                try {
-                    val srv = ServerSocket()
-                    srv.reuseAddress = true
-                    srv.bind(InetSocketAddress("0.0.0.0", candidatePort))
-                    boundServer = srv
-                    localTcpPort = candidatePort
-                    break
-                } catch (_: Exception) {
-                }
-            }
-            tcpServerSocket = boundServer
-
-            val lanIp = getLocalLanIpv4Address() ?: "0.0.0.0"
-            if (boundServer != null) {
-                logPacket(
-                    direction = "SYS • P2P",
-                    summary = "Открыт основной TCP-сокет P2P на $lanIp:$localTcpPort",
-                    details = "Фоновый сервис Yggdrasil готов к приему пакетов, файлов, голосовых и звонков"
-                )
-            }
-
-            launch {
-                val srv = boundServer ?: return@launch
-                while (isActive && !srv.isClosed) {
-                    try {
-                        val client = srv.accept()
-                        launch {
-                            handleIncomingTcpConnection(client, recipientProfileId = "", recipientIpv6 = "")
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-            }
+            if (tcpListenerJob?.isActive == true) return@launch
+            tcpListenerJob = launch { runPrimaryTcpListener() }
 
             if (YggNativeCoreBridge.isNativeLibraryLoaded) {
                 logPacket(
@@ -614,6 +594,72 @@ class YggTwinP2PBridge(
             launch {
                 applyLanDiscoveryState()
             }
+        }
+    }
+
+    /**
+     * Binding and accepting on the main P2P socket, and re-binding whenever the socket dies.
+     *
+     * A closed ServerSocket used to end the accept loop for good: the node kept its overlay
+     * links and reported itself online while answering nothing on TCP. The loop now treats a
+     * dead listener as a normal event — back off, bind again, keep serving — and only stops
+     * when the app asked for it.
+     */
+    private suspend fun CoroutineScope.runPrimaryTcpListener() {
+        while (isActive && listenersRequested) {
+            var boundServer: ServerSocket? = null
+            for (candidatePort in 51921..51930) {
+                if (!listenersRequested) return
+                try {
+                    val srv = ServerSocket()
+                    srv.reuseAddress = true
+                    srv.bind(InetSocketAddress("0.0.0.0", candidatePort))
+                    boundServer = srv
+                    localTcpPort = candidatePort
+                    break
+                } catch (_: Exception) {
+                }
+            }
+            tcpServerSocket = boundServer
+
+            if (boundServer == null) {
+                // No port was free at this moment — another instance is starting, or the
+                // radio is still down. Say so, and try again instead of going silent.
+                logPacket(
+                    direction = "ERR • P2P",
+                    summary = "Основной TCP-сокет P2P не открыт: все порты 51921-51930 недоступны",
+                    details = "Приём по TCP отсутствует; повторная привязка через 15 с"
+                )
+                delay(15_000)
+                continue
+            }
+
+            val lanIp = getLocalLanIpv4Address() ?: "0.0.0.0"
+            logPacket(
+                direction = "SYS • P2P",
+                summary = "Открыт основной TCP-сокет P2P на $lanIp:$localTcpPort",
+                details = "Фоновый сервис Yggdrasil готов к приему пакетов, файлов, голосовых и звонков"
+            )
+
+            while (isActive && listenersRequested && !boundServer.isClosed) {
+                try {
+                    val client = boundServer.accept()
+                    launch {
+                        handleIncomingTcpConnection(client, recipientProfileId = "", recipientIpv6 = "")
+                    }
+                } catch (_: Exception) {
+                    // A transient accept error must not become a hot spin against the kernel.
+                    delay(300)
+                }
+            }
+
+            if (!isActive || !listenersRequested) return
+            logPacket(
+                direction = "ERR • P2P",
+                summary = "Основной TCP-сокет закрылся: перепривязка портов",
+                details = "Приём P2P был прерван; повторная привязка через 2 с"
+            )
+            delay(2_000)
         }
     }
 
@@ -1327,7 +1373,7 @@ class YggTwinP2PBridge(
                 } else {
                     pendingOverlayAcks.remove(messageId)?.complete(rtt)
                     markAvatarAdvertised(messageId)
-                    onDeliveryAckReceived(map["chatId"] ?: "", messageId, rtt)
+                    onDeliveryAckReceived(map["chatId"] ?: "", messageId, rtt, senderPubKeyHex)
                     logPacket(
                         direction = "ACK <- YGG",
                         summary = "ACK получен через оверлей Yggdrasil (RTT: $rtt мс)",
@@ -2894,7 +2940,7 @@ class YggTwinP2PBridge(
                     if (ackMap["type"] == "ACK" && ackMap["messageId"] == messageId) {
                         val rtt = (System.currentTimeMillis() - now).coerceAtLeast(1L)
                         onTwinReachableChanged(true)
-                        onDeliveryAckReceived(chatId, messageId, rtt)
+                        onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6)
                         if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
                             advertisedAvatarHashes[chatId] = senderAvatarHash
                         }
@@ -3690,7 +3736,9 @@ class YggTwinP2PBridge(
                 if (ackMap?.get("type") == "ACK" && ackMap["messageId"] == messageId) {
                     val rtt = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
                     onTwinReachableChanged(true)
-                    onDeliveryAckReceived(chatId, messageId, rtt)
+                    // This socket proves nothing about who answered, so the frame carries no
+                    // sender key and a group message is not attributed to a member here.
+                    onDeliveryAckReceived(chatId, messageId, rtt, "")
                     logPacket(
                         direction = "ACK <- PEER",
                         summary = "Доставка подтверждена ACK через ${targetSocket.hostString}:${targetSocket.port} (RTT: $rtt мс)",
@@ -3753,6 +3801,11 @@ class YggTwinP2PBridge(
     }
 
     fun stop() {
+        // Cancel the self-healing loop before closing the socket, otherwise the loop would
+        // treat the shutdown close as a failure and bind a new listener behind stop().
+        listenersRequested = false
+        tcpListenerJob?.cancel()
+        tcpListenerJob = null
         try {
             tcpServerSocket?.close()
             tcpServerSocket = null

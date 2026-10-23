@@ -26,7 +26,7 @@ import java.io.FileInputStream
         CallLogEntity::class,
         GroupMemberEntity::class
     ],
-    version = 10,
+    version = 11,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -116,6 +116,21 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // A member the local owner removed has to stay removed: the roster another node
+                // advertises arrives again with the next message, and without this column that
+                // frame would silently re-add the address.
+                db.execSQL("ALTER TABLE group_members ADD COLUMN removedAt INTEGER NOT NULL DEFAULT 0")
+                // Matches the index Room builds from the entity for a fresh database; an
+                // upgraded one has to end up with the same schema or validation fails.
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_messages_chatId_peerMessageId` " +
+                        "ON `messages` (`chatId`, `peerMessageId`)"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -140,7 +155,8 @@ abstract class YggDatabase : RoomDatabase() {
             }
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
                 .addMigrations(
-                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10
+                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
+                    MIGRATION_10_11
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)

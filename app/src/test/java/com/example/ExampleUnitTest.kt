@@ -241,7 +241,7 @@ class ExampleUnitTest {
         val bridge = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -319,7 +319,7 @@ class ExampleUnitTest {
                     mainReceivedFromClone.complete(pkt)
                 }
             },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -331,7 +331,7 @@ class ExampleUnitTest {
                     cloneReceivedFromMain.complete(pkt)
                 }
             },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )

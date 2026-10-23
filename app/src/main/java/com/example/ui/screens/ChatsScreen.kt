@@ -17,6 +17,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -30,6 +31,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -101,6 +103,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -111,13 +114,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -148,6 +154,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun ChatsScreen(
@@ -177,6 +185,9 @@ fun ChatsScreen(
     onCreateNewChat: (String, String, Int) -> Unit,
     onCreateGroup: (String, List<String>) -> Unit = { _, _ -> },
     onAddContactsToGroup: (String, List<String>) -> Unit = { _, _ -> },
+    onRenameGroup: (String, String) -> Unit = { _, _ -> },
+    onRemoveGroupMember: (String, String) -> Unit = { _, _ -> },
+    onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
@@ -348,7 +359,12 @@ fun ChatsScreen(
                             groupContactCandidates = conversations,
                             onAddContactsToGroup = { ids ->
                                 onAddContactsToGroup(activeConversation.chatId, ids)
-                            }
+                            },
+                            onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                            onRemoveGroupMember = { ipv6 ->
+                                onRemoveGroupMember(activeConversation.chatId, ipv6)
+                            },
+                            onLeaveGroup = { onLeaveGroup(activeConversation.chatId) }
                         )
                     } else {
                         EmptyChatSelectionPlaceholder(
@@ -409,7 +425,10 @@ fun ChatsScreen(
                     groupContactCandidates = conversations,
                     onAddContactsToGroup = { ids ->
                         onAddContactsToGroup(activeConversation.chatId, ids)
-                    }
+                    },
+                    onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                    onRemoveGroupMember = { ipv6 -> onRemoveGroupMember(activeConversation.chatId, ipv6) },
+                    onLeaveGroup = { onLeaveGroup(activeConversation.chatId) }
                 )
             } else {
                 ChatListPane(
@@ -1477,7 +1496,10 @@ private fun ChatDetailPane(
     onSetContactVerified: (Boolean) -> Unit = {},
     groupMembers: List<GroupMemberEntity> = emptyList(),
     groupContactCandidates: List<ConversationEntity> = emptyList(),
-    onAddContactsToGroup: (List<String>) -> Unit = {}
+    onAddContactsToGroup: (List<String>) -> Unit = {},
+    onRenameGroup: (String) -> Unit = {},
+    onRemoveGroupMember: (String) -> Unit = {},
+    onLeaveGroup: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -1486,6 +1508,9 @@ private fun ChatDetailPane(
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
     var showAddMembersDialog by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var membersToAddCsv by rememberSaveable(conversation.chatId) { mutableStateOf("") }
+    var showGroupManageDialog by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
+    var groupTitleDraft by rememberSaveable(conversation.chatId) { mutableStateOf("") }
+    var confirmLeaveGroup by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var showDeleteConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var replyTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
@@ -1607,6 +1632,22 @@ private fun ChatDetailPane(
                                 )
                             }
                             if (conversation.chatType == "GROUP") {
+                                IconButton(
+                                    onClick = {
+                                        groupTitleDraft = conversation.title
+                                        showGroupManageDialog = true
+                                    },
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .testTag("group_manage_button")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Groups,
+                                        contentDescription = "Имя группы, участники, выход",
+                                        tint = EmeraldPrimary,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                }
                                 IconButton(
                                     onClick = { showAddMembersDialog = true },
                                     modifier = Modifier
@@ -2021,6 +2062,128 @@ private fun ChatDetailPane(
             )
         }
 
+        if (showGroupManageDialog) {
+            AlertDialog(
+                onDismissRequest = {
+                    showGroupManageDialog = false
+                    confirmLeaveGroup = false
+                },
+                title = { Text("Управление «${conversation.title}»") },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 340.dp)
+                            .verticalScroll(rememberScrollState())
+                            .testTag("group_manage_dialog"),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = groupTitleDraft,
+                            onValueChange = { groupTitleDraft = it },
+                            label = { Text("Имя группы") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("group_rename_field")
+                        )
+                        Button(
+                            enabled = groupTitleDraft.isNotBlank() &&
+                                groupTitleDraft.trim() != conversation.title,
+                            onClick = {
+                                onRenameGroup(groupTitleDraft)
+                                showGroupManageDialog = false
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("group_rename_confirm")
+                        ) {
+                            Text("Переименовать")
+                        }
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                        Text(
+                            text = if (groupMembers.isEmpty()) {
+                                "Участники ещё не подтверждены ни одним узлом."
+                            } else {
+                                "Участники (${groupMembers.size}) — убирание не отправляет узлу " +
+                                    "никакого сигнала: просто ваши новые сообщения в группу до него " +
+                                    "не дойдут, а остальные участники продолжат писать ему сами"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        groupMembers.forEach { member ->
+                            val label = member.memberName.ifBlank { "узел" }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .padding(vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = "$label • ${member.memberIpv6}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(
+                                    onClick = { onRemoveGroupMember(member.memberIpv6) },
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .testTag("group_remove_member_${member.memberIpv6}")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = "Убрать $label из группы",
+                                        tint = AmberShieldTertiary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                        if (confirmLeaveGroup) {
+                            Text(
+                                text = "Выход удалит группу и всю её переписку с этого устройства. " +
+                                    "Остальные участники останутся в группе и продолжат писать без вас.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Button(
+                                onClick = {
+                                    confirmLeaveGroup = false
+                                    showGroupManageDialog = false
+                                    onLeaveGroup()
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("group_leave_confirm")
+                            ) {
+                                Text("Подтвердить выход")
+                            }
+                        } else {
+                            TextButton(
+                                onClick = { confirmLeaveGroup = true },
+                                modifier = Modifier.testTag("group_leave_button")
+                            ) {
+                                Text("Выйти из группы", color = AmberShieldTertiary)
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showGroupManageDialog = false
+                        confirmLeaveGroup = false
+                    }) {
+                        Text("Закрыть")
+                    }
+                }
+            )
+        }
+
         // Message Composer Bar or Live Voice Recording Bar
         if (isRecordingVoice) {
             VoiceRecordingComposerBar(
@@ -2254,6 +2417,11 @@ private fun ChatDetailPane(
     }
 }
 
+// How far the bubble has to be dragged before the gesture is treated as an answer,
+// and where it stops visually. Both in dp, converted inside the pointer handler.
+private const val REPLY_SWIPE_THRESHOLD_DP = 90f
+private const val REPLY_SWIPE_MAX_OFFSET_DP = 140f
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun EncryptedMessageBubble(
@@ -2276,6 +2444,12 @@ private fun EncryptedMessageBubble(
     }
     // Both an offline queue item and an unconfirmed overlay send can be retried by tapping.
     val canRetry = message.deliveryState == "QUEUED_OFFLINE_SF" || message.deliveryState == "SENT_P2P"
+    // A horizontal drag is the gesture answer for one message: the bubble follows the finger
+    // and the quote is armed as soon as the drag passes the threshold.
+    var swipeOffset by remember(message.messageId) { mutableFloatStateOf(0f) }
+    val swipeDensity = LocalDensity.current.density
+    val replySwipeThresholdPx = REPLY_SWIPE_THRESHOLD_DP * swipeDensity
+    val replySwipeMaxOffsetPx = REPLY_SWIPE_MAX_OFFSET_DP * swipeDensity
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -2307,6 +2481,20 @@ private fun EncryptedMessageBubble(
             ),
             modifier = Modifier
                 .fillMaxWidth(0.88f)
+                .offset { IntOffset(x = swipeOffset.roundToInt(), y = 0) }
+                .pointerInput(message.messageId) {
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            if (abs(swipeOffset) >= replySwipeThresholdPx) {
+                                onReply()
+                            }
+                            swipeOffset = 0f
+                        },
+                        onDragCancel = { swipeOffset = 0f }
+                    ) { _, dragAmount ->
+                        swipeOffset = (swipeOffset + dragAmount).coerceIn(-replySwipeMaxOffsetPx, replySwipeMaxOffsetPx)
+                    }
+                }
                 .combinedClickable(
                     onClick = {
                         if (canRetry) {
@@ -2321,7 +2509,19 @@ private fun EncryptedMessageBubble(
                 )
                 .testTag("message_bubble_${message.messageId}")
         ) {
-            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (abs(swipeOffset) >= replySwipeThresholdPx * 0.4f) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Reply,
+                        contentDescription = "Ответить жестом",
+                        tint = CyberTealSecondary,
+                        modifier = Modifier
+                            .padding(start = 8.dp)
+                            .size(18.dp)
+                    )
+                }
+
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 8.dp)) {
                 if (!message.isOutgoing) {
                     Text(
                         text = message.senderName,
@@ -2540,6 +2740,7 @@ private fun EncryptedMessageBubble(
                             modifier = Modifier.size(14.dp)
                         )
                     }
+                }
                 }
             }
         }

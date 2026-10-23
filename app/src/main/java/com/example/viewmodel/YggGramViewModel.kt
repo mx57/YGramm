@@ -467,27 +467,34 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 syncForegroundServiceNotification()
             }.join()
         },
-        onDeliveryAckReceived = { chatId, messageId, rttMs ->
+        onDeliveryAckReceived = { chatId, messageId, rttMs, ackSenderKey ->
             viewModelScope.launch {
                 // The message row is authoritative for which chat an ACK belongs to: a group
                 // message confirmed by one member must not be written as delivered to all.
                 val ackedMsg = repository.getMessage(messageId)
                 val ackedChatId = ackedMsg?.chatId?.takeIf { it.isNotBlank() } ?: chatId
                 if (repository.getConversation(ackedChatId)?.chatType == "GROUP") {
-                    // The fan-out already stores this member in deliveredMemberCsv; the
-                    // callback only reports the running count.
-                    val ackedCount = ackedMsg?.deliveredMemberCsv
-                        ?.split(',').orEmpty().count { it.isNotBlank() }
-                    val memberTotal = repository.getGroupMembers(ackedChatId).size
+                    // An ACK that lands after the fan-out still has to be counted, otherwise
+                    // «2 из 3» freezes at whatever the synchronous pass managed to record.
+                    val (ackedMemberIpv6, counts) = repository.recordGroupMemberAckBySender(
+                        messageId = messageId,
+                        ackSenderKey = ackSenderKey
+                    )
+                    val (ackedCount, memberTotal) = counts
+                    val summary = if (ackedMemberIpv6.isBlank()) {
+                        "Группа • ACK от узла вне состава (${rttMs} мс): подтверждено $ackedCount из $memberTotal"
+                    } else {
+                        "Группа • участник подтвердил доставку (${rttMs} мс): $ackedCount из $memberTotal"
+                    }
                     repository.updateConversationRouteStatus(
                         chatId = ackedChatId,
                         isOnline = true,
-                        routeSummary = "Группа • ACK участника (${rttMs} мс): подтверждено $ackedCount из $memberTotal"
+                        routeSummary = summary
                     )
                     _uiState.update {
                         it.copy(
                             rxPacketsCount = it.rxPacketsCount + 1,
-                            statusBannerMessage = "Участник группы подтвердил доставку ACK (${rttMs} мс): $ackedCount из $memberTotal"
+                            statusBannerMessage = summary
                         )
                     }
                     return@launch
@@ -1988,6 +1995,67 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         return Triple(acked, routed, members.size)
     }
 
+    /**
+     * Sending one reaction frame to every member of a group, the same way a group message is
+     * fanned out. A reaction is addressed to a single node, so «the group reacted» is only
+     * true for the members whose ACK came back, and the caller reports that count.
+     *
+     * @return members that confirmed the reaction, and the roster size.
+     */
+    private suspend fun dispatchGroupReaction(
+        conv: ConversationEntity,
+        wireMessageId: String,
+        emoji: String,
+        action: String
+    ): Pair<Int, Int> {
+        val state = _uiState.value
+        val identity = state.identity
+        val members = repository.getGroupMembers(conv.chatId)
+        if (members.isEmpty() || identity.yggIpv6Address.isBlank()) return 0 to members.size
+
+        val candidatePeers = buildCandidateExternalPeersList()
+        // Every member's frame waits its own ACK, so one after another put the honest count
+        // behind the whole roster's timeouts: a group of eight with two nodes offline reported
+        // nothing until the last one gave up. The frames go out together and the count is the
+        // same set of real acknowledgements.
+        val delivered = withContext(Dispatchers.IO) {
+            members.map { member ->
+                async {
+                    // A member with its own contact row is addressed through it: that row carries the
+                    // direct endpoint hint and the pinned X25519 key. A roster-only member is
+                    // addressed by whatever the frame advertised.
+                    val known = conversations.value.firstOrNull {
+                        it.ownerProfileId == conv.ownerProfileId &&
+                            it.chatType != "GROUP" &&
+                            sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+                    }
+                    val memberConv = known
+                        ?: conv.copy(
+                            yggIpv6Address = member.memberIpv6,
+                            publicKeyHex = member.memberPubKeyHex,
+                            peerX25519PublicKeyHex = ""
+                        )
+                    val peerIdentity = repository.resolvePeerNodeIdentity(memberConv)
+                    val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { member.memberIpv6 }
+                    peerIpv6.isNotBlank() && networkEngine.dispatchReactionFrame(
+                        chatId = conv.chatId,
+                        messageId = wireMessageId,
+                        emoji = emoji,
+                        action = action,
+                        peerIpv6 = peerIpv6,
+                        directEndpointHint = extractDirectEndpointHint(memberConv),
+                        senderIpv6 = identity.yggIpv6Address,
+                        senderPubKeyHex = identity.yggNodePublicKeyHex,
+                        recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                        candidatePeers = candidatePeers,
+                        allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery
+                    ).delivered
+                }
+            }.awaitAll()
+        }
+        return delivered.count { it } to members.size
+    }
+
     private fun flushQueuedMessagesOverRealNetwork(trigger: String = "внешний вызов") {
         viewModelScope.launch {
             updateConnectivitySnapshot()
@@ -2572,7 +2640,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun toggleMessageReaction(messageId: String, emoji: String) {        viewModelScope.launch {
+    fun toggleMessageReaction(messageId: String, rawEmoji: String) {
+        viewModelScope.launch {
+            val emoji = YggRepository.normalizeReactionEmoji(rawEmoji)
+            if (emoji.isBlank()) return@launch
             val targetMsg = repository.getMessage(messageId) ?: return@launch
             val updated = repository.toggleReactionOnMessage(
                 messageId = messageId,
@@ -2583,9 +2654,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val conv = repository.getConversation(updated.chatId) ?: return@launch
             // Self-chat notes never leave the device; there is no peer to notify.
             if (YggRepository.isSelfChatId(conv.chatId)) return@launch
-            // A reaction frame reaches one node, so it cannot claim the group reacted.
-            // The local reaction the caller just made stays stored.
-            if (conv.chatType == "GROUP") return@launch
 
             val addedByMe = YggRepository.parseReactionsMap(updated.reactionsJson)[emoji]?.second == true
             // The peer must receive the id its own copy of the message uses.
@@ -2593,6 +2661,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 targetMsg.messageId
             } else {
                 targetMsg.peerMessageId.ifBlank { targetMsg.messageId }
+            }
+            if (conv.chatType == "GROUP") {
+                // A reaction frame is addressed to one node, so the group is served by
+                // sending it to every member and reporting which members actually confirmed.
+                val (acked, total) = dispatchGroupReaction(conv, wireMessageId, emoji, if (addedByMe) "ADD" else "REMOVE")
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            total == 0 -> "Группа • состав ещё не подтверждён, реакция $emoji сохранена локально"
+                            acked == total -> "Реакция $emoji подтверждена всеми участниками группы ($acked из $total)"
+                            acked > 0 -> "Реакция $emoji подтверждена $acked из $total участников; остальные её не получили"
+                            else -> "Реакция $emoji сохранена локально: ни до одного участника не дошла"
+                        }
+                    )
+                }
+                return@launch
             }
             val directHint = extractDirectEndpointHint(conv)
             val peerIdentity = repository.resolvePeerNodeIdentity(conv)
@@ -4049,6 +4133,51 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /** @param memberContactChatIds local chat ids of the contacts to fold into the group. */
+    fun renameGroup(chatId: String, newTitle: String) {
+        viewModelScope.launch {
+            val renamed = withContext(Dispatchers.IO) { repository.renameGroup(chatId, newTitle) }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (renamed) {
+                        "Группа переименована на этом устройстве; имена у остальных участников не меняются"
+                    } else {
+                        "Имя группы не изменено: пусто, совпадает с текущим или это не группа"
+                    }
+                )
+            }
+        }
+    }
+
+    fun removeGroupMember(chatId: String, memberIpv6: String) {
+        viewModelScope.launch {
+            val remaining = withContext(Dispatchers.IO) {
+                repository.removeMemberFromGroup(chatId, memberIpv6)
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Участник убран из состава, осталось $remaining. " +
+                        "Новое сообщение в группу ему уже не уйдёт"
+                )
+            }
+        }
+    }
+
+    fun leaveGroup(chatId: String) {
+        viewModelScope.launch {
+            val left = withContext(Dispatchers.IO) { repository.leaveGroup(chatId) }
+            _uiState.update { state ->
+                state.copy(
+                    selectedChatId = if (left && state.selectedChatId == chatId) null else state.selectedChatId,
+                    statusBannerMessage = if (left) {
+                        "Вы вышли из группы: состав и переписка удалены с этого устройства"
+                    } else {
+                        "Нечего покидать: это не группа"
+                    }
+                )
+            }
+        }
+    }
+
     fun addContactsToGroup(chatId: String, memberContactChatIds: List<String>) {
         viewModelScope.launch {
             val added = withContext(Dispatchers.IO) {
