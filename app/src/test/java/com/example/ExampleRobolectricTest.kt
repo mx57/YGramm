@@ -3,11 +3,15 @@ package com.example
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.YggDatabase
 import com.example.data.YggRepository
 import com.example.engine.IncomingReactionPacket
 import com.example.engine.IncomingTwinPacket
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggPeerScannerCatalog
@@ -35,7 +39,7 @@ class ExampleRobolectricTest {
     fun `read string from context matches YggGram`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("YggGram", appName)
+        assertEquals("YGramm", appName)
     }
 
     @Test
@@ -412,5 +416,372 @@ class ExampleRobolectricTest {
             "A broken native answer must not invent live peers",
             com.example.engine.YggNativeCoreBridge.readCoreUpPeers("{not json").isEmpty()
         )
+    }
+
+    @Test
+    fun `lost overlay frames are counted instead of vanishing silently`() {
+        val logs = CopyOnWriteArrayList<YggLivePacketLogEntry>()
+        val node = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = { logs.add(it) }
+        )
+        repeat(12) { node.noteOverlayDrop("profile_test", "payload оверлея не раскодирован") }
+        assertEquals(12L, node.overlayDropTotal())
+        assertEquals(
+            "A flooded journal buries the signal: only the first drop and every tenth are written",
+            2,
+            logs.count { it.summary.contains("потерян") }
+        )
+    }
+
+    @Test
+    fun `avatar crosses the p2p link once and the recipient stores only verified bytes`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val sourceFile = java.io.File(app.filesDir, "face_source.png").apply {
+            val bitmap = Bitmap.createBitmap(240, 240, Bitmap.Config.ARGB_8888)
+            Canvas(bitmap).drawColor(android.graphics.Color.parseColor("#7E57C2"))
+            java.io.FileOutputStream(this).use { out ->
+                assertTrue("Test image must encode", bitmap.compress(Bitmap.CompressFormat.PNG, 100, out))
+            }
+            bitmap.recycle()
+        }
+        val sourceUri = Uri.fromFile(sourceFile)
+
+        // 1. The codec turns the picked file into an overlay-sized, hash-named JPEG.
+        val stored = YggAvatarCodec.storeFromUri(app, sourceUri)
+        assertNotNull("A real image must become an avatar that fits one frame", stored)
+        requireNotNull(stored)
+        assertTrue(
+            "Stored avatar must stay inside the frame budget",
+            stored.jpegBytes in 1..YggAvatarCodec.MAX_JPEG_BYTES
+        )
+        val avatarBase64 = YggAvatarCodec.base64OfStoredFile(stored.localUri)
+        assertTrue("The stored file must read back for the wire", !avatarBase64.isNullOrBlank())
+
+        // 2. Owning profile keeps it across the database.
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao(), app)
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        repo.ensureInitialized(identity)
+        val profileId = repo.getAllProfilesNow().first().profileId
+        val updatedProfile = repo.setProfileAvatar(profileId, sourceUri)
+        assertEquals(stored.hashHex, updatedProfile?.avatarHashHex)
+        assertTrue(updatedProfile?.avatarUri?.startsWith("file://") == true)
+
+        // 3. Real P2P roundtrip: the picture rides the MSG frame of an ordinary message.
+        val packets = java.util.concurrent.ConcurrentLinkedQueue<IncomingTwinPacket>()
+        val receiverNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { packets.add(it) },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val senderNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        try {
+            receiverNode.start()
+            senderNode.start()
+            kotlinx.coroutines.delay(150)
+
+            val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
+            val chatId = repo.createNewConversation(
+                title = "Аватар Пир",
+                yggIpv6Input = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+                disappearingSeconds = 0,
+                directEndpointHint = receiverEndpoint
+            )
+
+            suspend fun send(text: String, id: String): Boolean =
+                senderNode.dispatchOutgoingMessageThroughYggdrasil(
+                    chatId = chatId,
+                    messageId = id,
+                    peerTitle = "Аватар Пир",
+                    peerIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
+                    directEndpointHint = receiverEndpoint,
+                    senderNodeLabel = "Узел YggGram #1",
+                    senderIpv6 = identity.yggIpv6Address,
+                    senderPubKeyHex = identity.yggNodePublicKeyHex,
+                    plainText = text,
+                    cipherPayloadHex = "aabbccdd",
+                    hashcashToken = "1:10:test",
+                    attachmentName = null,
+                    attachmentSizeBytes = 0L,
+                    senderAvatarHash = stored.hashHex,
+                    senderAvatarBase64 = avatarBase64.orEmpty()
+                )
+
+            assertTrue("First message must be ACKed", send("Первое сообщение", "msg_avatar_1"))
+            withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+            }
+            val first = packets.poll()
+            requireNotNull(first)
+            assertEquals(stored.hashHex, first.senderAvatarHash)
+            assertEquals(avatarBase64, first.senderAvatarData)
+
+            // 4. The recipient re-hashes the payload: a face is only stored when the
+            //    bytes match the hash the sender claimed under its own key.
+            repo.storeIncomingAvatar(chatId, first.senderAvatarHash, first.senderAvatarData)
+            val storedConv = repo.conversations.first().find { it.chatId == chatId }
+            assertEquals(stored.hashHex, storedConv?.avatarHashHex)
+            assertNotNull(YggAvatarCodec.fileFor(storedConv?.avatarUri.orEmpty()))
+
+            val forgedChatId = repo.createNewConversation(
+                title = "Подозрительный Пир",
+                yggIpv6Input = "0202:8f4e:3b12:90a4:55d1:c209:7e11:44a9",
+                disappearingSeconds = 0,
+                directEndpointHint = ""
+            )
+            repo.storeIncomingAvatar(forgedChatId, "0".repeat(64), first.senderAvatarData)
+            assertEquals(
+                "Bytes that do not hash to the claimed digest must never reach the disk",
+                "",
+                repo.conversations.first().find { it.chatId == forgedChatId }?.avatarHashHex
+            )
+
+            // 5. After the ACK the sender stops repeating 12 KB on every message.
+            assertTrue("Second message must be ACKed", send("Второе сообщение", "msg_avatar_2"))
+            withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+            }
+            val second = packets.poll()
+            requireNotNull(second)
+            assertEquals("The hash still identifies the picture", stored.hashHex, second.senderAvatarHash)
+            assertEquals("Confirmed avatars must not ride every frame", "", second.senderAvatarData)
+        } finally {
+            receiverNode.stop()
+            senderNode.stop()
+        }
+    }
+
+    @Test
+    fun `reimporting a contact card renames the chat it already owns`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao())
+        try {
+            val peerIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+            val first = repo.createNewConversation(
+                title = "Узел YggGram #1",
+                yggIpv6Input = peerIpv6,
+                disappearingSeconds = 0
+            )
+            val second = repo.createNewConversation(
+                title = "Узел YggGram #2",
+                yggIpv6Input = peerIpv6,
+                disappearingSeconds = 0
+            )
+            assertEquals("A card for a node that is already a contact must not create a second chat", first, second)
+            assertEquals(
+                "The newest card is the node owner's rename, and it must reach the chat list",
+                "Узел YggGram #2",
+                repo.conversations.first().find { it.chatId == first }?.title
+            )
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `group roster rides an ordinary message and only a full ack set counts as delivered`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val senderDb = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val peerDb = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val senderRepo = YggRepository(senderDb.yggDao())
+        val peerRepo = YggRepository(peerDb.yggDao())
+
+        val senderIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        val peerIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "glacier", "helium", "cascade", "nebula", "cobalt", "lattice",
+                "photon", "quartz", "onyx", "harbor", "vertex", "cedar"
+            ),
+            epoch = 1
+        )
+        senderRepo.ensureInitialized(senderIdentity)
+        peerRepo.ensureInitialized(peerIdentity)
+
+        val memberOneIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+        val memberTwoIpv6 = "0202:11be:77c4:0d35:9a08:5ef2:31b7:cc09"
+        val chatOne = senderRepo.createNewConversation(
+            title = "Узел А", yggIpv6Input = memberOneIpv6, disappearingSeconds = 0
+        )
+        val chatTwo = senderRepo.createNewConversation(
+            title = "Узел Б", yggIpv6Input = memberTwoIpv6, disappearingSeconds = 0
+        )
+
+        // 1. A group is local bookkeeping: an identifier, a type and a roster of addresses.
+        val groupChatId = senderRepo.createNewGroup(
+            title = "Полигон 0200::/7",
+            memberContactChatIds = listOf(chatOne, chatTwo),
+            ownerProfileId = YggRepository.DEFAULT_PROFILE_ID,
+            localIdentity = senderIdentity
+        )
+        val group = senderRepo.getConversation(groupChatId)
+        requireNotNull(group)
+        assertEquals("GROUP", group.chatType)
+        assertTrue(group.groupId.startsWith("grp_"))
+        assertEquals(2, senderRepo.getGroupMembers(groupChatId).size)
+
+        val outgoing = senderRepo.sendEncryptedMessage(
+            chatId = groupChatId,
+            plainText = "Привет группе",
+            senderIpv6 = senderIdentity.yggIpv6Address,
+            isOfflineMode = false,
+            sealedSenderGlobal = false,
+            powDifficultyBits = 1
+        )
+        requireNotNull(outgoing)
+
+        // 2. Send it over a real socket. The roster is advertised inside the message frame,
+        //    including the peer's own address, which it must refuse to store as a member.
+        val packets = CopyOnWriteArrayList<IncomingTwinPacket>()
+        val receiverNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { packets.add(it) },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val senderNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val roster = listOf(
+            "$memberOneIpv6|",
+            "$memberTwoIpv6|",
+            "${senderIdentity.yggIpv6Address}|${senderIdentity.yggNodePublicKeyHex}",
+            "${peerIdentity.yggIpv6Address}|"
+        ).joinToString(",")
+
+        try {
+            receiverNode.start()
+            senderNode.start()
+            kotlinx.coroutines.delay(150)
+            val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
+
+            val delivered = senderNode.dispatchOutgoingMessageThroughYggdrasil(
+                chatId = groupChatId,
+                messageId = outgoing.messageId,
+                peerTitle = "Узел А",
+                peerIpv6 = memberOneIpv6,
+                directEndpointHint = receiverEndpoint,
+                senderNodeLabel = "Узел YggGram #1",
+                senderIpv6 = senderIdentity.yggIpv6Address,
+                senderPubKeyHex = senderIdentity.yggNodePublicKeyHex,
+                plainText = outgoing.plainText,
+                cipherPayloadHex = outgoing.cipherPayloadHex,
+                hashcashToken = outgoing.hashcashPowToken,
+                attachmentName = null,
+                attachmentSizeBytes = 0L,
+                groupId = group.groupId,
+                groupTitle = group.title,
+                groupMembersCsv = roster
+            )
+            assertTrue("Group frame must reach the peer over the socket", delivered)
+
+            val frame = withTimeout(3000L) {
+                while (packets.isEmpty()) kotlinx.coroutines.delay(20)
+                packets.first()
+            }
+            assertEquals(group.groupId, frame.groupId)
+            assertEquals(group.title, frame.groupTitle)
+            assertTrue(
+                "The roster has to survive the wire framing",
+                frame.groupMembersCsv.contains(memberTwoIpv6)
+            )
+
+            // 3. The receiving node has never heard of this group. One frame from one
+            //    member is enough to rebuild it — and it must land in the group, not in a
+            //    private chat with whoever relayed it.
+            assertEquals("Узел YggGram #1", frame.senderNodeLabel)
+            val resolvedChatId = peerRepo.recordIncomingTwinMessage(frame, activeChatId = null)
+            val peerConv = peerRepo.getConversation(resolvedChatId)
+            requireNotNull(peerConv)
+            assertEquals("GROUP", peerConv.chatType)
+            assertEquals(group.groupId, peerConv.groupId)
+            assertEquals("Полигон 0200::/7", peerConv.title)
+            assertTrue(
+                "A group frame must not open a 1:1 dialog with its relay",
+                peerRepo.conversations.first().none {
+                    it.chatType != "GROUP" && it.yggIpv6Address == memberOneIpv6
+                }
+            )
+
+            val peerMembers = peerRepo.getGroupMembers(resolvedChatId)
+            assertEquals(
+                "The speaker and the member that never spoke are both known from one frame",
+                3,
+                peerMembers.size
+            )
+            assertTrue(peerMembers.any { it.memberIpv6 == memberTwoIpv6 })
+            // Only the node that actually spoke has a name: the roster carries addresses,
+            // so the other members stay unnamed until they introduce themselves.
+            assertEquals(
+                "Узел YggGram #1",
+                peerMembers.first { it.memberIpv6 == senderIdentity.yggIpv6Address.lowercase() }.memberName
+            )
+            assertEquals(
+                "",
+                peerMembers.first { it.memberIpv6 == memberOneIpv6 }.memberName
+            )
+            assertTrue(
+                "A node never lists its own address as an external member",
+                peerMembers.none { it.memberIpv6 == peerIdentity.yggIpv6Address.lowercase() }
+            )
+
+            // 4. Delivery is counted per member: one acknowledgement of two is not delivery.
+            val (firstAcked, rosterSize) = senderRepo.recordGroupMemberDelivery(
+                outgoing.messageId,
+                memberOneIpv6
+            )
+            assertEquals(2, rosterSize)
+            assertEquals(1, firstAcked)
+            val afterOneAck = senderRepo.getMessage(outgoing.messageId)?.deliveryState
+            assertTrue(
+                "Half a roster must not report DELIVERED, got $afterOneAck",
+                afterOneAck != "DELIVERED"
+            )
+
+            senderRepo.recordGroupMemberDelivery(outgoing.messageId, memberTwoIpv6)
+            val afterAllAcks = senderRepo.getMessage(outgoing.messageId)
+            assertEquals("DELIVERED", afterAllAcks?.deliveryState)
+            assertEquals(2, afterAllAcks?.deliveredMemberCsv?.split(',')?.size)
+        } finally {
+            receiverNode.stop()
+            senderNode.stop()
+        }
     }
 }

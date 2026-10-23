@@ -26,11 +26,12 @@ data class ParsedYggContactQr(
     val ed25519PubKeyHex: String,
     val directLanHint: String,
     val rawUri: String,
-    val x25519PubKeyHex: String = ""
+    val x25519PubKeyHex: String = "",
+    val nodeKeyProblem: String = ""
 )
 
 /**
- * YggGram contact-card codec built on the standard QR Code Model 2 format (ZXing).
+ * YGramm contact-card codec built on the standard QR Code Model 2 format (ZXing).
  * The rendered code is readable by any third-party QR scanner, and the in-app
  * camera/gallery scanner decodes standard QR frames with rotation and perspective
  * correction instead of sampling a hand-drawn matrix.
@@ -49,7 +50,7 @@ object YggQrCodeCodec {
         x25519PubKeyHex: String = ""
     ): String {
         val encodedName = try {
-            URLEncoder.encode(displayName.trim().ifBlank { "Узел YggGram" }, StandardCharsets.UTF_8.name())
+            URLEncoder.encode(displayName.trim().ifBlank { "Узел YGramm" }, StandardCharsets.UTF_8.name())
         } catch (_: Exception) {
             "YggNode"
         }
@@ -89,7 +90,17 @@ object YggQrCodeCodec {
             }
             // Never invent an Ed25519 key from the address: the overlay would silently
             // address a node that does not exist and the mesh would drop every frame.
-            val pubKey = params["pub"]?.trim()?.lowercase()?.takeIf { YggCryptoEngine.isEd25519Hex(it) }
+            val rawPubKey = params["pub"]?.trim()?.lowercase().orEmpty()
+            val pubKey = rawPubKey.takeIf { YggCryptoEngine.isEd25519Hex(it) }
+            // A truncated or corrupted ?pub= is the worst possible silent failure: the
+            // contact looks complete but has no addressable node key, so every message
+            // it receives stays queued forever. Report exactly what was in the card.
+            val nodeKeyProblem = when {
+                pubKey != null || rawPubKey.isEmpty() -> ""
+                rawPubKey.length != 64 ->
+                    "Ключ узла в визитке неполный: ${rawPubKey.length} символов вместо 64"
+                else -> "Ключ узла в визитке содержит символы вне [0-9a-f]"
+            }
             val name = params["name"]?.takeIf { it.isNotBlank() } ?: "Пир ${addressPart.take(14)}"
             val lan = params["lan"] ?: ""
             val ipv6 = when {
@@ -110,7 +121,8 @@ object YggQrCodeCodec {
                 rawUri = trimmed,
                 x25519PubKeyHex = params["xpub"]?.trim()?.lowercase()
                     ?.takeIf { it.length == 64 && it.all { c -> c.isDigit() || c.lowercaseChar() in 'a'..'f' } }
-                    .orEmpty()
+                    .orEmpty(),
+                nodeKeyProblem = nodeKeyProblem
             )
         }
 

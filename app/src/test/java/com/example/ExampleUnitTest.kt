@@ -3,6 +3,7 @@ package com.example
 
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggCryptoEngine
+import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggQrCodeCodec
 import com.example.engine.YggTwinP2PBridge
@@ -10,6 +11,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -150,6 +152,32 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun qrUriParser_flagsTruncatedNodeKeyInsteadOfSilentlyDroppingIt() {
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            ),
+            epoch = 1
+        )
+        val truncated = identity.yggNodePublicKeyHex.dropLast(1)
+        assertEquals(63, truncated.length)
+
+        val brokenCard = YggQrCodeCodec.parseContactString(
+            "ygggram://${identity.yggIpv6Address}?pub=$truncated&name=Y"
+        )
+        assertNotNull(brokenCard)
+        assertEquals("", brokenCard?.ed25519PubKeyHex)
+        assertTrue(brokenCard?.nodeKeyProblem?.contains("63") == true)
+
+        val cleanCard = YggQrCodeCodec.parseContactString(
+            "ygggram://${identity.yggIpv6Address}?pub=${identity.yggNodePublicKeyHex}&name=Y"
+        )
+        assertEquals("", cleanCard?.nodeKeyProblem)
+        assertEquals(identity.yggNodePublicKeyHex.lowercase(), cleanCard?.ed25519PubKeyHex)
+    }
+
+    @Test
     fun peerScannerCatalog_filtersByCountryAndWhitelist() {
         val ruPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "RU" }
         val fiPeers = YggPeerScannerCatalog.initialCatalog.filter { it.countryCode == "FI" }
@@ -239,5 +267,70 @@ class ExampleUnitTest {
             mainNodeBridge.stop()
             cloneNodeBridge.stop()
         }
+    }
+
+    @Test
+    fun sni_is_only_appended_where_the_core_can_act_on_it() {
+        // tls:// is the only link type in yggdrasil that reads ?sni=, and Go's crypto/tls
+        // drops an IP literal from SNI, so an IP sniDomain must not be smuggled in.
+        assertEquals(
+            "tls://95.217.35.148:443?sni=ya.ru",
+            YggNativeCoreBridge.corePeerUri("tls://95.217.35.148:443", "YA.RU")
+        )
+        assertEquals(
+            "tls://185.22.172.110:443",
+            YggNativeCoreBridge.corePeerUri("tls://185.22.172.110:443", "185.22.172.110")
+        )
+        assertEquals(
+            "wss://ygg.example:443",
+            YggNativeCoreBridge.corePeerUri("wss://ygg.example:443", "ya.ru")
+        )
+        assertEquals(
+            "tls://ygg.example:443?maxbackoff=20s",
+            YggNativeCoreBridge.corePeerUri("tls://ygg.example:443?maxbackoff=20s", "ya.ru")
+        )
+        for (junk in listOf("", "not a host", "bad host", "-dash.example", "trailing-.")) {
+            assertEquals(
+                "SNI must never carry $junk",
+                "tls://185.22.172.110:443",
+                YggNativeCoreBridge.corePeerUri("tls://185.22.172.110:443", junk)
+            )
+        }
+    }
+
+    @Test
+    fun the_first_links_a_node_dials_are_the_ones_that_name_a_host() {
+        assertFalse(
+            "tls://IP with an IP sniDomain still has no server name",
+            YggNativeCoreBridge.sendsHostnameSni("tls://95.217.35.148:443", "95.217.35.148")
+        )
+        assertTrue(
+            "tls://IP with a hostname sniDomain names that host",
+            YggNativeCoreBridge.sendsHostnameSni("tls://95.217.35.148:443", "ygg.example.net")
+        )
+        assertTrue(
+            "tls:// by domain already sends the name as ServerName",
+            YggNativeCoreBridge.sendsHostnameSni("tls://ygg.zbin.eu:7743", "ygg.zbin.eu")
+        )
+        assertTrue(
+            "wss:// by domain does too",
+            YggNativeCoreBridge.sendsHostnameSni("wss://host.example:443/api/v2/socket", "")
+        )
+        assertFalse(
+            "tcp:// has no TLS at all",
+            YggNativeCoreBridge.sendsHostnameSni("tcp://95.217.35.148:9317", "ygg.example.net")
+        )
+        assertFalse(
+            "an IPv6 literal in brackets is not a hostname",
+            YggNativeCoreBridge.sendsHostnameSni("tls://[2a00:1748:100:252::a]:443", "")
+        )
+
+        // A node only dials the first sixteen peers, so this ordering is what decides
+        // whether the uplink looks like HTTPS or like an unnamed TLS hello.
+        val dialOrder = YggPeerScannerCatalog.initialCatalog
+            .sortedByDescending { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+            .take(16)
+        val naming = dialOrder.count { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+        assertEquals("the whole dial list must name a host", 16, naming)
     }
 }

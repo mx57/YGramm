@@ -75,7 +75,7 @@ object YggNotificationCenter {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
             val incomingCallChannel = NotificationChannel(
                 INCOMING_CALL_CHANNEL_ID,
-                "YggGram • Входящие звонки",
+                "YGramm • Входящие звонки",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Полноэкранный входящий вызов с кнопками ответа и отклонения"
@@ -87,7 +87,7 @@ object YggNotificationCenter {
             }
             val callsChannel = NotificationChannel(
                 CALLS_CHANNEL_ID,
-                "YggGram • Пропущенные вызовы",
+                "YGramm • Пропущенные вызовы",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Уведомления о пропущенных звонках по всем активным профилям"
@@ -96,7 +96,7 @@ object YggNotificationCenter {
             }
             val msgChannel = NotificationChannel(
                 MESSAGES_CHANNEL_ID,
-                "YggGram • Сообщения и голосовые (Мульти-профиль)",
+                "YGramm • Сообщения и голосовые (Мульти-профиль)",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Уведомления о новых P2P сообщениях и голосовых записях для всех включенных профилей"

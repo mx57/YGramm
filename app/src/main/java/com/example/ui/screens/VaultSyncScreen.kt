@@ -283,13 +283,14 @@ fun VaultSyncScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "Зашифрованные локальные и WebDAV бэкапы",
+                                text = "Снимки метаданных хранилища (архив не создаётся)",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Text(
-                                text = "FastCDC чанкинг + Zstd + Argon2id (64 МБ) + XChaCha20-Poly1305",
+                                text = "Argon2id, XChaCha20-Poly1305, Zstd и FastCDC здесь не применяются: " +
+                                    "сводка считается из SHA-256 по размерам записей",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = AmberShieldTertiary
+                                color = MaterialTheme.colorScheme.error
                             )
                         }
                     }
@@ -340,7 +341,7 @@ fun VaultSyncScreen(
                         ) {
                             Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("WebDAV", maxLines = 1)
+                            Text("Файл для WebDAV", maxLines = 1)
                         }
                     }
 
@@ -554,7 +555,7 @@ private fun PairCrossPlatformDeviceModal(
     onDismiss: () -> Unit,
     onPair: (String, String, String, String) -> Unit
 ) {
-    var name by rememberSaveable { mutableStateOf("Ноутбук Linux / Windows (YggGram Desktop)") }
+    var name by rememberSaveable { mutableStateOf("Ноутбук Linux / Windows (YGramm Desktop)") }
     var ipv6 by rememberSaveable { mutableStateOf("0201:6f22:a810:49c1:77e0:12b4:9081:33d2") }
     var lan by rememberSaveable { mutableStateOf("192.168.1.25:51920 (Прямой LAN P2P)") }
 

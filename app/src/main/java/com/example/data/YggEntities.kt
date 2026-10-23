@@ -20,7 +20,12 @@ data class UserProfileEntity(
     val avatarColorHex: String,
     val createdAt: Long,
     val nodeRelayRole: String = "PEER_RELAY", // "CLIENT_ONLY", "PEER_RELAY", "SF_BLIND_RELAY"
-    val relayedPacketsCount: Int = 0
+    val relayedPacketsCount: Int = 0,
+    // Local file:// path of this profile's own picture, and the hash the other nodes
+    // last saw from us. The hash is what decides whether a message has to carry the
+    // bytes again.
+    val avatarUri: String = "",
+    val avatarHashHex: String = ""
 )
 
 @Entity(tableName = "conversations")
@@ -41,7 +46,18 @@ data class ConversationEntity(
     val bioStatus: String,
     val routeTransportSummary: String,
     val ownerProfileId: String = "profile_primary",
-    val peerX25519PublicKeyHex: String = ""
+    val peerX25519PublicKeyHex: String = "",
+    // The contact's picture as it reached us over the overlay, plus the hash it arrived
+    // with. Empty avatarUri means "never received one", which the UI must show as
+    // initials — not as a placeholder image someone could mistake for the real thing.
+    val avatarUri: String = "",
+    val avatarHashHex: String = "",
+    // "DIRECT" or "GROUP".
+    val chatType: String = "DIRECT",
+    // The identifier every member of a group sees on the wire. chatId stays local — one
+    // per owning profile — so two profiles on this device can each hold their own row for
+    // the same group instead of fighting over one primary key.
+    val groupId: String = ""
 )
 
 @Entity(tableName = "messages")
@@ -75,7 +91,11 @@ data class MessageEntity(
     // Display name of the original author for forwarded messages.
     val forwardedFrom: String = "",
     // 2 = X25519 + HKDF + AES-256-GCM; 1 = legacy envelope without confidentiality.
-    val envelopeVersion: Int = 1
+    val envelopeVersion: Int = 1,
+    // Which group members have ACKed this exact message. A group message is only
+    // DELIVERED when that set covers the roster, so the count shown to the user is a
+    // count of received acknowledgements and never an assumption.
+    val deliveredMemberCsv: String = ""
 )
 
 @Entity(tableName = "p2p_file_transfers")
@@ -166,5 +186,21 @@ data class CallLogEntity(
     val durationSeconds: Int,
     val transport: String,
     val ownerProfileId: String
+)
+
+/**
+ * One remote member of a group, keyed by the mesh address the overlay can actually dial.
+ *
+ * Members are stored by identity rather than by a local contact id because that is the
+ * only form both sides of the wire agree on: the roster a peer advertises references
+ * addresses, and each device resolves them into its own contact rows.
+ */
+@Entity(tableName = "group_members", primaryKeys = ["chatId", "memberIpv6"])
+data class GroupMemberEntity(
+    val chatId: String,
+    val memberIpv6: String,
+    val memberPubKeyHex: String,
+    val memberName: String,
+    val addedAt: Long
 )
 

@@ -68,6 +68,18 @@ data class IncomingTwinPacket(
     // Wire id of the message this one quotes, and the original author for forwards.
     val replyToMessageId: String = "",
     val forwardedFrom: String = "",
+    // The sender's own picture, so a contact's face arrives on the same authenticated
+    // overlay path as their messages instead of from a server nobody controls.
+    // data is only present on the first message after the sender changes it.
+    val senderAvatarHash: String = "",
+    val senderAvatarData: String = "",
+    // Group identity and roster, advertised by every group message. A member learns who
+    // else is in the group from the messages themselves, so a group needs no separate
+    // sync channel and no server: one frame from any member is enough to rebuild it.
+    val groupId: String = "",
+    val groupTitle: String = "",
+    // "ipv6|ed25519hex,ipv6|ed25519hex" — empty key when the sender only knows the address.
+    val groupMembersCsv: String = "",
     val rttMs: Long,
     val timestamp: Long
 )
@@ -514,9 +526,19 @@ class YggTwinP2PBridge(
             // even while another profile is in the foreground.
             // Stored peers outrank catalog guesses: a node dialled only from the
             // hardcoded list ignored the verified peers in the database and came up
-            // with zero live links. The catalog stays as the first-run fallback.
+            // with zero live links. The catalog stays as the first-run fallback, and a
+            // node only dials the first sixteen of them, so the ones whose hello names
+            // a host go first — those are the links a filtering provider is least likely
+            // to drop, and a fallback that reaches nothing is worth less than a slower
+            // one that reaches the overlay at all.
             val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
-                .ifEmpty { YggPeerScannerCatalog.initialCatalog.map { it.endpointUri } }
+                .ifEmpty {
+                    YggPeerScannerCatalog.initialCatalog
+                        .sortedByDescending {
+                            YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain)
+                        }
+                        .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
+                }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
                 synchronized(nativeCoreStartLock) {
@@ -592,6 +614,7 @@ class YggTwinP2PBridge(
     private val initializedNativeProfiles = ConcurrentHashMap.newKeySet<String>()
     private val nativeCoreStartLock = Any()
     private val overlayRecvJobs = ConcurrentHashMap<String, Job>()
+    private val overlayDropCounts = ConcurrentHashMap<String, AtomicLong>()
 
     // Core watchdog: a node that died after a successful init (or whose init
     // failed, e.g. no network at boot) is restarted from these parameters.
@@ -603,6 +626,57 @@ class YggTwinP2PBridge(
     private val coreDeathStrikes = ConcurrentHashMap<String, Int>()
     private var coreWatchdogJob: Job? = null
     private val pendingOverlayAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
+
+    /**
+     * Avatar advertisement bookkeeping.
+     *
+     * [advertisedAvatarHashes] holds, per chat, the last picture the recipient has been
+     * CONFIRMED to hold — an ACK, nothing less. Until that confirmation arrives every
+     * message to the chat repeats the bytes, so a torn or undelivered frame cannot leave
+     * a contact permanently faceless. [pendingAvatarAdverts] maps an in-flight message to
+     * what it carried, so whichever transport finally returns the ACK can record it.
+     */
+    private val advertisedAvatarHashes = ConcurrentHashMap<String, String>()
+    private val pendingAvatarAdverts = ConcurrentHashMap<String, Pair<String, String>>()
+
+    /**
+     * Base64url of a JPEG capped at [YggAvatarCodec.MAX_JPEG_BYTES], plus the frame's own
+     * overhead. Anything longer did not come from this codec and is dropped before it can
+     * displace the message it rode in on.
+     */
+    private fun avatarDataOf(frame: Map<String, String>): String =
+        frame["senderAvatarData"].orEmpty().takeIf {
+            it.length <= YggAvatarCodec.MAX_JPEG_BYTES * 2 && it.all { c -> c.isLetterOrDigit() || c == '-' || c == '_' }
+        }.orEmpty()
+
+    /**
+     * A roster is merged from whatever a peer advertises, so it is capped and shape-
+     * checked: one frame from an unfamiliar node must not be able to plant thousands of
+     * phantom members in a chat list.
+     */
+    private fun rosterOf(frame: Map<String, String>): String =
+        frame["groupMembers"].orEmpty()
+            .split(',')
+            .map { it.trim() }
+            .filter { it.contains(':') }
+            .distinct()
+            .take(64)
+            .joinToString(",")
+
+    /**
+     * A group id ends up inside a primary key, so it is shape-checked and bounded: an
+     * unfamiliar peer must not be able to mint an arbitrarily long identifier.
+     */
+    private fun groupIdOf(frame: Map<String, String>): String =
+        frame["groupId"].orEmpty().trim().lowercase()
+            .takeIf { it.length <= 64 && it.all { c -> c.isLetterOrDigit() || c == '_' || c == '-' } }
+            .orEmpty()
+
+    private fun markAvatarAdvertised(messageId: String) {
+        pendingAvatarAdverts.remove(messageId)?.let { (chatId, hash) ->
+            advertisedAvatarHashes[chatId] = hash
+        }
+    }
     // Reaction ACKs must never be confused with message ACKs: a reaction frame carries
     // the id of the message it reacts to, and completing a message ACK with it would
     // falsely upgrade that message to DELIVERED.
@@ -749,7 +823,8 @@ class YggTwinP2PBridge(
      */
     suspend fun applyPeerChangeToCores(
         peerUri: String,
-        enabled: Boolean
+        enabled: Boolean,
+        sniDomain: String = ""
     ): PeerApplyOutcome = withContext(Dispatchers.IO) {
         val uri = peerUri.trim()
         val profiles = initializedNativeProfiles.toList()
@@ -761,17 +836,30 @@ class YggTwinP2PBridge(
                 errorDetail = if (uri.isBlank()) "Пустой адрес пира" else "Нода Yggdrasil не запущена"
             )
         }
+        // What the core is actually told to dial, including the SNI it will put in the
+        // ClientHello. Removing still matches without it: yggdrasil identifies a link by
+        // scheme/host/port and ignores the query.
+        val dialUri = YggNativeCoreBridge.corePeerUri(uri, sniDomain)
         var applied = 0
         var live = 0
         var total = 0
         var failure: String? = null
         for (profileId in profiles) {
             val res = if (enabled) {
-                YggNativeCoreBridge.addPeer(profileId, uri)
+                YggNativeCoreBridge.addPeer(profileId, dialUri)
             } else {
-                YggNativeCoreBridge.removePeer(profileId, uri)
+                YggNativeCoreBridge.removePeer(profileId, dialUri)
             }
-            if (res.ok) applied++ else failure = res.error.ifBlank { "ядро отклонило пир" }
+            // "peer is already configured" is the state the caller asked for, not a
+            // failure. The autopilot re-adds its best peer on every pass, so reporting
+            // it as «пир не добавлен» filled the journal with false alarms while the
+            // link was up the whole time.
+            val alreadyConfigured = res.error.contains("already configured", ignoreCase = true)
+            if (res.ok || alreadyConfigured) {
+                applied++
+            } else {
+                failure = res.error.ifBlank { "ядро отклонило пир" }
+            }
             val mesh = YggNativeCoreBridge.readMeshState(profileId)
             live = maxOf(live, mesh.liveLinks)
             total = maxOf(total, mesh.totalLinks)
@@ -788,7 +876,8 @@ class YggTwinP2PBridge(
                 enabled -> "Пир добавлен в работающую ноду Yggdrasil"
                 else -> "Пир удалён из работающей ноды Yggdrasil"
             },
-            details = "$uri • живых линков ядра: $live из $total" + (failure?.let { " • $it" } ?: "")
+            details = "$dialUri • живых линков ядра: $live из $total" +
+                (failure?.let { " • $it" } ?: "")
         )
         PeerApplyOutcome(applied, live, total, failure)
     }
@@ -813,7 +902,7 @@ class YggTwinP2PBridge(
     }
 
     private fun startOverlayRecvLoop(profileId: String) {
-        if (overlayRecvJobs.containsKey(profileId)) return
+        if (overlayRecvJobs[profileId]?.isActive == true) return
         val job = scope.launch {
             while (isActive && initializedNativeProfiles.contains(profileId)) {
                 val pollResult = try {
@@ -829,11 +918,19 @@ class YggTwinP2PBridge(
                     }
                     continue
                 }
-                val decoded = YggNativeCoreBridge.decodeOverlayPayload(pollResult.rawJson) ?: continue
+                val decoded = YggNativeCoreBridge.decodeOverlayPayload(pollResult.rawJson)
+                if (decoded == null) {
+                    noteOverlayDrop(profileId, "payload оверлея не раскодирован")
+                    continue
+                }
                 val (payload, senderPubKeyHex) = decoded
                 try {
                     handleOverlayFrame(profileId, payload, senderPubKeyHex)
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
+                    noteOverlayDrop(
+                        profileId,
+                        "обработка кадра упала: ${t.javaClass.simpleName}${t.message?.let { ": $it" } ?: ""}"
+                    )
                 }
             }
             // Self-cleanup so a watchdog re-init can start a fresh recv loop.
@@ -842,7 +939,33 @@ class YggTwinP2PBridge(
         overlayRecvJobs[profileId] = job
     }
 
+    /**
+     * Frames the node received but the app could not use. Without this the drops are
+     * invisible: every counter keeps counting only what survived parsing, so a link
+     * that loses half its traffic still looks perfectly healthy.
+     */
+    internal fun noteOverlayDrop(profileId: String, reason: String) {
+        val counter = overlayDropCounts.getOrPut(profileId) { AtomicLong() }
+        val total = counter.incrementAndGet()
+        // A broken link would flood the journal one line per frame; the first drop and
+        // then every tenth carry the running number the operator actually needs.
+        if (total == 1L || total % 10L == 0L) {
+            logPacket(
+                direction = "ERR • YGG",
+                summary = "Кадр оверлея потерян — всего потерь: $total",
+                details = "profile=$profileId • $reason"
+            )
+        }
+    }
+
     fun coreRestartCount(profileId: String): Int = coreRestartCounts[profileId] ?: 0
+
+    /**
+     * Frames the nodes received but the app could not use, summed over profiles.
+     * The RX counter only counts what survived parsing; without this number a link
+     * that loses traffic looks identical to one that does not.
+     */
+    fun overlayDropTotal(): Long = overlayDropCounts.values.sumOf { it.get() }
 
     /**
      * Drops every in-memory core bookkeeping so a panic-wipe leaves no profile
@@ -858,6 +981,7 @@ class YggTwinP2PBridge(
         coreDeathStrikes.clear()
         overlayRecvJobs.values.forEach { it.cancel() }
         overlayRecvJobs.clear()
+        overlayDropCounts.clear()
         initializedNativeProfiles.clear()
     }
 
@@ -888,6 +1012,16 @@ class YggTwinP2PBridge(
                     if (System.currentTimeMillis() - (coreStartAttemptAt[profileId] ?: 0L) < CORE_START_GRACE_MS) continue
                     if (YggNativeCoreBridge.readMeshState(profileId).available) {
                         coreDeathStrikes.remove(profileId)
+                        // A dead reader is invisible everywhere else: the node reports
+                        // live links while incoming frames pile up unread in the core.
+                        if (overlayRecvJobs[profileId]?.isActive != true) {
+                            logPacket(
+                                direction = "ERR • YGG",
+                                summary = "Приёмник оверлея профиля не работал — перезапущен",
+                                details = "profile=$profileId • потерь кадров на сейчас: ${overlayDropCounts[profileId]?.get() ?: 0L}"
+                            )
+                            startOverlayRecvLoop(profileId)
+                        }
                         continue
                     }
                     // One failed query can be a JNI hiccup; only a second consecutive
@@ -1142,6 +1276,11 @@ class YggTwinP2PBridge(
                     voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
                     replyToMessageId = map["replyToMessageId"].orEmpty(),
                     forwardedFrom = map["forwardedFrom"].orEmpty(),
+                    senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
+                    senderAvatarData = avatarDataOf(map),
+                    groupId = groupIdOf(map),
+                    groupTitle = map["groupTitle"].orEmpty().trim().take(80),
+                    groupMembersCsv = rosterOf(map),
                     rttMs = (System.currentTimeMillis() - sentAt).coerceAtLeast(1L),
                     timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis()
                 )
@@ -1179,6 +1318,7 @@ class YggTwinP2PBridge(
                     )
                 } else {
                     pendingOverlayAcks.remove(messageId)?.complete(rtt)
+                    markAvatarAdvertised(messageId)
                     onDeliveryAckReceived(map["chatId"] ?: "", messageId, rtt)
                     logPacket(
                         direction = "ACK <- YGG",
@@ -1558,7 +1698,12 @@ class YggTwinP2PBridge(
                         voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                         voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
                         replyToMessageId = map["replyToMessageId"].orEmpty(),
-                        forwardedFrom = map["forwardedFrom"].orEmpty()
+                        forwardedFrom = map["forwardedFrom"].orEmpty(),
+                        senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
+                        senderAvatarData = avatarDataOf(map),
+                        groupId = groupIdOf(map),
+                        groupTitle = map["groupTitle"].orEmpty().trim().take(80),
+                        groupMembersCsv = rosterOf(map)
                     )
 
                     val ackFrame = encodeWireFrame(
@@ -1802,7 +1947,7 @@ class YggTwinP2PBridge(
         if (map["type"] == "LAN_ANNOUNCE") {
             val yggIpv6 = map["yggIpv6"] ?: return
             val pubKey = map["pubKey"] ?: ""
-            val name = map["displayName"] ?: "Узел YggGram ($senderIp)"
+            val name = map["displayName"] ?: "Узел YGramm ($senderIp)"
             val port = map["tcpPort"]?.toIntOrNull() ?: 51921
             directEndpointTable[yggIpv6.lowercase()] = InetSocketAddress.createUnresolved(senderIp, port)
             val node = DiscoveredLanNode(
@@ -2181,7 +2326,12 @@ class YggTwinP2PBridge(
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
         replyToMessageId: String = "",
-        forwardedFrom: String = ""
+        forwardedFrom: String = "",
+        senderAvatarHash: String = "",
+        senderAvatarBase64: String = "",
+        groupId: String = "",
+        groupTitle: String = "",
+        groupMembersCsv: String = ""
     ): SelfYggdrasilRelayResult = withContext(Dispatchers.IO) {
         val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()] ?: ""
         val targetProfileId = ipv6ToProfileIdMap[peerIpv6.trim().lowercase()]
@@ -2351,6 +2501,12 @@ class YggTwinP2PBridge(
 
         val now = System.currentTimeMillis()
         val senderPort = activeProfilePortMap[senderProfileId] ?: localTcpPort
+        // Repeat the bytes until the recipient ACKs having seen this exact hash, then go
+        // back to sending nothing but the hash itself — a changed picture must not cost
+        // 12 KB on every message forever, and an unconfirmed one must not be forgotten.
+        val avatarRidesAlong = senderAvatarHash.isNotBlank() &&
+            senderAvatarBase64.isNotBlank() &&
+            advertisedAvatarHashes[chatId] != senderAvatarHash
         val messageFields = linkedMapOf(
             "type" to "MSG",
             "chatId" to chatId,
@@ -2372,6 +2528,11 @@ class YggTwinP2PBridge(
             "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
             "replyToMessageId" to replyToMessageId,
             "forwardedFrom" to forwardedFrom,
+            "senderAvatarHash" to senderAvatarHash,
+            "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+            "groupId" to groupId,
+            "groupTitle" to groupTitle,
+            "groupMembers" to groupMembersCsv,
             "sentAt" to now.toString(),
             "timestamp" to now.toString()
         )
@@ -2393,6 +2554,7 @@ class YggTwinP2PBridge(
         val totalOutboundBytes = wirePayload.length.toLong() + (attachmentBase64?.length ?: 0)
 
         var ackDeferred: kotlinx.coroutines.CompletableDeferred<Long>? = null
+        if (avatarRidesAlong) pendingAvatarAdverts[messageId] = chatId to senderAvatarHash
         if (overlayReady) {
             logPacket(
                 direction = "TX -> YGG",
@@ -2457,6 +2619,7 @@ class YggTwinP2PBridge(
                 readTimeoutMs = if (overlayReady) 3000 else 7000
             )
             if (lanRtt != null) {
+                markAvatarAdvertised(messageId)
                 ackDeferred?.let {
                     it.complete(lanRtt)
                     pendingOverlayAcks.remove(messageId, it)
@@ -2519,7 +2682,10 @@ class YggTwinP2PBridge(
                         connectTimeoutMs = 2000,
                         readTimeoutMs = 2500
                     ) != null
-                    if (lanConfirmed) pendingAck.complete(1L)
+                    if (lanConfirmed) {
+                        markAvatarAdvertised(messageId)
+                        pendingAck.complete(1L)
+                    }
                 }
                 if (lanConfirmed) break
                 val resent = sendOverlayFrame(senderProfileId, recipientKeyHex, wirePayload, "MSG")
@@ -2530,6 +2696,7 @@ class YggTwinP2PBridge(
                 )
             }
             pendingOverlayAcks.remove(messageId, pendingAck)
+            pendingAvatarAdverts.remove(messageId)
             if (!pendingAck.isCompleted) {
                 logPacket(
                     direction = "ERR • YGG",
@@ -2605,7 +2772,12 @@ class YggTwinP2PBridge(
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
         replyToMessageId: String = "",
-        forwardedFrom: String = ""
+        forwardedFrom: String = "",
+        senderAvatarHash: String = "",
+        senderAvatarBase64: String = "",
+        groupId: String = "",
+        groupTitle: String = "",
+        groupMembersCsv: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (directEndpointHint.isNotBlank() && allowDirectLanRouting) {
             registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
@@ -2669,6 +2841,15 @@ class YggTwinP2PBridge(
                         "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
                         "replyToMessageId" to replyToMessageId,
                         "forwardedFrom" to forwardedFrom,
+                        "senderAvatarHash" to senderAvatarHash,
+                        "senderAvatarData" to (
+                            if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank() &&
+                                advertisedAvatarHashes[chatId] != senderAvatarHash
+                            ) senderAvatarBase64 else ""
+                            ),
+                        "groupId" to groupId,
+                        "groupTitle" to groupTitle,
+                        "groupMembers" to groupMembersCsv,
                         "sentAt" to now.toString(),
                         "timestamp" to now.toString()
                     )
@@ -2682,6 +2863,9 @@ class YggTwinP2PBridge(
                         val rtt = (System.currentTimeMillis() - now).coerceAtLeast(1L)
                         onTwinReachableChanged(true)
                         onDeliveryAckReceived(chatId, messageId, rtt)
+                        if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
+                            advertisedAvatarHashes[chatId] = senderAvatarHash
+                        }
                         logPacket(
                             direction = "ACK <- PEER",
                             summary = "Подтверждена реальная доставка пакета ${messageId.take(10)} (RTT: $rtt мс)",

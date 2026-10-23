@@ -7,6 +7,7 @@ import android.util.Log
 import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import java.io.File
 import java.util.UUID
@@ -60,7 +61,7 @@ class YggRepository(
         val primaryProfile = if (existingProfiles.isEmpty()) {
             val created = UserProfileEntity(
                 profileId = DEFAULT_PROFILE_ID,
-                displayName = "Узел YggGram #1",
+                displayName = "Узел YGramm #1",
                 handle = "@node1.ygg",
                 bio = "Основной децентрализованный профиль в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
                 statusText = "В оверлее 200::/7 (Порт 51921)",
@@ -212,7 +213,7 @@ class YggRepository(
         val palette = listOf("#10B981", "#06B6D4", "#F59E0B", "#8B5CF6", "#EC4899")
         val avatarHex = palette[(index - 1) % palette.size]
 
-        val cleanName = displayName.trim().ifBlank { "Узел YggGram #$index" }
+        val cleanName = displayName.trim().ifBlank { "Узел YGramm #$index" }
         val cleanHandle = handle.trim().ifBlank { "@node$index.ygg" }.let {
             if (it.startsWith("@")) it else "@$it"
         }
@@ -352,6 +353,209 @@ class YggRepository(
         )
         dao.upsertProfile(updated)
         return updated
+    }
+
+    /**
+     * Installing a picture the user picked as this profile's avatar.
+     *
+     * @return the updated row, or null when the source is not a readable image or will not
+     *         compress into a message frame; the previous avatar is kept in that case,
+     *         because showing the user a face they did not choose is worse than telling
+     *         them this one did not fit.
+     */
+    suspend fun setProfileAvatar(profileId: String, source: Uri): UserProfileEntity? {
+        val context = appContext ?: return null
+        val existing = dao.getProfileById(profileId) ?: return null
+        val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
+        if (stored.hashHex != existing.avatarHashHex) {
+            YggAvatarCodec.forget(context, existing.avatarUri)
+            dao.updateProfileAvatar(profileId, stored.localUri, stored.hashHex)
+        }
+        return dao.getProfileById(profileId)
+    }
+
+    suspend fun clearProfileAvatar(profileId: String) {
+        val context = appContext ?: return
+        val existing = dao.getProfileById(profileId) ?: return
+        if (existing.avatarUri.isBlank() && existing.avatarHashHex.isBlank()) return
+        YggAvatarCodec.forget(context, existing.avatarUri)
+        dao.updateProfileAvatar(profileId, "", "")
+    }
+
+    suspend fun profileAvatarBase64(profileId: String): String =
+        dao.getProfileById(profileId)?.avatarUri
+            ?.let(YggAvatarCodec::base64OfStoredFile)
+            .orEmpty()
+
+    /**
+     * Saving a contact's avatar received over the overlay.
+     *
+     * Runs after the message itself is persisted and as a partial UPDATE: the conversation
+     * row is re-saved from a copy elsewhere, and a full upsert there would drop the picture
+     * again the moment the contact sent their next message.
+     */
+    suspend fun storeIncomingAvatar(chatId: String, avatarHashHex: String, avatarBase64: String) {
+        val context = appContext ?: return
+        if (chatId.isBlank() || avatarHashHex.isBlank() || avatarBase64.isBlank()) return
+        val conv = dao.getConversationById(chatId) ?: return
+        if (conv.avatarHashHex.equals(avatarHashHex, ignoreCase = true)) return
+        val stored = YggAvatarCodec.storeIncoming(
+            avatarBase64,
+            avatarHashHex,
+            YggAvatarCodec.avatarDir(context)
+        ) ?: return
+        dao.updateConversationAvatar(chatId, stored.localUri, stored.hashHex)
+    }
+
+    // ── Groups ──────────────────────────────────────────────────────────────────────
+
+    fun observeGroupMembers(chatId: String): Flow<List<GroupMemberEntity>> =
+        dao.observeGroupMembers(chatId)
+
+    fun observeGroupMemberCounts(): Flow<List<GroupMemberCount>> = dao.observeGroupMemberCounts()
+
+    suspend fun getGroupMembers(chatId: String): List<GroupMemberEntity> = dao.getGroupMembers(chatId)
+
+    /**
+     * Opening a group from contacts this profile already has a chat with.
+     *
+     * A group is only ever a roster of mesh addresses: there is no server to host it, so
+     "creating" one is local bookkeeping and the first message is what tells the other
+     nodes the group exists and who is in it.
+     *
+     * @return the local chat id, or "" when no member resolved to a diallable address.
+     */
+    suspend fun createNewGroup(
+        title: String,
+        memberContactChatIds: List<String>,
+        ownerProfileId: String,
+        localIdentity: DerivedIdentityHierarchy?
+    ): String {
+        val contacts = memberContactChatIds.mapNotNull { dao.getConversationById(it) }
+            .filter { !isSelfChatId(it.chatId) && it.chatType != "GROUP" && it.yggIpv6Address.isNotBlank() }
+            .distinctBy { it.yggIpv6Address.lowercase() }
+        if (contacts.isEmpty()) return ""
+
+        val groupId = "grp_" + UUID.randomUUID().toString().replace("-", "").take(20)
+        val now = System.currentTimeMillis()
+        val chatId = "chat_${ownerProfileId}_$groupId"
+        dao.upsertConversation(
+            ConversationEntity(
+                chatId = chatId,
+                title = title.trim().ifBlank { "Группа на ${contacts.size + 1}" },
+                yggIpv6Address = localIdentity?.yggIpv6Address.orEmpty(),
+                publicKeyHex = localIdentity?.yggNodePublicKeyHex.orEmpty(),
+                protocolType = "YGG_X25519_AESGCM",
+                isVerified = false,
+                sealedSenderEnabled = true,
+                disappearingTtlSeconds = 0,
+                unreadCount = 0,
+                lastMessagePreview = "",
+                lastTimestamp = now,
+                isOnlineInMesh = true,
+                avatarColorHex = "#10B981",
+                bioStatus = "Группа в оверлее Yggdrasil",
+                routeTransportSummary = "Yggdrasil Overlay 0200::/7",
+                ownerProfileId = ownerProfileId,
+                chatType = "GROUP",
+                groupId = groupId
+            )
+        )
+        dao.upsertGroupMembers(
+            contacts.map {
+                GroupMemberEntity(
+                    chatId = chatId,
+                    memberIpv6 = it.yggIpv6Address,
+                    memberPubKeyHex = it.publicKeyHex,
+                    memberName = it.title,
+                    addedAt = now
+                )
+            }
+        )
+        return chatId
+    }
+
+    /** @return how many contacts were newly added to the group. */
+    suspend fun addContactsToGroup(chatId: String, memberContactChatIds: List<String>): Int {
+        val group = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return 0
+        val existing = dao.getGroupMembers(chatId).map { it.memberIpv6.lowercase() }.toSet()
+        val now = System.currentTimeMillis()
+        val fresh = memberContactChatIds.mapNotNull { dao.getConversationById(it) }
+            .filter {
+                !isSelfChatId(it.chatId) && it.chatType != "GROUP" &&
+                    it.yggIpv6Address.isNotBlank() && it.yggIpv6Address.lowercase() !in existing
+            }
+            .distinctBy { it.yggIpv6Address.lowercase() }
+        if (fresh.isEmpty()) return 0
+        dao.upsertGroupMembers(
+            fresh.map {
+                GroupMemberEntity(
+                    chatId = group.chatId,
+                    memberIpv6 = it.yggIpv6Address,
+                    memberPubKeyHex = it.publicKeyHex,
+                    memberName = it.title,
+                    addedAt = now
+                )
+            }
+        )
+        return fresh.size
+    }
+
+    /**
+     * Folding the roster a frame advertises into the local member table.
+     *
+     * The sender of a group message is itself a member whether or not it listed itself —
+     * it just proved it can deliver to this group. Own profiles are skipped so a device
+     * running several profiles does not list one of its own nodes as an external member.
+     */
+    private suspend fun mergeGroupRoster(chatId: String, packet: IncomingTwinPacket) {
+        val ownAddresses = dao.getAllProfilesNow().map { it.yggIpv6Address.lowercase() }.toSet()
+        val now = System.currentTimeMillis()
+        val rows = mutableListOf<GroupMemberEntity>()
+        // The speaker is listed first: it is the one member whose name the frame really
+        // carries, and distinctBy below keeps the first row for an address.
+        val senderAddress = packet.senderIpv6.trim().lowercase()
+        if (senderAddress.contains(':') && senderAddress !in ownAddresses) {
+            rows += GroupMemberEntity(
+                chatId = chatId,
+                memberIpv6 = senderAddress,
+                memberPubKeyHex = packet.senderPubKeyHex.trim().lowercase().takeIf { isEd25519Hex(it) }.orEmpty(),
+                memberName = packet.senderNodeLabel,
+                addedAt = now
+            )
+        }
+        packet.groupMembersCsv.split(',').map { it.trim() }.filter { it.isNotBlank() }.forEach { entry ->
+            val address = entry.substringBefore('|').trim().lowercase()
+            val key = entry.substringAfter('|', "").trim().lowercase()
+            if (address.contains(':') && address !in ownAddresses) {
+                rows += GroupMemberEntity(
+                    chatId = chatId,
+                    memberIpv6 = address,
+                    memberPubKeyHex = if (isEd25519Hex(key)) key else "",
+                    memberName = "",
+                    addedAt = now
+                )
+            }
+        }
+        if (rows.isNotEmpty()) dao.upsertGroupMembers(rows.distinctBy { it.memberIpv6 })
+    }
+
+    /**
+     * Recording one member's acknowledgement for a group message.
+     *
+     * «DELIVERED» is written only when the delivered set covers the whole roster; until
+     * then the message reports exactly how many acknowledgements have arrived, because a
+     * group of five where two are offline has not been delivered to.
+     */
+    suspend fun recordGroupMemberDelivery(messageId: String, memberIpv6: String): Pair<Int, Int> {
+        val msg = dao.getMessageById(messageId) ?: return 0 to 0
+        val delivered = msg.deliveredMemberCsv.split(',')
+            .map { it.trim().lowercase() }.filter { it.isNotBlank() }.toMutableSet()
+        delivered += memberIpv6.trim().lowercase()
+        val total = dao.getGroupMembers(msg.chatId).size
+        val state = if (total in 1..delivered.size) "DELIVERED" else msg.deliveryState
+        dao.updateMessageGroupDelivery(messageId, delivered.joinToString(","), state)
+        return delivered.size to total
     }
 
     suspend fun deleteSecondaryProfile(profileId: String): List<UserProfileEntity> {
@@ -998,8 +1202,41 @@ class YggRepository(
         val allConvs = dao.getAllConversationsNow()
         var conv: ConversationEntity? = null
 
+        // A group frame belongs to the group, never to whoever happened to relay it. This
+        // has to be resolved before the sender-address match below, otherwise every member
+        // that speaks in a group would silently open a separate 1:1 chat with us.
+        if (packet.groupId.isNotBlank()) {
+            conv = dao.getGroupConversation(packet.groupId, targetOwnerProfileId)
+                ?: run {
+                    val ownerAddr = allProfiles.find { it.profileId == targetOwnerProfileId }
+                        ?.yggIpv6Address.orEmpty()
+                    val created = ConversationEntity(
+                        chatId = "chat_${targetOwnerProfileId}_${packet.groupId}",
+                        title = packet.groupTitle.trim().ifBlank { "Группа ${packet.groupId.take(8)}" },
+                        yggIpv6Address = ownerAddr,
+                        publicKeyHex = "",
+                        protocolType = "YGG_X25519_AESGCM",
+                        isVerified = false,
+                        sealedSenderEnabled = true,
+                        disappearingTtlSeconds = 0,
+                        unreadCount = 0,
+                        lastMessagePreview = "",
+                        lastTimestamp = packet.timestamp,
+                        isOnlineInMesh = true,
+                        avatarColorHex = "#10B981",
+                        bioStatus = "Группа в оверлее Yggdrasil",
+                        routeTransportSummary = "Yggdrasil Overlay 0200::/7 (${packet.rttMs} мс)",
+                        ownerProfileId = targetOwnerProfileId,
+                        chatType = "GROUP",
+                        groupId = packet.groupId
+                    )
+                    dao.upsertConversation(created)
+                    created
+                }
+        }
+
         // If this is a self-echo packet in a self-chat, match the exact targetChatId
-        if (packet.targetChatId.isNotBlank() && isSelfChatId(packet.targetChatId)) {
+        if (conv == null && packet.targetChatId.isNotBlank() && isSelfChatId(packet.targetChatId)) {
             conv = dao.getConversationById(packet.targetChatId)
         }
 
@@ -1008,6 +1245,7 @@ class YggRepository(
             conv = allConvs.find {
                 it.ownerProfileId == targetOwnerProfileId &&
                     !isSelfChatId(it.chatId) &&
+                    it.chatType != "GROUP" &&
                     sameMeshAddress(it.yggIpv6Address, packet.senderIpv6)
             }
         }
@@ -1142,19 +1380,23 @@ class YggRepository(
         }
 
         val isCurrentlyViewing = (targetOwnerProfileId == currentPrimaryProfileId) && (activeChatId == conv.chatId)
-        if (authenticatedSenderX25519Pub.isNotBlank() && authenticatedSenderX25519Pub != conv.peerX25519PublicKeyHex) {
-            conv = conv.copy(peerX25519PublicKeyHex = authenticatedSenderX25519Pub)
-        }
-        // An overlay-delivered frame carries the sender's node key authenticated by the
-        // Yggdrasil session. A LAN frame only claims it, but pinning is still safe: a key
-        // is accepted only when it reproduces the sender's mesh address, and finding a
-        // different key for the same 128-bit address is infeasible. This also heals
-        // contacts that were added by a bare IPv6 without a key.
-        val verifiedSenderKey = packet.senderPubKeyHex.trim().lowercase().takeIf {
-            isEd25519Hex(it) && YggCryptoEngine.addressMatchesEd25519Key(packet.senderIpv6, it)
-        }
-        if (verifiedSenderKey != null && !verifiedSenderKey.equals(conv.publicKeyHex, ignoreCase = true)) {
-            conv = conv.copy(publicKeyHex = verifiedSenderKey)
+        if (conv.chatType == "GROUP") {
+            mergeGroupRoster(conv.chatId, packet)
+        } else {
+            if (authenticatedSenderX25519Pub.isNotBlank() && authenticatedSenderX25519Pub != conv.peerX25519PublicKeyHex) {
+                conv = conv.copy(peerX25519PublicKeyHex = authenticatedSenderX25519Pub)
+            }
+            // An overlay-delivered frame carries the sender's node key authenticated by the
+            // Yggdrasil session. A LAN frame only claims it, but pinning is still safe: a key
+            // is accepted only when it reproduces the sender's mesh address, and finding a
+            // different key for the same 128-bit address is infeasible. This also heals
+            // contacts that were added by a bare IPv6 without a key.
+            val verifiedSenderKey = packet.senderPubKeyHex.trim().lowercase().takeIf {
+                isEd25519Hex(it) && YggCryptoEngine.addressMatchesEd25519Key(packet.senderIpv6, it)
+            }
+            if (verifiedSenderKey != null && !verifiedSenderKey.equals(conv.publicKeyHex, ignoreCase = true)) {
+                conv = conv.copy(publicKeyHex = verifiedSenderKey)
+            }
         }
         val previewPrefix = when (packet.attachmentType) {
             "VOICE" -> "🎤 Голосовое (${packet.voiceDurationSec}с) "
@@ -1190,6 +1432,7 @@ class YggRepository(
         return dao.getAllConversationsNow().firstOrNull {
             it.ownerProfileId == ownerProfileId &&
                 !isSelfChatId(it.chatId) &&
+                it.chatType != "GROUP" &&
                 sameMeshAddress(it.yggIpv6Address, senderIpv6)
         }?.chatId
     }
@@ -1328,6 +1571,12 @@ class YggRepository(
         }
         if (existingForProfile != null) {
             var repaired = existingForProfile
+            // The card is authored by the node owner, so a re-import is their rename.
+            // Without this the chat keeps the name from the first card and the second
+            // import looks like it silently did nothing.
+            if (title.isNotBlank() && existingForProfile.title != title.trim()) {
+                repaired = repaired.copy(title = title.trim())
+            }
             if (!sameMeshAddress(existingForProfile.yggIpv6Address, cleanIpv6)) {
                 repaired = repaired.copy(yggIpv6Address = cleanIpv6)
             }
@@ -1496,16 +1745,12 @@ class YggRepository(
 
     suspend fun updatePeersTransportProfile(
         whitelistMode: Boolean,
-        preferredSni: String,
-        utlsProfile: String
+        preferredSni: String
     ) {
         val all = dao.getAllPeersNow()
         val updated = all.map { p ->
             val newSni = if (whitelistMode && p.isWhitelistCompatible) preferredSni else p.sniDomain
-            p.copy(
-                sniDomain = newSni,
-                utlsFingerprint = if (p.transportType == "QUIC_UDP_PADDING") p.utlsFingerprint else utlsProfile
-            )
+            p.copy(sniDomain = newSni)
         }
         dao.insertPeers(updated)
     }

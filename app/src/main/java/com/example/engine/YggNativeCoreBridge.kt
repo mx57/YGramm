@@ -179,6 +179,60 @@ object YggNativeCoreBridge {
     }
 
     /**
+     * The URI exactly as the Go core must receive it.
+     *
+     * yggdrasil reads `?sni=<hostname>` off the peer URI (src/core/link.go) and uses it
+     * as the TLS ServerName, while Go's crypto/tls refuses to put an IP literal into SNI
+     * (RFC 6066) — which is what a `tls://95.217.35.148:443` link looks like on the wire:
+     * a handshake with no server name at all, on port 443, from a node whose traffic is
+     * being filtered. A hostname sniDomain turns that into an ordinary-looking HTTPS
+     * hello without touching any of the crypto: the overlay still peers with the same
+     * key, and the certificate is the node's own as before.
+     *
+     * Only tls:// honours it, so every other scheme and every value that is not a
+     * hostname is passed through unchanged instead of being silently rewritten.
+     */
+    fun corePeerUri(endpointUri: String, sniDomain: String): String {
+        val uri = endpointUri.trim()
+        if (!uri.startsWith("tls://") || uri.contains('?')) return uri
+        val sni = sniDomain.trim().lowercase().trim('.')
+        if (!isSniHostname(sni)) return uri
+        return "$uri?sni=$sni"
+    }
+
+    /**
+     * A dotted name Go's crypto/tls is willing to put in a ClientHello.
+     *
+     * "1.2.3.4" satisfies the label shape, so the pattern alone is not enough: an IP
+     * literal is exactly what RFC 6066 forbids as a server name, and Go drops it in
+     * silence instead of refusing the dial.
+     */
+    private fun isSniHostname(value: String): Boolean {
+        if (!value.matches(SNI_HOSTNAME)) return false
+        return !value.split('.').all { it.toIntOrNull() != null }
+    }
+
+    private val SNI_HOSTNAME =
+        Regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+    /**
+     * Whether this peer's handshake will actually name a host on the wire.
+     *
+     * Two ways to get there: a `?sni=` the tls:// link accepts, or a tls:// / wss:// URI
+     * whose own host is a name — those two link types already copy it into ServerName
+     * before any option is read. An IP endpoint without a usable sniDomain is the case
+     * that stays silent, and it is the one a filtering provider sees as a bare TLS hello.
+     */
+    fun sendsHostnameSni(endpointUri: String, sniDomain: String): Boolean {
+        val uri = endpointUri.trim()
+        if (corePeerUri(uri, sniDomain) != uri) return true
+        if (!uri.startsWith("tls://") && !uri.startsWith("wss://")) return false
+        val host = uri.substringAfter("://").substringBefore('/')
+            .substringBeforeLast(':').trimStart('[').trimEnd(']')
+        return isSniHostname(host)
+    }
+
+    /**
      * Interrupts the core's reconnect backoff so a node that lost its public
      * peers dials them again immediately.
      */

@@ -11,7 +11,10 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.net.NetworkRequest
+import android.util.Log
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -19,6 +22,8 @@ import com.example.data.BackupSnapshotEntity
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
 import com.example.data.CryptoKeyRecordEntity
+import com.example.data.GroupMemberCount
+import com.example.data.GroupMemberEntity
 import com.example.data.LinkedDeviceEntity
 import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
@@ -34,6 +39,7 @@ import com.example.engine.IncomingCallSignalPacket
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.SelfYggdrasilRelayResult
 import com.example.engine.YggAudioMediaEngine
+import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
@@ -51,6 +57,7 @@ import com.example.service.YggNotificationCenter
 import com.example.service.YggPopupNotificationItem
 import com.example.service.YggQuickReplyBus
 import com.example.ui.components.PendingProfileSwitchRequest
+import com.example.update.YGrammUpdateController
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
@@ -83,26 +90,35 @@ enum class YggNavTab {
     PROFILE_PRIVACY
 }
 
-enum class CensorshipPreset(val title: String, val badge: String, val summary: String) {
+enum class CensorshipPreset(
+    val title: String,
+    val badge: String,
+    val summary: String,
+    val implemented: Boolean = true
+) {
     RU_WHITELIST_CDN(
         title = "Обход Белых Списков (CDN WSS + RU SNI)",
         badge = "WHITELIST WSS",
-        summary = "Маскировка трафика Yggdrasil под HTTPS WebSocket через разрешенные инфраструктурные домены и CDN"
+        summary = "Пиры с транспортом wss:// и tls://: ядро подставляет выбранный разрешённый SNI-домен " +
+            "в ClientHello реального TLS-рукопожатия. Это единственная маска, которая уходит в трафик."
     ),
     TSPU_VLESS_SHADOWTLS(
         title = "ТСПУ Анти-Зондирование (VLESS + ShadowTLS v3)",
         badge = "VLESS + uTLS",
-        summary = "Туннелирование с отпечатками uTLS Chrome 128 / iOS 18 и защитой от активного пробинга ТСПУ"
+        summary = "Не реализовано",
+        implemented = false
     ),
     QUIC_UDP_OBFUSCATION(
         title = "Анти-Сигнатурный UDP (QUIC Padding + Jitter)",
         badge = "QUIC PADDED",
-        summary = "Выравнивание размеров датаграмм и шумовые префиксы против блокировки сигнатур Yggdrasil"
+        summary = "Не реализовано",
+        implemented = false
     ),
     AUTONOMOUS_DHT_DOH(
         title = "Шатдаун / Автономный Поиск (DHT BEP-44 + DoH)",
         badge = "DHT + DoH",
-        summary = "Бессерверный поиск входных пиров через BitTorrent Mainline DHT и подписанные Ed25519 списки"
+        summary = "Не реализовано",
+        implemented = false
     )
 }
 
@@ -129,11 +145,6 @@ data class AntiDpiConfigState(
         "ozone.ru"
     ),
     val utlsProfile: String = "HelloChrome_128_Auto",
-    val shadowTlsV3Enabled: Boolean = true,
-    val vlessRealityEnabled: Boolean = true,
-    val quicPaddingEnabled: Boolean = true,
-    val quicPaddingMTU: Int = 1360,
-    val dhtBep44BootstrapEnabled: Boolean = true,
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
     val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil..."
@@ -141,7 +152,7 @@ data class AntiDpiConfigState(
 
 data class DecentralizedUserProfile(
     val profileId: String = YggRepository.DEFAULT_PROFILE_ID,
-    val displayName: String = "Узел YggGram #1",
+    val displayName: String = "Узел YGramm #1",
     val handle: String = "@node1.ygg",
     val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
     val statusText: String = "В оверлее 200::/7 (Порт 51921)",
@@ -149,7 +160,9 @@ data class DecentralizedUserProfile(
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
     val relayedPacketsCount: Int = 0,
-    val profileFingerprintHex: String = ""
+    val profileFingerprintHex: String = "",
+    val avatarUri: String = "",
+    val avatarHashHex: String = ""
 )
 
 data class PrivacyMatrixState(
@@ -173,6 +186,7 @@ data class ActiveVoiceCallState(
     val chatId: String,
     val peerTitle: String,
     val peerIpv6: String,
+    val peerAvatarUri: String = "",
     // "DIALING_YGG", "RINGING_INCOMING", "ACTIVE_ENCRYPTED", "OFFLINE_ERROR"
     val callStatus: String,
     val statusSubtext: String,
@@ -220,6 +234,7 @@ data class YggGramUiState(
     val antiDpiConfig: AntiDpiConfigState = AntiDpiConfigState(),
     val peerScanner: PeerScannerState = PeerScannerState(),
     val coreMesh: YggNativeCoreBridge.CoreMeshState = YggNativeCoreBridge.CoreMeshState(available = false),
+    val overlayDrops: Long = 0L,
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
     val privacyMatrix: PrivacyMatrixState = PrivacyMatrixState(),
     val activeVoiceCall: ActiveVoiceCallState? = null,
@@ -276,6 +291,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         .distinctUntilChanged()
         .debounce(250L)
         .flatMapLatest { (profileId, query) -> repository.searchMessages(profileId, query) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Roster of the conversation that is open, empty for a 1:1 dialog. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val activeGroupMembers: StateFlow<List<GroupMemberEntity>> = _uiState
+        .map { it.selectedChatId.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { chatId -> repository.observeGroupMembers(chatId) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Member counts behind every group row, so the chat list states a real roster size. */
+    val groupMemberCounts: StateFlow<List<GroupMemberCount>> = repository
+        .observeGroupMemberCounts()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val typingExpiryJobs =
@@ -353,6 +381,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     activeChatId = _uiState.value.selectedChatId,
                     currentPrimaryProfileId = currentPrimaryId
                 )
+                // After the message, so the conversation row this writes onto already
+                // exists; the picture is checked against its own hash inside the codec.
+                repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
 
                 val targetProfileName = targetProfile?.displayName
                 val profileSuffix = if (targetProfile != null && targetProfile.profileId != currentPrimaryId) {
@@ -417,6 +448,29 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         },
         onDeliveryAckReceived = { chatId, messageId, rttMs ->
             viewModelScope.launch {
+                // The message row is authoritative for which chat an ACK belongs to: a group
+                // message confirmed by one member must not be written as delivered to all.
+                val ackedMsg = repository.getMessage(messageId)
+                val ackedChatId = ackedMsg?.chatId?.takeIf { it.isNotBlank() } ?: chatId
+                if (repository.getConversation(ackedChatId)?.chatType == "GROUP") {
+                    // The fan-out already stores this member in deliveredMemberCsv; the
+                    // callback only reports the running count.
+                    val ackedCount = ackedMsg?.deliveredMemberCsv
+                        ?.split(',').orEmpty().count { it.isNotBlank() }
+                    val memberTotal = repository.getGroupMembers(ackedChatId).size
+                    repository.updateConversationRouteStatus(
+                        chatId = ackedChatId,
+                        isOnline = true,
+                        routeSummary = "Группа • ACK участника (${rttMs} мс): подтверждено $ackedCount из $memberTotal"
+                    )
+                    _uiState.update {
+                        it.copy(
+                            rxPacketsCount = it.rxPacketsCount + 1,
+                            statusBannerMessage = "Участник группы подтвердил доставку ACK (${rttMs} мс): $ackedCount из $memberTotal"
+                        )
+                    }
+                    return@launch
+                }
                 repository.markMessageDelivered(messageId)
                 if (chatId.isNotBlank()) {
                     repository.updateConversationRouteStatus(
@@ -502,8 +556,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
-        onReadReceiptReceived = { _, ids ->
+        onReadReceiptReceived = { chatId, ids ->
             viewModelScope.launch {
+                // A group has no reader-of-record: one member's receipt would mark the
+                // message read for everybody, so group receipts are not applied.
+                if (repository.getConversation(chatId)?.chatType == "GROUP") return@launch
                 ids.forEach { repository.markOutgoingMessageRead(it) }
                 if (ids.isNotEmpty()) {
                     _uiState.update {
@@ -622,6 +679,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     )
 
     init {
+        YGrammUpdateController.attach(application)
         viewModelScope.launch {
             networkDpiController.antiDpiConfig.collect { cfg ->
                 _uiState.update { it.copy(antiDpiConfig = cfg) }
@@ -724,15 +782,37 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 delay(45_000L)
                 if (repository.getQueuedMessages().isEmpty()) continue
                 if (!networkEngine.isRealNetworkAvailable()) continue
-                flushQueuedMessagesOverRealNetwork()
+                flushQueuedMessagesOverRealNetwork("таймер 45 с")
             }
         }
 
         // The peer card must reflect the real Go core: only the core knows which
         // public links are up and which remote nodes its routing tree reached.
         viewModelScope.launch {
+            var lastMeshSignature = ""
+            var lastMeshChangeFlushAt = 0L
             while (true) {
                 refreshCoreMeshState()
+                // A new live link or a routing tree that grew is the moment a queued
+                // message can finally leave; waiting for the 45 s tick made the user
+                // watch «в очереди» long after the overlay had recovered. Debounced
+                // because a flapping peer changes the signature every few seconds.
+                val mesh = _uiState.value.coreMesh
+                if (mesh.available) {
+                    val signature = "${mesh.liveLinks}/${mesh.knownNodes}/" +
+                        mesh.upPeers.keys.sorted().joinToString(",")
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (signature != lastMeshSignature) {
+                        lastMeshSignature = signature
+                        if (now - lastMeshChangeFlushAt >= 12_000L &&
+                            networkEngine.isRealNetworkAvailable() &&
+                            repository.getQueuedMessages().isNotEmpty()
+                        ) {
+                            lastMeshChangeFlushAt = now
+                            flushQueuedMessagesOverRealNetwork("изменение mesh")
+                        }
+                    }
+                }
                 delay(8_000L)
             }
         }
@@ -744,7 +824,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             YggNativeCoreBridge.readMeshState(profileId)
         }
         _uiState.update {
-            it.copy(coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)))
+            it.copy(
+                coreMesh = state.copy(restartCount = networkEngine.coreRestartCount(profileId)),
+                overlayDrops = networkEngine.overlayDropTotal()
+            )
         }
         applyCoreLinkStatusToPeers(state)
     }
@@ -807,7 +890,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     isActiveInBackground = profileEntity.isActiveInBackground,
                     nodeRelayRole = profileEntity.nodeRelayRole,
                     relayedPacketsCount = profileEntity.relayedPacketsCount,
-                    profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
+                    profileFingerprintHex = "sha256_fp:${sigHash.take(44)}",
+                    avatarUri = profileEntity.avatarUri,
+                    avatarHashHex = profileEntity.avatarHashHex
                 )
             )
         }
@@ -1477,12 +1562,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     /**
      * Peers the nodes dial at boot. Connected ones come first because the core caps
      * the dial list — a stored peer that answered the last scan must not be pushed
-     * out by catalog entries that were never verified.
+     * out by catalog entries that were never verified. Among equals, the ones whose
+     * handshake names a host outrank the bare ones: on a filtered uplink those are the
+     * links that get through, and a capped list full of dropped handshakes has no route
+     * to the overlay at all.
      */
     private suspend fun storedPeerUrisForBoot(): List<String> =
         repository.getAllPeersNow()
-            .sortedByDescending { it.isConnected }
-            .map { it.endpointUri }
+            .sortedWith(
+                compareByDescending<YggPeerEntity> { it.isConnected }
+                    .thenByDescending { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
+            )
+            .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
 
     /**
      * Probes all configured peers in the routing table using real TCP/TLS sockets.
@@ -1700,12 +1791,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         if (!nextOffline) {
-            flushQueuedMessagesOverRealNetwork()
+            flushQueuedMessagesOverRealNetwork("выход из офлайна")
         }
     }
 
     private fun isConversationSelfNode(conv: ConversationEntity?, identity: DerivedIdentityHierarchy): Boolean {
         if (conv == null) return false
+        // A group row carries this node's own address as its owner, but it is a set of
+        // external members — sending to it is never a note to ourselves.
+        if (conv.chatType == "GROUP") return false
         return YggRepository.isSelfChatId(conv.chatId) ||
             conv.publicKeyHex.equals(identity.yggNodePublicKeyHex, ignoreCase = true) ||
             sameMeshAddress(conv.yggIpv6Address, identity.yggIpv6Address)
@@ -1728,7 +1822,118 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         return connectedFirst.map { Triple(it.endpointUri, it.sniDomain, it.regionLabel) }
     }
 
-    private fun flushQueuedMessagesOverRealNetwork() {
+    /**
+     * Fan a group note out over the mesh, one frame per roster member.
+     *
+     * Yggdrasil has no multicast and there is no server, so a group is only a set of 1:1
+     * overlay links that all carry the same groupId and the same advertised roster; members
+     * learn the roster from the frames themselves. Acknowledgements are counted per address
+     * and the message turns DELIVERED only when the whole roster has acked, because a group
+     * of five with two nodes offline has not been delivered to.
+     *
+     * @return acknowledged members, members a frame reached, and the roster size.
+     */
+    private suspend fun dispatchGroupMessage(
+        conv: ConversationEntity,
+        msg: MessageEntity,
+        attachmentBase64: String?
+    ): Triple<Int, Int, Int> {
+        val state = _uiState.value
+        val identity = state.identity
+        val members = repository.getGroupMembers(conv.chatId)
+        if (members.isEmpty() || identity.yggIpv6Address.isBlank())
+            return Triple(0, 0, members.size)
+
+        val roster = (members.map { it.memberIpv6.lowercase() to it.memberPubKeyHex.lowercase() } +
+            (identity.yggIpv6Address.lowercase() to identity.yggNodePublicKeyHex.lowercase()))
+            .filter { it.first.contains(":") }
+            .distinctBy { it.first }
+            .take(64)
+        val rosterCsv = roster.joinToString(",") { "${it.first}|${it.second}" }
+        val candidatePeers = buildCandidateExternalPeersList()
+        val avatarBase64 = YggAvatarCodec.base64OfStoredFile(state.userProfile.avatarUri).orEmpty()
+
+        var acked = 0
+        var routed = 0
+        members.forEach { member ->
+            // The member's own contact row is used when it exists: it carries the direct
+            // endpoint hint and the X25519 key pinned by past conversations. A member added
+            // only through someone else's roster notice has no row yet, so it is addressed
+            // by what the frame advertised.
+            val known = conversations.value.firstOrNull {
+                it.ownerProfileId == conv.ownerProfileId &&
+                    it.chatType != "GROUP" &&
+                    sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+            }
+            val memberConv = known
+                ?: conv.copy(
+                    yggIpv6Address = member.memberIpv6,
+                    publicKeyHex = member.memberPubKeyHex,
+                    peerX25519PublicKeyHex = ""
+                )
+            val peerIdentity = repository.resolvePeerNodeIdentity(memberConv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { member.memberIpv6 }
+            if (peerIpv6.isBlank()) return@forEach
+            val result = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
+                chatId = conv.chatId,
+                messageId = msg.messageId,
+                peerTitle = member.memberName.ifBlank { memberConv.title },
+                peerIpv6 = peerIpv6,
+                directEndpointHint = extractDirectEndpointHint(memberConv),
+                senderNodeLabel = state.userProfile.displayName,
+                senderIpv6 = identity.yggIpv6Address,
+                senderPubKeyHex = identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                plainText = msg.plainText,
+                cipherPayloadHex = msg.cipherPayloadHex,
+                hashcashToken = msg.hashcashPowToken,
+                attachmentName = msg.attachmentName,
+                attachmentSizeBytes = msg.attachmentSizeBytes,
+                candidatePeers = candidatePeers,
+                allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery,
+                attachmentType = msg.attachmentType,
+                attachmentUri = msg.attachmentUri,
+                attachmentBase64 = attachmentBase64,
+                voiceDurationSec = msg.voiceDurationSec,
+                voiceWaveformCsv = msg.voiceWaveformCsv,
+                replyToMessageId = msg.replyToMessageId,
+                forwardedFrom = msg.forwardedFrom,
+                senderAvatarHash = state.userProfile.avatarHashHex,
+                senderAvatarBase64 = avatarBase64,
+                groupId = conv.groupId,
+                groupTitle = conv.title,
+                groupMembersCsv = rosterCsv
+            )
+            if (result.delivered) routed++
+            if (result.relayEndpointUri.isNotBlank() && result.rttMs > 0) {
+                repository.updatePeerTrafficByEndpoint(
+                    endpointUri = result.relayEndpointUri,
+                    rttMs = result.rttMs.toInt(),
+                    txDelta = result.txBytes,
+                    rxDelta = result.rxBytes
+                )
+            }
+            if (result.endToEndConfirmed) {
+                repository.recordGroupMemberDelivery(msg.messageId, peerIpv6)
+                acked++
+            } else if (result.delivered) {
+                repository.markMessageSentP2P(msg.messageId)
+            }
+        }
+        repository.updateConversationRouteStatus(
+            chatId = conv.chatId,
+            isOnline = routed > 0,
+            routeSummary = when {
+                acked == members.size -> "Группа • доставлено всем: $acked из ${members.size}"
+                acked > 0 -> "Группа • подтверждено ACK: $acked из ${members.size}"
+                routed > 0 -> "Группа • передано в оверлей: $routed из ${members.size}, ACK пока нет"
+                else -> "Группа • нет подтвержденного маршрута ни к одному участнику"
+            }
+        )
+        return Triple(acked, routed, members.size)
+    }
+
+    private fun flushQueuedMessagesOverRealNetwork(trigger: String = "внешний вызов") {
         viewModelScope.launch {
             updateConnectivitySnapshot()
             val hasInternet = networkEngine.isRealNetworkAvailable()
@@ -1739,6 +1944,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
             val app = getApplication<Application>()
             val queued = repository.getQueuedMessages()
+            // Which trigger fired matters when a queue drains late: in logcat the 45 s
+            // timer and the mesh-change path are otherwise indistinguishable.
+            Log.d("YggSF", "flush(${trigger}): сообщений в очереди ${queued.size}")
             var deliveredCount = 0
             var confirmedCount = 0
             var unreadableAttachments = 0
@@ -1772,6 +1980,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     // separately by the overlay probe.
                     repository.markMessageLocalNote(msg.messageId)
                     deliveredCount++
+                } else if (conv.chatType == "GROUP") {
+                    val (acked, routed, total) = dispatchGroupMessage(conv, msg, attachmentBase64)
+                    if (acked == total && total > 0) confirmedCount++
+                    if (routed > 0) deliveredCount++
                 } else {
                     val directHint = extractDirectEndpointHint(conv)
                     val peerIdentity = repository.resolvePeerNodeIdentity(conv)
@@ -1796,7 +2008,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentUri = msg.attachmentUri,
                         attachmentBase64 = attachmentBase64,
                         voiceDurationSec = msg.voiceDurationSec,
-                        voiceWaveformCsv = msg.voiceWaveformCsv
+                        voiceWaveformCsv = msg.voiceWaveformCsv,
+                        senderAvatarHash = _uiState.value.userProfile.avatarHashHex,
+                        senderAvatarBase64 = YggAvatarCodec
+                            .base64OfStoredFile(_uiState.value.userProfile.avatarUri).orEmpty()
                     )
                     if (overlayRelay.delivered) {
                         deliveredCount++
@@ -1889,6 +2104,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (wireIds.isEmpty()) return
         repository.markIncomingMessagesRead(chatId)
         val conv = repository.getConversation(chatId) ?: return
+        // Receipts and typing are 1:1 frames; a group has no single peer to address and a
+        // receipt sent to one member would claim the whole group read it.
+        if (conv.chatType == "GROUP") return
         val state = _uiState.value
         if (conv.ownerProfileId.isNotBlank() && conv.ownerProfileId != state.currentProfileId) return
         val peerIdentity = repository.resolvePeerNodeIdentity(conv)
@@ -2052,6 +2270,26 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
 
             _uiState.update { it.copy(txPacketsCount = it.txPacketsCount + 1) }
+
+            if (targetConv?.chatType == "GROUP") {
+                val (acked, routed, total) = dispatchGroupMessage(targetConv, savedMsg, attachmentBase64)
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            total == 0 -> "В группе «${targetConv.title}» нет участников — добавьте контакты"
+                            acked == total -> "Группа «${targetConv.title}»: доставлено всем ($acked из $total)"
+                            acked > 0 -> "Группа «${targetConv.title}»: ACK подтверждены только $acked из $total"
+                            routed > 0 ->
+                                "Группа «${targetConv.title}»: передано $routed из $total, ACK пока не получен — нажмите «Повторить»"
+                            else ->
+                                "Группа «${targetConv.title}»: нет подтвержденного маршрута ни к одному участнику, сообщения в очереди S&F"
+                        }
+                    )
+                }
+                syncForegroundServiceNotification()
+                return@launch
+            }
+
             val candidatePeers = buildCandidateExternalPeersList()
 
             // Check if sending to self ("Избранное • Мой узел Yggdrasil" or own IPv6/PubKey)
@@ -2095,7 +2333,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 voiceDurationSec = voiceDurationSec,
                 voiceWaveformCsv = voiceWaveformCsv,
                 replyToMessageId = wireQuoteId,
-                forwardedFrom = forwardedFrom
+                forwardedFrom = forwardedFrom,
+                senderAvatarHash = currentState.userProfile.avatarHashHex,
+                senderAvatarBase64 = YggAvatarCodec
+                    .base64OfStoredFile(currentState.userProfile.avatarUri).orEmpty()
             )
 
             if (overlayResult.delivered) {
@@ -2222,6 +2463,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val conv = repository.getConversation(chatId) ?: return@launch
             if (isConversationSelfNode(conv, state.identity)) return@launch
+            // A typing frame is addressed to one node; sending it to a single member would
+            // imply the whole group was notified.
+            if (conv.chatType == "GROUP") return@launch
             val peerIdentity = repository.resolvePeerNodeIdentity(conv)
             val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
             if (peerIpv6.isBlank()) return@launch
@@ -2250,6 +2494,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val conv = repository.getConversation(updated.chatId) ?: return@launch
             // Self-chat notes never leave the device; there is no peer to notify.
             if (YggRepository.isSelfChatId(conv.chatId)) return@launch
+            // A reaction frame reaches one node, so it cannot claim the group reacted.
+            // The local reaction the caller just made stays stored.
+            if (conv.chatType == "GROUP") return@launch
 
             val addedByMe = YggRepository.parseReactionsMap(updated.reactionsJson)[emoji]?.second == true
             // The peer must receive the id its own copy of the message uses.
@@ -2293,6 +2540,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun addContactFromQrPayload(
         parsedQr: com.example.engine.ParsedYggContactQr
     ) {
+        // A damaged ?pub= never addresses a node on the overlay, so a card without any
+        // other usable route is refused instead of becoming a chat that queues forever.
+        if (parsedQr.nodeKeyProblem.isNotBlank() && parsedQr.directLanHint.isBlank()) {
+            val reason = "${parsedQr.nodeKeyProblem}. Контакт «${parsedQr.displayName}» не добавлен: " +
+                "попросите владельца узла экспортировать визитку заново"
+            _uiState.update { it.copy(statusBannerMessage = reason) }
+            // The banner slot is shared with routine autopilot notices that replace it
+            // within seconds, so the refusal reason is shown on its own as well.
+            Toast.makeText(getApplication(), reason, Toast.LENGTH_LONG).show()
+            return
+        }
+        val knownChatIdsBefore = conversations.value.map { it.chatId }.toSet()
         viewModelScope.launch {
             val newChatId = withContext(Dispatchers.IO) {
                 repository.createNewConversation(
@@ -2306,6 +2565,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     peerEd25519PublicKeyHex = parsedQr.ed25519PubKeyHex
                 )
             }
+            // A card for a node that is already a contact reuses that chat, so say so
+            // instead of reporting a second contact the user will never find in the list.
+            val wasAlreadyInContacts = newChatId in knownChatIdsBefore
             if (parsedQr.directLanHint.isNotBlank()) {
                 withContext(Dispatchers.IO) {
                     networkEngine.registerDirectEndpointForPeer(parsedQr.yggIpv6Address, parsedQr.directLanHint)
@@ -2322,9 +2584,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         YggRepository.isSelfChatId(newChatId) ->
                             "Распознан ваш собственный QR-код: открыт чат «Избранное • Мой узел Yggdrasil»"
                         hasNodeKey ->
-                            "По QR-коду добавлен контакт «${parsedQr.displayName}»: Ed25519-ключ совпадает с адресом узла"
+                            (if (wasAlreadyInContacts)
+                                "Контакт «${parsedQr.displayName}» уже был в списке: визитка обновила его имя, адрес и ключ"
+                            else
+                                "По QR-коду добавлен контакт «${parsedQr.displayName}»") +
+                                ": Ed25519-ключ совпадает с адресом ${createdConv?.yggIpv6Address.orEmpty()}"
                         createdLanHint.isNotBlank() ->
-                            "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint), оверлей требует полный ?pub=…"
+                            "Контакт «${parsedQr.displayName}» добавлен: доступен прямой LAN-маршрут ($createdLanHint). " +
+                                parsedQr.nodeKeyProblem.ifBlank { "Оверлей требует полный ?pub=…" }
                         else ->
                             "Контакт «${parsedQr.displayName}» добавлен без Ed25519-ключа: сообщения через оверлей недоставимы, нужен полный идентификатор"
                     }
@@ -2348,6 +2615,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             if (YggRepository.isSelfChatId(conv.chatId) || isConversationSelfNode(conv, current.identity)) {
                 _uiState.update {
                     it.copy(statusBannerMessage = "Нельзя позвонить собственному узлу: выберите чат с собеседником")
+                }
+                return@launch
+            }
+            if (conv.chatType == "GROUP") {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Групповой звонок не поддерживается: вызов идёт на один узел, откройте личный чат участника")
                 }
                 return@launch
             }
@@ -2410,6 +2683,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         chatId = conv.chatId,
                         peerTitle = conv.title,
                         peerIpv6 = peerIpv6,
+                        peerAvatarUri = conv.avatarUri,
                         callStatus = "DIALING_YGG",
                         statusSubtext = "Отправка зашифрованного сигнала вызова через Yggdrasil...",
                         verificationEmojis = if (peerKeyKnownAtDial) {
@@ -2782,12 +3056,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         activeCallJob?.cancel()
         activeCallJob = null
         val targetIsCurrent = targetProfile.profileId == _uiState.value.currentProfileId
+        val callerAvatarUri = conversations.value
+            .find { it.chatId == conversationChatId }?.avatarUri.orEmpty()
         _uiState.update {
             it.copy(
                 activeVoiceCall = ActiveVoiceCallState(
                     chatId = conversationChatId,
                     peerTitle = callerTitle,
                     peerIpv6 = callSig.callerIpv6,
+                    peerAvatarUri = callerAvatarUri,
                     callStatus = "RINGING_INCOMING",
                     statusSubtext = "Входящий зашифрованный вызов (${callSig.transport}) • примите или отклоните",
                     verificationEmojis = buildCallVerificationEmojis(
@@ -3340,6 +3617,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 repository.markMessageLocalNote(message.messageId)
                 val outcome = networkEngine.probeOverlayRoundTrip(currentState.currentProfileId)
                 applyOverlayProbeOutcome(outcome, conv.chatId)
+            } else if (conv.chatType == "GROUP") {
+                val (acked, routed, total) = dispatchGroupMessage(conv, message, attachmentBase64)
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = when {
+                            total == 0 -> "В группе нет участников: сначала добавьте контакты"
+                            acked == total -> "Повтор в группу: доставлено всем ($acked из $total)"
+                            else -> "Повтор в группу: ACK $acked из $total, кадров передано: $routed"
+                        }
+                    )
+                }
             } else {
                 val peerIdentity = repository.resolvePeerNodeIdentity(conv)
                 val overlayRes = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
@@ -3601,7 +3889,68 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         networkDpiController.connectTopFastestPeersInSelectedCountry()
     }
 
-    fun createNewChatOrGroup(
+    /**
+     * Opening a group from the contacts this profile already has dialogs with.
+     *
+     * Nothing leaves the device yet: on a mesh with no server, the group only becomes real
+     * to the other nodes when the first message goes out, because that frame carries its
+     * identifier and its roster.
+     */
+    fun createGroup(title: String, memberContactChatIds: List<String>) {
+        val picked = memberContactChatIds.filter { it.isNotBlank() }
+        if (picked.isEmpty()) {
+            _uiState.update {
+                it.copy(statusBannerMessage = "Группа не создана: выберите хотя бы один контакт")
+            }
+            return
+        }
+        viewModelScope.launch {
+            val newChatId = withContext(Dispatchers.IO) {
+                repository.createNewGroup(
+                    title = title,
+                    memberContactChatIds = picked,
+                    ownerProfileId = _uiState.value.currentProfileId,
+                    localIdentity = _uiState.value.identity
+                )
+            }
+            if (newChatId.isBlank()) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Группа не создана: у выбранных контактов нет адреса узла в оверлее"
+                    )
+                }
+                return@launch
+            }
+            val rosterSize = withContext(Dispatchers.IO) { repository.getGroupMembers(newChatId).size }
+            _uiState.update {
+                it.copy(
+                    selectedChatId = newChatId,
+                    statusBannerMessage = "Группа создана, участников: ${rosterSize + 1}. " +
+                        "Она станет видима остальным с первым отправленным сообщением"
+                )
+            }
+        }
+    }
+
+    /** @param memberContactChatIds local chat ids of the contacts to fold into the group. */
+    fun addContactsToGroup(chatId: String, memberContactChatIds: List<String>) {
+        viewModelScope.launch {
+            val added = withContext(Dispatchers.IO) {
+                repository.addContactsToGroup(chatId, memberContactChatIds)
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (added > 0) {
+                        "Участников добавлено: $added. Новый состав уйдёт с следующим сообщением в группу"
+                    } else {
+                        "Добавлять нечего: эти контакты уже в группе или у них нет адреса узла"
+                    }
+                )
+            }
+        }
+    }
+
+    fun createNewChat(
         title: String,
         yggIpv6Input: String,
         disappearingSeconds: Int
@@ -3736,7 +4085,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 isConnected = probe.reachable,
                 whitelistCompatible = whitelistCompatible
             )
-            val core = networkEngine.applyPeerChangeToCores(endpointUri.trim(), enabled = true)
+            val core = networkEngine.applyPeerChangeToCores(
+                endpointUri.trim(),
+                enabled = true,
+                sniDomain = sniDomain
+            )
+
             _uiState.update {
                 it.copy(
                     statusBannerMessage = when {
@@ -3771,7 +4125,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     rxDelta = probe.rxBytes,
                     txDelta = probe.txBytes
                 )
-                val core = networkEngine.applyPeerChangeToCores(peer.endpointUri, enabled = true)
+                val core = networkEngine.applyPeerChangeToCores(
+                    peer.endpointUri,
+                    enabled = true,
+                    sniDomain = peer.sniDomain
+                )
+
                 // Reachability of the port says nothing about the Yggdrasil link: only
                 // the node can say whether it actually brought the peer up.
                 val linkLine = if (core.applied > 0) " • линков ядра: ${core.liveLinks} из ${core.totalLinks}" else ""
@@ -3899,7 +4258,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = "Создан зашифрованный бэкап ${snapshot.archiveFileName} (${snapshot.chunkCountFastCdc} чанков FastCDC)"
+                    statusBannerMessage = "Сохранён снимок метаданных ${snapshot.archiveFileName}. " +
+                        "Файла архива на диске нет: экспорт шифрованной базы ещё не реализован"
                 )
             }
         }
@@ -3907,9 +4267,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun verifyOrRestoreBackup(snapshot: BackupSnapshotEntity, isRestore: Boolean) {
         val msg = if (isRestore) {
-            "Восстановлено состояние из архива ${snapshot.archiveFileName} (Merkle SHA-256: ${snapshot.merkleRootHex.take(12)}...)"
+            "Восстановление из ${snapshot.archiveFileName} выполнено быть не может: реального архива нет, " +
+                "изменены только записи об этом снимке"
         } else {
-            "Проверка полинома Poly1305 и дерева Merkle для ${snapshot.archiveFileName} пройдена успешно"
+            "Сводка ${snapshot.archiveFileName} посчитана по метаданным снимка: ни Poly1305, " +
+                "ни дерево Merkle от файла архива не проверялись — самого файла нет"
         }
         _uiState.update { it.copy(statusBannerMessage = msg) }
     }
@@ -3950,6 +4312,42 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(statusBannerMessage = "Профиль сохранён • отпечаток вычислен по ключу узла")
             }
+        }
+    }
+
+    /**
+     * Setting the profile picture from the gallery.
+     *
+     * Nothing is announced as changed unless the codec produced a file: the avatar travels
+     * inside the message frame, so a picture too large to fit there has no honest delivery
+     * path and must not quietly become a half-cropped one.
+     */
+    fun setProfileAvatar(source: Uri) {
+        viewModelScope.launch {
+            val profileId = _uiState.value.currentProfileId
+            val updated = repository.setProfileAvatar(profileId, source)
+            if (updated != null) {
+                applyUserProfileEntityToState(updated)
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Фото профиля обновлено • будет передано при следующем сообщении")
+                }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Фото не подходит: нужен файл, из которого получится квадрат до ${YggAvatarCodec.MAX_JPEG_BYTES / 1000} КБ"
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearProfileAvatar() {
+        viewModelScope.launch {
+            val profileId = _uiState.value.currentProfileId
+            repository.clearProfileAvatar(profileId)
+            repository.getAllProfilesNow().find { it.profileId == profileId }
+                ?.let { applyUserProfileEntityToState(it) }
+            _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
         }
     }
 

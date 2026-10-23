@@ -84,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.YggPeerEntity
 import com.example.engine.DiscoveredYggPeer
+import com.example.engine.YggNativeCoreBridge
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
@@ -375,7 +376,8 @@ fun NetworkDpiScreen(
                                             shape = RoundedCornerShape(8.dp)
                                         ) {
                                             Text(
-                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $liveRoutes",
+                                                text = "TX:${uiState.txPacketsCount} • RX:${uiState.rxPacketsCount} • Пиров: $liveRoutes" +
+                                                    if (uiState.overlayDrops > 0) " • Потери кадров: ${uiState.overlayDrops}" else "",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = CyberTealSecondary,
                                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -631,6 +633,28 @@ fun NetworkDpiScreen(
                             )
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    // One click for the whole table: the per-peer copy could not keep up
+                                    // with a set that changes while the user is still selecting rows.
+                                    clipboard.setPrimaryClip(
+                                        ClipData.newPlainText(
+                                            "Yggdrasil Peers",
+                                            peers.joinToString("\n") { it.endpointUri }
+                                        )
+                                    )
+                                    Toast.makeText(context, "Скопировано пиров: ${peers.size}", Toast.LENGTH_SHORT).show()
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                modifier = Modifier.testTag("copy_all_peers_button")
+                            ) {
+                                Icon(
+                                    Icons.Default.ContentCopy,
+                                    contentDescription = "Скопировать все пиры",
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
                             OutlinedButton(
                                 onClick = { showBulkImportDialog = true },
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
@@ -918,7 +942,7 @@ fun NetworkDpiScreen(
                                         color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.outlineVariant,
                                         shape = RoundedCornerShape(14.dp)
                                     )
-                                    .clickable { onSelectPreset(preset) }
+                                    .clickable(enabled = preset.implemented) { onSelectPreset(preset) }
                                     .testTag("preset_card_${preset.name}"),
                                 shape = RoundedCornerShape(14.dp),
                                 colors = CardDefaults.cardColors(
@@ -960,18 +984,33 @@ fun NetworkDpiScreen(
                                                 shape = RoundedCornerShape(6.dp)
                                             ) {
                                                 Text(
-                                                    text = preset.badge,
+                                                    text = if (preset.implemented) preset.badge else "НЕТ В СБОРКЕ",
                                                     style = MaterialTheme.typography.labelSmall,
-                                                    color = if (isSelected) EmeraldPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    color = if (!preset.implemented) {
+                                                        MaterialTheme.colorScheme.error
+                                                    } else if (isSelected) {
+                                                        EmeraldPrimary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                                    },
                                                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                                 )
                                             }
                                         }
                                         Spacer(modifier = Modifier.height(3.dp))
                                         Text(
-                                            text = preset.summary,
+                                            text = if (preset.implemented) {
+                                                preset.summary
+                                            } else {
+                                                "В этой сборке не реализовано: такой маскировки в трафике нет, " +
+                                                    "профиль выбрать нельзя."
+                                            },
                                             style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            color = if (preset.implemented) {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            } else {
+                                                MaterialTheme.colorScheme.error
+                                            }
                                         )
                                     }
                                 }
@@ -1035,6 +1074,13 @@ fun NetworkDpiScreen(
                                     style = MaterialTheme.typography.titleMedium
                                 )
                             }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Ядро uTLS не использует: ClientHello собирает TLS-стек Android, поэтому выбор " +
+                                    "профиля сохраняется в базе пиров, но на трафик не влияет.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(
                                 modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -1076,12 +1122,16 @@ fun NetworkDpiScreen(
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Text(
-                                text = "Модули защиты от анализа трафика (DPI / ТСПУ)",
+                                text = "Что реально меняет трафик",
                                 style = MaterialTheme.typography.titleMedium
                             )
 
                             Text(
-                                text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                                text = "Работает: пир считается живым только после реального TLS-рукопожатия с " +
+                                    "подменой SNI и ответа по протоколу Yggdrasil; для wss://-пиров фреймы идут " +
+                                    "поверх WebSocket на 443.\n" +
+                                    "Не реализовано и переключателей нет: uTLS-подмена фингерпринта, VLESS Reality, " +
+                                    "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1092,30 +1142,6 @@ fun NetworkDpiScreen(
                                 checked = cfg.whitelistCdnWssEnabled,
                                 tag = "switch_whitelist_wss",
                                 onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
-                            )
-
-                            DpiSwitchRow(
-                                title = "ShadowTLS v3 + VLESS Reality (Защита от активного пробинга)",
-                                subtitle = "Перенаправление неавторизованных проверок ТСПУ на реальный TLS-сертификат домена SNI",
-                                checked = cfg.shadowTlsV3Enabled && cfg.vlessRealityEnabled,
-                                tag = "switch_shadowtls_vless",
-                                onToggle = { onToggleAntiDpiFlag("SHADOWTLS") }
-                            )
-
-                            DpiSwitchRow(
-                                title = "Обфускация QUIC UDP (Выравнивание пакетов до ${cfg.quicPaddingMTU} байт)",
-                                subtitle = "Скрывает сигнатуры рукопожатия протокола Yggdrasil и статистику длин пакетов",
-                                checked = cfg.quicPaddingEnabled,
-                                tag = "switch_quic_padding",
-                                onToggle = { onToggleAntiDpiFlag("QUIC_PAD") }
-                            )
-
-                            DpiSwitchRow(
-                                title = "Автономный Bootstrap: BitTorrent Mainline DHT (BEP-44) + DoH",
-                                subtitle = "Поиск подписанных Ed25519 списков пиров без обращения к заблокированным каталогам",
-                                checked = cfg.dhtBep44BootstrapEnabled,
-                                tag = "switch_dht_bep44",
-                                onToggle = { onToggleAntiDpiFlag("DHT_BEP44") }
                             )
                         }
                     }
@@ -1451,7 +1477,10 @@ private fun PeerNodeCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "SNI: ${peer.sniDomain} • ${peer.utlsFingerprint}",
+                        text = if (YggNativeCoreBridge.corePeerUri(peer.endpointUri, peer.sniDomain) != peer.endpointUri)
+                            "SNI в ClientHello: ${peer.sniDomain} • ${peer.utlsFingerprint}"
+                        else
+                            "SNI НЕ отправляется: ${peer.sniDomain.ifBlank { "не задан" }} • ${peer.utlsFingerprint}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -1754,12 +1783,13 @@ private fun SimpleNetworkShieldContent(
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
 
-                    // Key telemetry metrics in 3 columns
+                    // Key telemetry metrics in 3 columns. Without weights the long exit-node label
+                    // below starves the other two columns and their captions wrap one letter per line.
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1.7f)) {
                             Text(
                                 text = "УЗЕЛ ВЫХОДА",
                                 style = MaterialTheme.typography.labelSmall,
@@ -1775,10 +1805,14 @@ private fun SimpleNetworkShieldContent(
                                 overflow = TextOverflow.Ellipsis
                             )
                         }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Column(
+                            modifier = Modifier.weight(0.9f),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
                             Text(
                                 text = "ЗАДЕРЖКА",
                                 style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(3.dp))
@@ -1786,13 +1820,18 @@ private fun SimpleNetworkShieldContent(
                                 text = if (bestLatency > 0) "$bestLatency мс" else "—",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Bold,
+                                maxLines = 1,
                                 color = if (bestLatency in 1..120) EmeraldPrimary else MaterialTheme.colorScheme.onSurface
                             )
                         }
-                        Column(horizontalAlignment = Alignment.End) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            horizontalAlignment = Alignment.End
+                        ) {
                             Text(
                                 text = "ТРАНСПОРТ",
                                 style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(3.dp))
@@ -1803,6 +1842,8 @@ private fun SimpleNetworkShieldContent(
                                     ?.takeIf { it.isNotBlank() } ?: "нет линка",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 color = CyberTealSecondary
                             )
                         }
@@ -1989,7 +2030,8 @@ private fun SimpleNetworkShieldContent(
                     )
 
                     Text(
-                        text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                        text = "Работает: подмена SNI в реальном TLS-рукопожатии и транспорт wss:// на 443.\n" +
+                            "Не реализовано: uTLS-фингерпринт, VLESS Reality, ShadowTLS v3, padding QUIC, DHT BEP-44.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2000,22 +2042,6 @@ private fun SimpleNetworkShieldContent(
                         checked = cfg.whitelistCdnWssEnabled,
                         tag = "simple_switch_whitelist_mode",
                         onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
-                    )
-
-                    DpiSwitchRow(
-                        title = "Защита от активного пробинга (VLESS Reality)",
-                        subtitle = "Отклоняет зондирующие пакеты цензурных сканеров с отпечатком uTLS Chrome 128",
-                        checked = cfg.vlessRealityEnabled,
-                        tag = "simple_switch_vless_mode",
-                        onToggle = { onToggleAntiDpiFlag("VLESS") }
-                    )
-
-                    DpiSwitchRow(
-                        title = "Анти-сигнатурный Padding (MTU ${cfg.quicPaddingMTU})",
-                        subtitle = "Скрывает длины сообщений и голосовых пакетов от DPI-сигнатур",
-                        checked = cfg.quicPaddingEnabled,
-                        tag = "simple_switch_quic_padding",
-                        onToggle = { onToggleAntiDpiFlag("QUIC_PAD") }
                     )
                 }
             }
@@ -2046,7 +2072,7 @@ private fun SimpleNetworkShieldContent(
                         )
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "Кастомные SNI, uTLS профили, ShadowTLS v3, живой терминал пакетов и ручные маршруты",
+                            text = "Кастомные SNI-домены, ручной выбор транспорта у пира, живой терминал пакетов и ручные маршруты",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
