@@ -1486,7 +1486,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private suspend fun storedPeerUrisForBoot(): List<String> =
         repository.getAllPeersNow()
             .sortedByDescending { it.isConnected }
-            .map { it.endpointUri }
+            .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
 
     /**
      * Probes all configured peers in the routing table using real TCP/TLS sockets.
@@ -3740,7 +3740,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 isConnected = probe.reachable,
                 whitelistCompatible = whitelistCompatible
             )
-            val core = networkEngine.applyPeerChangeToCores(endpointUri.trim(), enabled = true)
+            val core = networkEngine.applyPeerChangeToCores(
+                endpointUri.trim(),
+                enabled = true,
+                sniDomain = sniDomain
+            )
+
             _uiState.update {
                 it.copy(
                     statusBannerMessage = when {
@@ -3775,7 +3780,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     rxDelta = probe.rxBytes,
                     txDelta = probe.txBytes
                 )
-                val core = networkEngine.applyPeerChangeToCores(peer.endpointUri, enabled = true)
+                val core = networkEngine.applyPeerChangeToCores(
+                    peer.endpointUri,
+                    enabled = true,
+                    sniDomain = peer.sniDomain
+                )
+
                 // Reachability of the port says nothing about the Yggdrasil link: only
                 // the node can say whether it actually brought the peer up.
                 val linkLine = if (core.applied > 0) " • линков ядра: ${core.liveLinks} из ${core.totalLinks}" else ""

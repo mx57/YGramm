@@ -5,7 +5,6 @@ go 1.25.0
 
 require (
 	github.com/Arceliar/ironwood v0.0.0-20260613025018-d50055b11f5e
-	github.com/refraction-networking/utls v1.6.7
 	github.com/yggdrasil-network/yggdrasil-go v0.5.14
 	golang.org/x/crypto v0.53.0
 )

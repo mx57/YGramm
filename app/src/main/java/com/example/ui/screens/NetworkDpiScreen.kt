@@ -84,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.YggPeerEntity
 import com.example.engine.DiscoveredYggPeer
+import com.example.engine.YggNativeCoreBridge
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
@@ -1082,7 +1083,7 @@ fun NetworkDpiScreen(
                             )
 
                             Text(
-                                text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                                text = "Только SNI реально уходит в транспорт: для tls:// пира с доменным именем в базе ядро ставит его в ClientHello. uTLS-профиль, Reality и padding в трафик не передаются.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1452,7 +1453,10 @@ private fun PeerNodeCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "SNI: ${peer.sniDomain} • ${peer.utlsFingerprint}",
+                        text = if (YggNativeCoreBridge.corePeerUri(peer.endpointUri, peer.sniDomain) != peer.endpointUri)
+                            "SNI в ClientHello: ${peer.sniDomain} • ${peer.utlsFingerprint}"
+                        else
+                            "SNI НЕ отправляется: ${peer.sniDomain.ifBlank { "не задан" }} • ${peer.utlsFingerprint}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -1990,7 +1994,7 @@ private fun SimpleNetworkShieldContent(
                     )
 
                     Text(
-                        text = "Ни один переключатель ниже не меняет трафик: ядро подключается к пиру обычным TLS, а SNI и uTLS-профиль лежат в базе пиров и в транспорт пока не передаются.",
+                        text = "Только SNI реально уходит в транспорт: для tls:// пира с доменным именем в базе ядро ставит его в ClientHello. uTLS-профиль, Reality и padding в трафик не передаются.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

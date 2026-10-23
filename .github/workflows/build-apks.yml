@@ -61,7 +61,10 @@ jobs:
 
       - name: Run unit tests and build both variants
         run: |
-          gradle :app:testDebugUnitTest --tests com.example.ExampleUnitTest
+          # The whole suite, not one class: the Robolectric tests are the ones that
+          # prove delivery, peer truth and clean start, and filtering them out left
+          # regressions merging with a green check.
+          gradle :app:testDebugUnitTest
           gradle :app:assembleDebug
           # Release always builds here: R8, resource shrinking and the manifest merge are
           # checked on every push even though the runner has no upload key to sign with.

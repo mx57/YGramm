@@ -179,6 +179,32 @@ object YggNativeCoreBridge {
     }
 
     /**
+     * The URI exactly as the Go core must receive it.
+     *
+     * yggdrasil reads `?sni=<hostname>` off the peer URI (src/core/link.go) and uses it
+     * as the TLS ServerName, while Go's crypto/tls refuses to put an IP literal into SNI
+     * (RFC 6066) — which is what a `tls://95.217.35.148:443` link looks like on the wire:
+     * a handshake with no server name at all, on port 443, from a node whose traffic is
+     * being filtered. A hostname sniDomain turns that into an ordinary-looking HTTPS
+     * hello without touching any of the crypto: the overlay still peers with the same
+     * key, and the certificate is the node's own as before.
+     *
+     * Only tls:// honours it, so every other scheme and every value that is not a
+     * hostname is passed through unchanged instead of being silently rewritten.
+     */
+    fun corePeerUri(endpointUri: String, sniDomain: String): String {
+        val uri = endpointUri.trim()
+        val sni = sniDomain.trim().lowercase().trim('.')
+        if (!uri.startsWith("tls://") || uri.contains('?') || !sni.matches(SNI_HOSTNAME)) return uri
+        // "1.2.3.4" satisfies the hostname shape but is an IP literal the core would drop.
+        if (sni.split('.').all { it.toIntOrNull() != null }) return uri
+        return "$uri?sni=$sni"
+    }
+
+    private val SNI_HOSTNAME =
+        Regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+    /**
      * Interrupts the core's reconnect backoff so a node that lost its public
      * peers dials them again immediately.
      */

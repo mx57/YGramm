@@ -3,6 +3,7 @@ package com.example
 
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggCryptoEngine
+import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggQrCodeCodec
 import com.example.engine.YggTwinP2PBridge
@@ -238,6 +239,35 @@ class ExampleUnitTest {
         } finally {
             mainNodeBridge.stop()
             cloneNodeBridge.stop()
+        }
+    }
+
+    @Test
+    fun sni_is_only_appended_where_the_core_can_act_on_it() {
+        // tls:// is the only link type in yggdrasil that reads ?sni=, and Go's crypto/tls
+        // drops an IP literal from SNI, so an IP sniDomain must not be smuggled in.
+        assertEquals(
+            "tls://95.217.35.148:443?sni=ya.ru",
+            YggNativeCoreBridge.corePeerUri("tls://95.217.35.148:443", "YA.RU")
+        )
+        assertEquals(
+            "tls://185.22.172.110:443",
+            YggNativeCoreBridge.corePeerUri("tls://185.22.172.110:443", "185.22.172.110")
+        )
+        assertEquals(
+            "wss://ygg.example:443",
+            YggNativeCoreBridge.corePeerUri("wss://ygg.example:443", "ya.ru")
+        )
+        assertEquals(
+            "tls://ygg.example:443?maxbackoff=20s",
+            YggNativeCoreBridge.corePeerUri("tls://ygg.example:443?maxbackoff=20s", "ya.ru")
+        )
+        for (junk in listOf("", "not a host", "bad host", "-dash.example", "trailing-.")) {
+            assertEquals(
+                "SNI must never carry $junk",
+                "tls://185.22.172.110:443",
+                YggNativeCoreBridge.corePeerUri("tls://185.22.172.110:443", junk)
+            )
         }
     }
 }

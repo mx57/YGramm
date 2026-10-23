@@ -516,7 +516,11 @@ class YggTwinP2PBridge(
             // hardcoded list ignored the verified peers in the database and came up
             // with zero live links. The catalog stays as the first-run fallback.
             val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
-                .ifEmpty { YggPeerScannerCatalog.initialCatalog.map { it.endpointUri } }
+                .ifEmpty {
+                    YggPeerScannerCatalog.initialCatalog.map {
+                        YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain)
+                    }
+                }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
                 synchronized(nativeCoreStartLock) {
@@ -750,7 +754,8 @@ class YggTwinP2PBridge(
      */
     suspend fun applyPeerChangeToCores(
         peerUri: String,
-        enabled: Boolean
+        enabled: Boolean,
+        sniDomain: String = ""
     ): PeerApplyOutcome = withContext(Dispatchers.IO) {
         val uri = peerUri.trim()
         val profiles = initializedNativeProfiles.toList()
@@ -762,17 +767,30 @@ class YggTwinP2PBridge(
                 errorDetail = if (uri.isBlank()) "Пустой адрес пира" else "Нода Yggdrasil не запущена"
             )
         }
+        // What the core is actually told to dial, including the SNI it will put in the
+        // ClientHello. Removing still matches without it: yggdrasil identifies a link by
+        // scheme/host/port and ignores the query.
+        val dialUri = YggNativeCoreBridge.corePeerUri(uri, sniDomain)
         var applied = 0
         var live = 0
         var total = 0
         var failure: String? = null
         for (profileId in profiles) {
             val res = if (enabled) {
-                YggNativeCoreBridge.addPeer(profileId, uri)
+                YggNativeCoreBridge.addPeer(profileId, dialUri)
             } else {
-                YggNativeCoreBridge.removePeer(profileId, uri)
+                YggNativeCoreBridge.removePeer(profileId, dialUri)
             }
-            if (res.ok) applied++ else failure = res.error.ifBlank { "ядро отклонило пир" }
+            // "peer is already configured" is the state the caller asked for, not a
+            // failure. The autopilot re-adds its best peer on every pass, so reporting
+            // it as «пир не добавлен» filled the journal with false alarms while the
+            // link was up the whole time.
+            val alreadyConfigured = res.error.contains("already configured", ignoreCase = true)
+            if (res.ok || alreadyConfigured) {
+                applied++
+            } else {
+                failure = res.error.ifBlank { "ядро отклонило пир" }
+            }
             val mesh = YggNativeCoreBridge.readMeshState(profileId)
             live = maxOf(live, mesh.liveLinks)
             total = maxOf(total, mesh.totalLinks)
@@ -789,7 +807,8 @@ class YggTwinP2PBridge(
                 enabled -> "Пир добавлен в работающую ноду Yggdrasil"
                 else -> "Пир удалён из работающей ноды Yggdrasil"
             },
-            details = "$uri • живых линков ядра: $live из $total" + (failure?.let { " • $it" } ?: "")
+            details = "$dialUri • живых линков ядра: $live из $total" +
+                (failure?.let { " • $it" } ?: "")
         )
         PeerApplyOutcome(applied, live, total, failure)
     }

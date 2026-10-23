@@ -172,7 +172,12 @@ class NetworkDpiController(
                 }
                 // A reachable port is not a Yggdrasil link: hand the peer to the live node
                 // and only report recovery once the node accepted it.
-                val core = networkEngine.applyPeerChangeToCores(candidate.endpointUri, enabled = true)
+                val core = networkEngine.applyPeerChangeToCores(
+                    candidate.endpointUri,
+                    enabled = true,
+                    sniDomain = candidate.sniDomain
+                )
+
                 if (core.applied > 0) {
                     withContext(Dispatchers.Main) {
                         onBannerMessage(
@@ -434,7 +439,11 @@ class NetworkDpiController(
                 }
                 state.copy(discoveredPeers = updatedDiscovered)
             }
-            val core = networkEngine.applyPeerChangeToCores(scanned.endpointUri, enabled = true)
+            val core = networkEngine.applyPeerChangeToCores(
+                scanned.endpointUri,
+                enabled = true,
+                sniDomain = scanned.sniDomain
+            )
             onBannerMessage(
                 when {
                     core.applied == 0 ->
@@ -487,7 +496,11 @@ class NetworkDpiController(
                     isConnected = true,
                     whitelistCompatible = scanned.whitelistCompatible
                 )
-                val core = networkEngine.applyPeerChangeToCores(scanned.endpointUri, enabled = true)
+                val core = networkEngine.applyPeerChangeToCores(
+                    scanned.endpointUri,
+                    enabled = true,
+                    sniDomain = scanned.sniDomain
+                )
                 applied += core.applied
                 live = maxOf(live, core.liveLinks)
                 total = maxOf(total, core.totalLinks)
