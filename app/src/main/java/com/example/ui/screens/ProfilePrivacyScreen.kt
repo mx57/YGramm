@@ -151,8 +151,9 @@ fun ProfilePrivacyScreen(
         suppressNotificationsForOpenChat: Boolean?,
         messageNotificationsEnabled: Boolean?,
         voiceNotificationsEnabled: Boolean?,
-        callNotificationsEnabled: Boolean?
-    ) -> Unit = { _, _, _, _, _, _ -> },
+        callNotificationsEnabled: Boolean?,
+        hideNotificationContent: Boolean?
+    ) -> Unit = { _, _, _, _, _, _, _ -> },
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
     onPickProfileAvatar: (Uri) -> Unit = {},
     onClearProfileAvatar: () -> Unit = {}
@@ -182,7 +183,7 @@ fun ProfilePrivacyScreen(
         notificationPrefs.edit().putBoolean("notif_permission_requested", true).apply()
         when (pendingNotificationPermissionTarget) {
             "system" -> {
-                onUpdateNotifications(null, granted, null, null, null, null)
+                onUpdateNotifications(null, granted, null, null, null, null, null)
                 if (!granted) {
                     Toast.makeText(
                         context,
@@ -893,7 +894,7 @@ fun ProfilePrivacyScreen(
                         checked = uiState.privacyMatrix.inAppNotificationsEnabled,
                         tag = "notif_in_app_switch",
                         onCheckedChange = {
-                            onUpdateNotifications(it, null, null, null, null, null)
+                            onUpdateNotifications(it, null, null, null, null, null, null)
                         }
                     )
 
@@ -911,7 +912,7 @@ fun ProfilePrivacyScreen(
                                 pendingNotificationPermissionTarget = "system"
                                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
-                                onUpdateNotifications(null, enabled, null, null, null, null)
+                                onUpdateNotifications(null, enabled, null, null, null, null, null)
                             }
                         }
                     )
@@ -991,7 +992,17 @@ fun ProfilePrivacyScreen(
                         checked = uiState.privacyMatrix.suppressNotificationsForOpenChat,
                         tag = "notif_suppress_open_chat_switch",
                         onCheckedChange = {
-                            onUpdateNotifications(null, null, it, null, null, null)
+                            onUpdateNotifications(null, null, it, null, null, null, null)
+                        }
+                    )
+
+                    PrivacyToggleItem(
+                        title = "Скрывать текст в уведомлениях",
+                        subtitle = "На экране блокировки видно только «Новое сообщение» или «Голосовое»: ни текста, ни адреса узлов. С выключенным переключателем содержимое читается любому, кто возьмёт телефон в руки",
+                        checked = uiState.privacyMatrix.hideNotificationContent,
+                        tag = "notif_hide_content_switch",
+                        onCheckedChange = {
+                            onUpdateNotifications(null, null, null, it, null, null, null)
                         }
                     )
 
@@ -1003,7 +1014,7 @@ fun ProfilePrivacyScreen(
                         checked = uiState.privacyMatrix.messageNotificationsEnabled,
                         tag = "notif_messages_switch",
                         onCheckedChange = {
-                            onUpdateNotifications(null, null, null, it, null, null)
+                            onUpdateNotifications(null, null, null, it, null, null, null)
                         }
                     )
 
@@ -1013,7 +1024,7 @@ fun ProfilePrivacyScreen(
                         checked = uiState.privacyMatrix.voiceNotificationsEnabled,
                         tag = "notif_voice_switch",
                         onCheckedChange = {
-                            onUpdateNotifications(null, null, null, null, it, null)
+                            onUpdateNotifications(null, null, null, null, it, null, null)
                         }
                     )
 
@@ -1023,7 +1034,7 @@ fun ProfilePrivacyScreen(
                         checked = uiState.privacyMatrix.callNotificationsEnabled,
                         tag = "notif_calls_switch",
                         onCheckedChange = {
-                            onUpdateNotifications(null, null, null, null, null, it)
+                            onUpdateNotifications(null, null, null, null, null, it, null)
                         }
                     )
                 }
@@ -1168,7 +1179,8 @@ fun ProfilePrivacyScreen(
                     Text(
                         text = "• Сетевое ядро: Go-сборка Yggdrasil v0.5.14 (LINKS/ironwood) как libygggram.so через JNI. Системный VPN, TUN и root не используются: оверлей идёт по обычным сокетам приложения.\n" +
                             "• Обход блокировок: пиры подключаются по tls:// и wss:// на 443 (включая пути через CDN). Пир считается подтверждённым только после реального TLS-handshake с подменой SNI и ответа по протоколу Yggdrasil — открытого порта мало. uTLS-подмена фингерпринта, VLESS Reality, ShadowTLS v3 и DHT BEP-44 в этой сборке НЕ реализованы: такие схемы встречаются только как метки в каталоге пиров.\n" +
-                            "• Криптография: BIP-39 -> HMAC-SHA512 для узла, Ed25519 для адреса IPv6 в 0200::/7, X25519 + HKDF-SHA256 + AES-256-GCM для сообщений и медиа звонков (статический ECDH, без прямой секретности).\n" +
+                            "• Криптография: BIP-39 -> HMAC-SHA512 для узла, Ed25519 для адреса IPv6 в 0200::/7. Поверх транспорта — X25519 + HKDF-SHA256 + AES-256-GCM на текст, вложения, голосовые и медиа звонка (статический ECDH, без прямой секретности). Сам транспорт Yggdrasil шифрует кадры Arceliar/ironwood (X25519 + XSalsa20-Poly1305).\n" +
+                            "• Без ключа X25519 собеседника из визитки сообщение не отправляется: открытого текста «с косметикой» в сборке нет, конверты старой версии 1 принимающая сторона отвергает.\n" +
                             "• Доставка: ACK на каждое сообщение, очередь S&F с повтором при изменении mesh, подтверждение по каждому участнику группы.\n" +
                             "• Обновления: релиз на GitHub, проверка sha256 и подписи APK по закреплённому ключу, установка системным установщиком.\n" +
                             "• Лицензия: GPL-3.0 (файл LICENSE в репозитории); шрифты — см. LICENSE-fonts.md.",

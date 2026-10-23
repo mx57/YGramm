@@ -871,6 +871,76 @@ class YggRepository(
         dao.upsertProfile(profile.copy(mnemonicCsv = words.joinToString(" ")))
     }
 
+    private data class SealingKeys(
+        val senderX25519PrivateKey: ByteArray,
+        val senderEd25519PublicKeyHex: String,
+        val peerX25519PublicKeyHex: String
+    )
+
+    /**
+     * Keys an outgoing envelope for this conversation would be built from, or null when the
+     * peer X25519 key is unknown. Without that key there is no shared secret, and the only
+     * alternative is a key anyone can recompute from the public values on the wire, so the
+     * caller must refuse to send instead.
+     */
+    private suspend fun resolveSealingKeys(conv: ConversationEntity): SealingKeys? {
+        val profiles = dao.getAllProfilesNow()
+        val senderProfile = profiles.find { it.profileId == conv.ownerProfileId }
+            ?: profiles.find { it.isCurrentPrimary }
+            ?: profiles.firstOrNull()
+            ?: return null
+        var senderWords = senderProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+        if (senderWords.isEmpty()) {
+            senderWords = YggCryptoEngine.generateFreshMnemonic12()
+            dao.upsertProfile(senderProfile.copy(mnemonicCsv = senderWords.joinToString(" ")))
+        }
+        val senderIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(senderWords)
+        val peerKey = conv.peerX25519PublicKeyHex.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
+            ?: profiles.find {
+                it.profileId != senderProfile.profileId &&
+                    sameMeshAddress(it.yggIpv6Address, conv.yggIpv6Address)
+            }?.let { peerProfile ->
+                YggCryptoEngine.deriveHierarchyFromMnemonic(
+                    peerProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
+                ).x25519IdentityPubHex.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
+            }
+            ?: senderIdentity.x25519IdentityPubHex.takeIf {
+                // A group row has no single peer key: its stored envelope is only the local
+                // copy, addressed to ourselves. Every member gets a real envelope sealed to
+                // that member's own key when the message is dispatched.
+                (isSelfChatId(conv.chatId) || conv.chatType == "GROUP") &&
+                    YggCryptoEngine.isUsablePeerX25519PublicKey(senderIdentity.x25519IdentityPubHex)
+            }
+            ?: return null
+        return SealingKeys(
+            senderX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(senderWords),
+            senderEd25519PublicKeyHex = senderIdentity.yggNodePublicKeyHex,
+            peerX25519PublicKeyHex = peerKey
+        )
+    }
+
+    /** Null means the conversation has no usable peer key, so nothing is sealed. */
+    suspend fun sealForConversation(
+        conv: ConversationEntity,
+        plainText: String,
+        ratchetStep: Int = 0,
+        sealedSender: Boolean = true
+    ): String? {
+        val keys = resolveSealingKeys(conv) ?: return null
+        return YggCryptoEngine.sealConversationEnvelope(
+            plainText = plainText,
+            senderX25519PrivateKey = keys.senderX25519PrivateKey,
+            senderEd25519PublicKeyHex = keys.senderEd25519PublicKeyHex,
+            peerX25519PublicKeyHex = keys.peerX25519PublicKeyHex,
+            keyEpoch = 1,
+            ratchetStep = ratchetStep,
+            sealedSender = sealedSender
+        )
+    }
+
+    suspend fun conversationHasEndToEndKey(chatId: String): Boolean =
+        dao.getConversationById(chatId)?.let { resolveSealingKeys(it) != null } ?: false
+
     suspend fun sendEncryptedMessage(
         chatId: String,
         plainText: String,
@@ -893,40 +963,12 @@ class YggRepository(
         val step = ((now / 1000L) % 900).toInt() + 1
         val useSealed = sealedSenderGlobal || conv.sealedSenderEnabled
 
-        val allProfiles = dao.getAllProfilesNow()
-        val senderProfile = allProfiles.find { it.profileId == conv.ownerProfileId }
-            ?: allProfiles.find { it.isCurrentPrimary }
-            ?: allProfiles.firstOrNull()
-            ?: return null
-        var senderWords = senderProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
-        if (senderWords.isEmpty()) {
-            senderWords = YggCryptoEngine.generateFreshMnemonic12()
-            dao.upsertProfile(senderProfile.copy(mnemonicCsv = senderWords.joinToString(" ")))
-        }
-        val senderXPriv = YggCryptoEngine.x25519PrivateKeyFromMnemonic(senderWords)
-        val senderIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(senderWords)
-
-        val peerX25519Pub = conv.peerX25519PublicKeyHex.takeIf { it.isNotBlank() }
-            ?: allProfiles.find {
-                it.profileId != senderProfile.profileId &&
-                    sameMeshAddress(it.yggIpv6Address, conv.yggIpv6Address)
-            }?.let { peerProfile ->
-                YggCryptoEngine.deriveHierarchyFromMnemonic(
-                    peerProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
-                ).x25519IdentityPubHex.takeIf { it.isNotBlank() }
-            }
-            ?: senderIdentity.x25519IdentityPubHex.takeIf { isSelfChatId(conv.chatId) }
-
-        val cipherHex = YggCryptoEngine.sealConversationEnvelope(
+        val cipherHex = sealForConversation(
+            conv = conv,
             plainText = plainText,
-            senderX25519PrivateKey = senderXPriv,
-            senderEd25519PublicKeyHex = senderIdentity.yggNodePublicKeyHex,
-            peerX25519PublicKeyHex = peerX25519Pub,
-            keyEpoch = 1,
             ratchetStep = step,
             sealedSender = useSealed
-        )
-        val envelopeVersion = YggCryptoEngine.envelopeVersionFor(peerX25519Pub)
+        ) ?: return null
         val powToken = YggCryptoEngine.computeHashcashStamp(
             recipientIpv6 = conv.yggIpv6Address,
             payloadHashHex = cipherHex,
@@ -948,7 +990,7 @@ class YggRepository(
             isOutgoing = true,
             deliveryState = initialDelivery,
             ratchetStep = step,
-            sealedSenderFlag = envelopeVersion >= 2 && useSealed,
+            sealedSenderFlag = useSealed,
             hashcashPowToken = powToken,
             attachmentName = attachmentName,
             attachmentSizeBytes = attachmentSizeBytes,
@@ -961,7 +1003,7 @@ class YggRepository(
             reactionsJson = "",
             replyToMessageId = replyToMessageId,
             forwardedFrom = forwardedFrom,
-            envelopeVersion = envelopeVersion
+            envelopeVersion = 2
         )
         dao.insertMessage(message)
 
@@ -1255,14 +1297,16 @@ class YggRepository(
         // is safe to pin as the peer's X25519 public key for future outgoing envelopes.
         val recipientWords = allProfiles.find { it.profileId == targetOwnerProfileId }
             ?.mnemonicCsv?.split(" ")?.filter { it.isNotBlank() }.orEmpty()
+        val recipientXPriv = YggCryptoEngine.x25519PrivateKeyFromMnemonic(recipientWords)
+            .takeIf { recipientWords.isNotEmpty() }
         var resolvedPlainText = ""
         var authenticatedSenderX25519Pub = ""
         var resolvedEnvelopeVersion = 1
-        if (recipientWords.isNotEmpty() && packet.cipherPayloadHex.isNotBlank()) {
+        if (recipientXPriv != null && packet.cipherPayloadHex.isNotBlank()) {
             try {
                 val opened = YggCryptoEngine.openConversationEnvelope(
                     envelope = packet.cipherPayloadHex,
-                    recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(recipientWords),
+                    recipientX25519PrivateKey = recipientXPriv,
                     senderEd25519PublicKeyHex = packet.senderPubKeyHex.takeIf { it.isNotBlank() }
                 )
                 resolvedPlainText = opened.plainText
@@ -1278,9 +1322,33 @@ class YggRepository(
             }
         }
         if (resolvedPlainText.isBlank()) {
-            // Legacy interop: frames from older builds carry the text alongside the
-            // non-confidential v1 envelope, which provides no confidentiality anyway.
-            resolvedPlainText = packet.plainText.ifBlank { "[Зашифрованное сообщение — не удалось расшифровать]" }
+            // An envelope that did not verify under this profile's key is never replaced by
+            // the plaintext a frame might carry: accepting it would let anyone write words
+            // into this chat under someone else's name.
+            resolvedPlainText = "[Сообщение не расшифровано: нет ключа собеседника]"
+        }
+
+        // Attachment bytes (photos, files, voice notes) are sealed exactly like text. An
+        // envelope that does not verify under this profile's key is discarded instead of
+        // being written to disk, so nothing unauthenticated becomes playable.
+        var attachmentPayload = packet.attachmentBase64.orEmpty()
+        if (attachmentPayload.isNotBlank()) {
+            attachmentPayload = recipientXPriv?.let { key ->
+                try {
+                    YggCryptoEngine.openConversationEnvelope(
+                        envelope = attachmentPayload,
+                        recipientX25519PrivateKey = key,
+                        senderEd25519PublicKeyHex = packet.senderPubKeyHex.takeIf { it.isNotBlank() }
+                    ).plainText
+                } catch (e: Exception) {
+                    Log.w(
+                        "YggGramCrypto",
+                        "Attachment ${packet.messageId.take(16)} rejected: " +
+                            "${e.javaClass.simpleName}: ${e.message} • wireSender=${packet.senderPubKeyHex.take(16)}"
+                    )
+                    ""
+                }
+            }.orEmpty()
         }
 
         if (conv == null) {
@@ -1317,7 +1385,7 @@ class YggRepository(
                 context = appContext,
                 attachmentName = packet.attachmentName,
                 attachmentType = packet.attachmentType,
-                attachmentBase64 = packet.attachmentBase64,
+                attachmentBase64 = attachmentPayload.ifBlank { null },
                 fallbackUri = packet.attachmentUri,
                 voiceDurationSec = packet.voiceDurationSec,
                 voiceWaveformCsv = packet.voiceWaveformCsv

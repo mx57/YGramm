@@ -177,6 +177,7 @@ data class PrivacyMatrixState(
     val inAppNotificationsEnabled: Boolean = true,
     val systemNotificationsEnabled: Boolean = true,
     val suppressNotificationsForOpenChat: Boolean = true,
+    val hideNotificationContent: Boolean = true,
     val messageNotificationsEnabled: Boolean = true,
     val voiceNotificationsEnabled: Boolean = true,
     val callNotificationsEnabled: Boolean = true
@@ -346,6 +347,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     @Volatile
     private var activeCallMediaKey: ByteArray? = null
 
+    // Highest call-media frame number accepted so far, kept per call: a frame that does not
+    // advance it is a replay and must not be played twice.
+    @Volatile
+    private var callRxLastSeq: Long = 0L
+
+    @Volatile
+    private var callRxLastSeqCallId: String = ""
+
     private var callMediaSendJob: kotlinx.coroutines.Job? = null
     private var callTickerJob: kotlinx.coroutines.Job? = null
     private var callTimeoutJob: kotlinx.coroutines.Job? = null
@@ -407,10 +416,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     val isVoice = packet.attachmentType == "VOICE"
                     val category = if (isVoice) YggAlertCategory.NEW_VOICE else YggAlertCategory.NEW_MESSAGE
                     val previewText = when (packet.attachmentType) {
-                        "VOICE" -> "🎙️ Голосовое сообщение (${packet.voiceDurationSec.coerceAtLeast(1)} сек) • PCM/Opus AEAD"
+                        "VOICE" -> "🎙️ Голосовое сообщение (${packet.voiceDurationSec.coerceAtLeast(1)} сек) • PCM, AES-256-GCM"
                         "IMAGE" -> "🖼️ Фотография: ${packet.attachmentName ?: "image.png"} — ${packet.plainText}"
                         "FILE" -> "📎 P2P Файл: ${packet.attachmentName ?: "file.bin"} — ${packet.plainText}"
                         else -> packet.plainText
+                    }
+                    // A notification sits on the lock screen, where anyone holding the phone
+                    // reads it, so the body only appears there if the owner asked for it.
+                    val notificationPreview = if (_uiState.value.privacyMatrix.hideNotificationContent) {
+                        when (packet.attachmentType) {
+                            "VOICE" -> "🎙️ Голосовое сообщение"
+                            "IMAGE" -> "🖼️ Фотография"
+                            "FILE" -> "📎 Файл"
+                            else -> "Новое сообщение"
+                        }
+                    } else {
+                        previewText
                     }
                     emitPopupAndSystemNotification(
                         category = category,
@@ -418,7 +439,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         chatId = chatId,
                         senderName = packet.senderNodeLabel,
                         senderIpv6 = packet.senderIpv6,
-                        messagePreview = previewText,
+                        messagePreview = notificationPreview,
                         voiceDurationSec = packet.voiceDurationSec
                     )
                 }
@@ -713,6 +734,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     inAppNotificationsEnabled = uiPrefs.getBoolean("notif_in_app", true),
                     systemNotificationsEnabled = uiPrefs.getBoolean("notif_system", true),
                     suppressNotificationsForOpenChat = uiPrefs.getBoolean("notif_suppress_open_chat", true),
+                    hideNotificationContent = uiPrefs.getBoolean("notif_hide_content", true),
                     messageNotificationsEnabled = uiPrefs.getBoolean("notif_messages", true),
                     voiceNotificationsEnabled = uiPrefs.getBoolean("notif_voice", true),
                     callNotificationsEnabled = uiPrefs.getBoolean("notif_calls", true),
@@ -919,6 +941,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         inAppNotificationsEnabled: Boolean? = null,
         systemNotificationsEnabled: Boolean? = null,
         suppressNotificationsForOpenChat: Boolean? = null,
+        hideNotificationContent: Boolean? = null,
         messageNotificationsEnabled: Boolean? = null,
         voiceNotificationsEnabled: Boolean? = null,
         callNotificationsEnabled: Boolean? = null
@@ -929,6 +952,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 inAppNotificationsEnabled = inAppNotificationsEnabled ?: p.inAppNotificationsEnabled,
                 systemNotificationsEnabled = systemNotificationsEnabled ?: p.systemNotificationsEnabled,
                 suppressNotificationsForOpenChat = suppressNotificationsForOpenChat ?: p.suppressNotificationsForOpenChat,
+                hideNotificationContent = hideNotificationContent ?: p.hideNotificationContent,
                 messageNotificationsEnabled = messageNotificationsEnabled ?: p.messageNotificationsEnabled,
                 voiceNotificationsEnabled = voiceNotificationsEnabled ?: p.voiceNotificationsEnabled,
                 callNotificationsEnabled = callNotificationsEnabled ?: p.callNotificationsEnabled
@@ -943,6 +967,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             .putBoolean("notif_in_app", p.inAppNotificationsEnabled)
             .putBoolean("notif_system", p.systemNotificationsEnabled)
             .putBoolean("notif_suppress_open_chat", p.suppressNotificationsForOpenChat)
+            .putBoolean("notif_hide_content", p.hideNotificationContent)
             .putBoolean("notif_messages", p.messageNotificationsEnabled)
             .putBoolean("notif_voice", p.voiceNotificationsEnabled)
             .putBoolean("notif_calls", p.callNotificationsEnabled)
@@ -1317,7 +1342,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
 
             val preview = when (category) {
-                YggAlertCategory.INCOMING_CALL -> "Входящий голосовой вызов через оверлей Yggdrasil (Opus/PCM AEAD)"
+                YggAlertCategory.INCOMING_CALL -> "Входящий голосовой вызов через оверлей Yggdrasil (PCM, AES-256-GCM)"
                 YggAlertCategory.MISSED_CALL -> "Пропущенный голосовой вызов • Нажмите «Перезвонить»"
                 YggAlertCategory.NEW_VOICE -> "🎙️ Голосовое сообщение (6 сек) • Записано с микрофона (PCM 16 кГц)"
                 YggAlertCategory.NEW_MESSAGE -> "Новое сообщение, защищённое X25519 + AES-256-GCM, для профиля «${targetProfile.displayName}»"
@@ -1823,6 +1848,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
+     * Attachment bytes are sealed with the same envelope as text: a photo, a file or a voice
+     * note must not leave the device in cleartext just because the transport encrypts it too.
+     * Null means the payload has no key to seal it with, and the caller must drop the send.
+     */
+    private suspend fun sealedAttachmentFor(
+        conv: ConversationEntity,
+        payload: String?
+    ): String? = payload?.let { repository.sealForConversation(conv, it) }
+
+    /**
      * Fan a group note out over the mesh, one frame per roster member.
      *
      * Yggdrasil has no multicast and there is no server, so a group is only a set of 1:1
@@ -1855,6 +1890,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
         var acked = 0
         var routed = 0
+        var noKeyMembers = 0
         members.forEach { member ->
             // The member's own contact row is used when it exists: it carries the direct
             // endpoint hint and the X25519 key pinned by past conversations. A member added
@@ -1874,6 +1910,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val peerIdentity = repository.resolvePeerNodeIdentity(memberConv)
             val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { member.memberIpv6 }
             if (peerIpv6.isBlank()) return@forEach
+            // Each member gets an envelope sealed to its own X25519 key. One shared blob for
+            // the whole roster could only be sealed to a key everyone already knows, which is
+            // exactly the non-confidential envelope this build refuses to send.
+            val memberCipherHex = repository.sealForConversation(
+                conv = memberConv,
+                plainText = msg.plainText,
+                ratchetStep = msg.ratchetStep,
+                sealedSender = msg.sealedSenderFlag
+            )
+            if (memberCipherHex == null) {
+                noKeyMembers++
+                return@forEach
+            }
+            val memberAttachment = attachmentBase64?.let { repository.sealForConversation(memberConv, it) }
+            if (attachmentBase64 != null && memberAttachment == null) {
+                noKeyMembers++
+                return@forEach
+            }
             val result = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                 chatId = conv.chatId,
                 messageId = msg.messageId,
@@ -1885,7 +1939,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 senderPubKeyHex = identity.yggNodePublicKeyHex,
                 recipientNodePubKeyHex = peerIdentity.publicKeyHex,
                 plainText = msg.plainText,
-                cipherPayloadHex = msg.cipherPayloadHex,
+                cipherPayloadHex = memberCipherHex,
                 hashcashToken = msg.hashcashPowToken,
                 attachmentName = msg.attachmentName,
                 attachmentSizeBytes = msg.attachmentSizeBytes,
@@ -1893,7 +1947,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery,
                 attachmentType = msg.attachmentType,
                 attachmentUri = msg.attachmentUri,
-                attachmentBase64 = attachmentBase64,
+                attachmentBase64 = memberAttachment,
                 voiceDurationSec = msg.voiceDurationSec,
                 voiceWaveformCsv = msg.voiceWaveformCsv,
                 replyToMessageId = msg.replyToMessageId,
@@ -1927,6 +1981,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 acked == members.size -> "Группа • доставлено всем: $acked из ${members.size}"
                 acked > 0 -> "Группа • подтверждено ACK: $acked из ${members.size}"
                 routed > 0 -> "Группа • передано в оверлей: $routed из ${members.size}, ACK пока нет"
+                noKeyMembers > 0 -> "Группа • $noKeyMembers участникам без ключа X25519 сообщение не отправлено"
                 else -> "Группа • нет подтвержденного маршрута ни к одному участнику"
             }
         )
@@ -1949,7 +2004,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             Log.d("YggSF", "flush(${trigger}): сообщений в очереди ${queued.size}")
             var deliveredCount = 0
             var confirmedCount = 0
-            var unreadableAttachments = 0
+            var queueBlocked = 0
             val currentIdentity = _uiState.value.identity
             val candidateExternalPeers = buildCandidateExternalPeersList()
 
@@ -1971,7 +2026,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 if (wantsAttachment && attachmentBase64 == null) {
                     // Dispatching without the payload would mark the note delivered while the peer
                     // receives an empty attachment, so the message stays in the queue.
-                    unreadableAttachments++
+                    queueBlocked++
                     continue
                 }
                 if (isConversationSelfNode(conv, currentIdentity)) {
@@ -1987,6 +2042,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 } else {
                     val directHint = extractDirectEndpointHint(conv)
                     val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+                    val sealedAttachment = sealedAttachmentFor(conv, attachmentBase64)
+                    // A queued note is re-sealed on its way out: an envelope stored by an older
+                    // build may be the non-confidential kind, and the peer could not open it.
+                    val sealedCipher = repository.sealForConversation(
+                        conv = conv,
+                        plainText = msg.plainText,
+                        ratchetStep = msg.ratchetStep,
+                        sealedSender = msg.sealedSenderFlag
+                    )
+                    if (sealedCipher == null || (attachmentBase64 != null && sealedAttachment == null)) {
+                        // The queue must not deliver anything in cleartext just because a
+                        // key went missing after the message was stored.
+                        queueBlocked++
+                        continue
+                    }
                     val overlayRelay = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                         chatId = conv.chatId,
                         messageId = msg.messageId,
@@ -2006,7 +2076,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery,
                         attachmentType = msg.attachmentType,
                         attachmentUri = msg.attachmentUri,
-                        attachmentBase64 = attachmentBase64,
+                        attachmentBase64 = sealedAttachment,
                         voiceDurationSec = msg.voiceDurationSec,
                         voiceWaveformCsv = msg.voiceWaveformCsv,
                         senderAvatarHash = _uiState.value.userProfile.avatarHashHex,
@@ -2037,8 +2107,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             if (queued.isNotEmpty()) {
-                val attachmentNote = if (unreadableAttachments > 0) {
-                    " • вложений без читаемого файла: $unreadableAttachments, они остались в очереди"
+                val attachmentNote = if (queueBlocked > 0) {
+                    " • не отправлено без ключа X25519 или без читаемого файла: $queueBlocked, остались в очереди"
                 } else ""
                 _uiState.update {
                     it.copy(
@@ -2190,6 +2260,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val offline = currentState.isOfflineStoreAndForwardMode ||
                 (!currentState.isNetworkAvailable && !allowManualLan && directHint.isBlank())
 
+            if (targetConv?.chatType != "GROUP" && !repository.conversationHasEndToEndKey(chatId)) {
+                // Without the peer X25519 key there is no shared secret, and the alternative
+                // is a key anyone can recompute from the public values on the wire.
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Сообщение не отправлено: для этого чата нет настоящего end-to-end ключа. " +
+                            "Импортируйте визитку собеседника заново — ключ X25519 берётся только из неё."
+                    )
+                }
+                return@launch
+            }
+
             // Prepare local copy and binary Base64 payload for real P2P transfer
             var resolvedLocalUri = attachmentUri
             var resolvedSizeBytes = attachmentSizeBytes
@@ -2306,6 +2388,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             // Route through the real Yggdrasil overlay first, then an explicit LAN
             // endpoint as a confirmed fallback. A stale stored key is never used.
             val peerIdentity = targetConv?.let { repository.resolvePeerNodeIdentity(it) }
+            val sealedAttachment = targetConv?.let { sealedAttachmentFor(it, attachmentBase64) }
+            if (attachmentBase64 != null && sealedAttachment == null) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Вложение не отправлено: для этого чата нет ключа X25519 — шифровать его нечем.")
+                }
+                return@launch
+            }
             val peerIpv6 = peerIdentity?.yggIpv6Address?.takeIf { it.isNotBlank() }
                 ?: targetConv?.yggIpv6Address
                 ?: ""
@@ -2329,7 +2418,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 allowLanFallback = allowManualLan,
                 attachmentType = effectiveType,
                 attachmentUri = resolvedLocalUri,
-                attachmentBase64 = attachmentBase64,
+                attachmentBase64 = sealedAttachment,
                 voiceDurationSec = voiceDurationSec,
                 voiceWaveformCsv = voiceWaveformCsv,
                 replyToMessageId = wireQuoteId,
@@ -2394,7 +2483,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             ?: "voice_${System.currentTimeMillis() % 100000}.wav"
         sendMessage(
             chatId = chatId,
-            plainText = "Голосовое сообщение PCM/Opus AEAD (${safeDur} сек)",
+            plainText = "Голосовое сообщение PCM AEAD (${safeDur} сек)",
             attachmentName = fileName,
             attachmentSizeBytes = recordedFileSizeBytes,
             attachmentType = "VOICE",
@@ -3284,10 +3373,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             for (pcm in callMicQueue) {
                 val currentCtx = activeCallContext ?: break
                 val key = activeCallMediaKey ?: break
-                val frame = runCatching {
-                    YggCryptoEngine.sealCallMediaFrame(key, pcm, currentCtx.callId)
-                }.getOrNull() ?: break
                 sequence++
+                val frame = runCatching {
+                    YggCryptoEngine.sealCallMediaFrame(key, pcm, currentCtx.callId, sequence)
+                }.getOrNull() ?: break
                 val sent = networkEngine.sendCallAudioFrame(currentCtx.callId, frame.first, frame.second, sequence)
                 if (!sent) {
                     withContext(Dispatchers.Main) {
@@ -3362,13 +3451,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (packet.recipientProfileId.isNotBlank() && packet.recipientProfileId != ctx.localProfileId) return
         val key = activeCallMediaKey ?: return
         if (packet.ivBase64.isBlank() || packet.cipherBase64.isBlank()) return
+        // The overlay delivers one stream per call in order, so a frame whose number is not
+        // ahead of the last accepted one is a replay or a forgery and never reaches the speaker.
+        if (packet.callId != callRxLastSeqCallId) {
+            callRxLastSeqCallId = packet.callId
+            callRxLastSeq = 0L
+        }
+        if (packet.seq <= callRxLastSeq) {
+            callRxAeadFailures.incrementAndGet()
+            return
+        }
         val pcm = runCatching {
-            YggCryptoEngine.openCallMediaFrame(key, packet.ivBase64, packet.cipherBase64, packet.callId)
+            YggCryptoEngine.openCallMediaFrame(key, packet.ivBase64, packet.cipherBase64, packet.callId, packet.seq)
         }.getOrElse {
             callRxAeadFailures.incrementAndGet()
             return
         }
         if (pcm.isEmpty()) return
+        callRxLastSeq = packet.seq
         YggAudioMediaEngine.enqueueVoipRemotePcm(pcm)
         callRxFrameCounter.incrementAndGet()
     }
@@ -3630,6 +3730,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             } else {
                 val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+                val sealedText = repository.sealForConversation(
+                    conv = conv,
+                    plainText = message.plainText,
+                    ratchetStep = message.ratchetStep,
+                    sealedSender = message.sealedSenderFlag
+                )
+                val sealedAttachment = sealedAttachmentFor(conv, attachmentBase64)
+                if (sealedText == null || (attachmentBase64 != null && sealedAttachment == null)) {
+                    _uiState.update {
+                        it.copy(
+                            statusBannerMessage = "Повтор не отправлен: для этого чата нет ключа X25519 — " +
+                                "сообщение осталось в очереди. Импортируйте визитку собеседника заново."
+                        )
+                    }
+                    return@launch
+                }
                 val overlayRes = networkEngine.dispatchMessageViaExternalYggdrasilOverlay(
                     chatId = conv.chatId,
                     messageId = message.messageId,
@@ -3641,7 +3757,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     senderPubKeyHex = currentState.identity.yggNodePublicKeyHex,
                     recipientNodePubKeyHex = peerIdentity.publicKeyHex,
                     plainText = message.plainText,
-                    cipherPayloadHex = message.cipherPayloadHex,
+                    cipherPayloadHex = sealedText,
                     hashcashToken = message.hashcashPowToken,
                     attachmentName = message.attachmentName,
                     attachmentSizeBytes = message.attachmentSizeBytes,
@@ -3649,7 +3765,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     allowLanFallback = allowManualLan,
                     attachmentType = message.attachmentType,
                     attachmentUri = message.attachmentUri,
-                    attachmentBase64 = attachmentBase64,
+                    attachmentBase64 = sealedAttachment,
                     voiceDurationSec = message.voiceDurationSec,
                     voiceWaveformCsv = message.voiceWaveformCsv
                 )

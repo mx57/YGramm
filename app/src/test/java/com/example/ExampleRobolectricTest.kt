@@ -11,6 +11,7 @@ import com.example.data.YggDatabase
 import com.example.data.YggRepository
 import com.example.engine.IncomingReactionPacket
 import com.example.engine.IncomingTwinPacket
+import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggLivePacketLogEntry
@@ -23,6 +24,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -132,13 +136,24 @@ class ExampleRobolectricTest {
 
             val receiverEndpoint = "127.0.0.1:${receiverNode.localTcpPort}"
             val peerIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8"
+            // The peer's card carries its X25519 identity key; without it there is nothing to
+            // seal to, and the repository refuses to send rather than fall back to open text.
+            val peerIdentity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+                listOf(
+                    "glacier", "helium", "cascade", "nebula", "cobalt", "lattice",
+                    "photon", "quartz", "onyx", "harbor", "vertex", "cedar"
+                ),
+                epoch = 1
+            )
 
             // 3. Create a real contact with direct endpoint
             val chatId = repo.createNewConversation(
                 title = "Mimir Peer Node",
                 yggIpv6Input = peerIpv6,
                 disappearingSeconds = 0,
-                directEndpointHint = receiverEndpoint
+                directEndpointHint = receiverEndpoint,
+                peerX25519PublicKeyHex = peerIdentity.x25519IdentityPubHex,
+                peerEd25519PublicKeyHex = peerIdentity.yggNodePublicKeyHex
             )
 
             // 4. Encrypt and queue outgoing voice message
@@ -216,6 +231,130 @@ class ExampleRobolectricTest {
         } finally {
             receiverNode.stop()
             senderNode.stop()
+        }
+    }
+
+    @Test
+    fun `voice payload crosses the socket only as an envelope the peer key opens`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.yggDao()
+        val repo = YggRepository(dao)
+
+        val aliceWords = listOf(
+            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+        )
+        val bobWords = listOf(
+            "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
+            "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
+        )
+        val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceWords, epoch = 1)
+        val bob = YggCryptoEngine.deriveHierarchyFromMnemonic(bobWords, epoch = 1)
+        repo.ensureInitialized(alice)
+
+        val rx = CompletableDeferred<IncomingTwinPacket>()
+        val senderNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = {},
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        val receiverNode = YggTwinP2PBridge(
+            context = null,
+            onPacketReceived = { if (!rx.isCompleted) rx.complete(it) },
+            onDeliveryAckReceived = { _, _, _ -> },
+            onTwinReachableChanged = {},
+            onPacketLogAdded = {}
+        )
+        try {
+            senderNode.start()
+            receiverNode.start()
+            kotlinx.coroutines.delay(150)
+            val endpoint = "127.0.0.1:${receiverNode.localTcpPort}"
+
+            val chatId = repo.createNewConversation(
+                title = "Alice Peer",
+                yggIpv6Input = bob.yggIpv6Address,
+                disappearingSeconds = 0,
+                directEndpointHint = endpoint,
+                peerX25519PublicKeyHex = bob.x25519IdentityPubHex,
+                peerEd25519PublicKeyHex = bob.yggNodePublicKeyHex
+            )
+            val conv = dao.getConversationById(chatId)
+            requireNotNull(conv)
+
+            // A real WAV written by the recorder path, encoded exactly like production does.
+            val pcm = ByteArray(6400) { ((it * 17) % 251).toByte() }
+            val wavFile = java.io.File(app.filesDir, "wire_voice.wav").apply {
+                writeBytes(wav16Mono(pcm, sampleRate = 16_000))
+            }
+            val clearBase64 = YggAudioMediaEngine.prepareAttachmentForP2P(
+                context = app,
+                attachmentName = "wire_voice.wav",
+                attachmentType = "VOICE",
+                attachmentUri = android.net.Uri.fromFile(wavFile).toString(),
+                voiceDurationSec = 1,
+                voiceWaveformCsv = "0.4,0.6"
+            ).second
+            assertTrue(clearBase64.isNotBlank())
+
+            val sealedAttachment = repo.sealForConversation(conv, clearBase64)
+            assertNotNull("A conversation with a peer key must seal its attachment", sealedAttachment)
+
+            val delivered = senderNode.dispatchOutgoingMessageThroughYggdrasil(
+                chatId = chatId,
+                messageId = "msg_wire_voice",
+                peerTitle = "Alice Peer",
+                peerIpv6 = bob.yggIpv6Address,
+                directEndpointHint = endpoint,
+                senderNodeLabel = "Node Alice",
+                senderIpv6 = alice.yggIpv6Address,
+                senderPubKeyHex = alice.yggNodePublicKeyHex,
+                plainText = "Голосовое",
+                cipherPayloadHex = "00",
+                hashcashToken = "1:1:test",
+                attachmentName = "wire_voice.wav",
+                attachmentSizeBytes = wavFile.length(),
+                attachmentType = "VOICE",
+                voiceDurationSec = 1,
+                voiceWaveformCsv = "0.4,0.6",
+                attachmentBase64 = sealedAttachment
+            )
+            assertTrue("Voice frame must cross the real socket", delivered)
+
+            // What the recipient's socket actually received: an envelope, never the WAV bytes.
+            val packet = withTimeout(3000L) { rx.await() }
+            val wireAttachment = packet.attachmentBase64
+            requireNotNull(wireAttachment)
+            assertNotEquals(clearBase64, wireAttachment)
+            assertFalse("Base64 WAV header must not appear in the wire frame", wireAttachment.contains("UklGR"))
+
+            val opened = YggCryptoEngine.openConversationEnvelope(
+                envelope = wireAttachment,
+                recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobWords, epoch = 1),
+                senderEd25519PublicKeyHex = alice.yggNodePublicKeyHex
+            )
+            assertEquals(clearBase64, opened.plainText)
+
+            // And the recipient can actually play it: decoded bytes match the recorder's WAV.
+            val saved = YggAudioMediaEngine.saveIncomingP2PAttachment(
+                context = app,
+                attachmentName = "wire_voice.wav",
+                attachmentType = "VOICE",
+                attachmentBase64 = opened.plainText,
+                fallbackUri = null,
+                voiceDurationSec = 1,
+                voiceWaveformCsv = "0.4,0.6"
+            )
+            assertNotNull(saved)
+            assertArrayEquals(wavFile.readBytes(), java.io.File(android.net.Uri.parse(saved).path!!).readBytes())
+        } finally {
+            senderNode.stop()
+            receiverNode.stop()
         }
     }
 
@@ -783,5 +922,24 @@ class ExampleRobolectricTest {
             receiverNode.stop()
             senderNode.stop()
         }
+    }
+
+    /** Same 44-byte RIFF header the recorder writes, so the test exercises a real WAV file. */
+    private fun wav16Mono(pcm: ByteArray, sampleRate: Int): ByteArray {
+        val header = java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.US_ASCII))
+        header.putInt(36 + pcm.size)
+        header.put("WAVE".toByteArray(Charsets.US_ASCII))
+        header.put("fmt ".toByteArray(Charsets.US_ASCII))
+        header.putInt(16)
+        header.putShort(1)
+        header.putShort(1)
+        header.putInt(sampleRate)
+        header.putInt(sampleRate * 2)
+        header.putShort(2)
+        header.putShort(16)
+        header.put("data".toByteArray(Charsets.US_ASCII))
+        header.putInt(pcm.size)
+        return header.array() + pcm
     }
 }
