@@ -324,6 +324,14 @@ class YggTwinP2PBridge(
 
     @Volatile
     var allowDirectLanRouting: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            // The listener is the only thing that makes a peer discoverable in the local
+            // network, so the toggle has to open and close it instead of merely changing
+            // how frames received anyway are counted.
+            scope.launch { applyLanDiscoveryState() }
+        }
 
     private val yggdrasilTlsSocketFactory: SSLSocketFactory by lazy {
         val trustAllYggPeerCerts = arrayOf<TrustManager>(
@@ -604,7 +612,7 @@ class YggTwinP2PBridge(
             }
 
             launch {
-                startLanDiscoveryListener()
+                applyLanDiscoveryState()
             }
         }
     }
@@ -1574,6 +1582,17 @@ class YggTwinP2PBridge(
         }
     }
 
+    /** Opens the LAN discovery listener while direct LAN exchange is allowed, closes it otherwise. */
+    private suspend fun applyLanDiscoveryState() {
+        if (!allowDirectLanRouting) {
+            lanDiscoverySocket?.close()
+            lanDiscoverySocket = null
+            return
+        }
+        if (lanDiscoverySocket?.isClosed == false) return
+        startLanDiscoveryListener()
+    }
+
     private suspend fun startLanDiscoveryListener() {
         val sock = try {
             DatagramSocket(null).apply {
@@ -1601,6 +1620,9 @@ class YggTwinP2PBridge(
         }
     }
 
+    private fun isLoopbackAddress(ip: String): Boolean =
+        ip.startsWith("127.") || ip == "::1" || ip.equals("0:0:0:0:0:0:0:1", ignoreCase = true)
+
     private suspend fun handleIncomingTcpConnection(
         socket: Socket,
         recipientProfileId: String,
@@ -1609,6 +1631,16 @@ class YggTwinP2PBridge(
         try {
             socket.soTimeout = 10000
             val remoteIp = socket.inetAddress?.hostAddress ?: "unknown"
+            // A direct LAN peer is opt-in. Loopback stays open because the profile-to-profile
+            // transfers and the on-device tests run over it.
+            if (!allowDirectLanRouting && !isLoopbackAddress(remoteIp)) {
+                logPacket(
+                    direction = "RX <- LAN",
+                    summary = "Прямое LAN-соединение от $remoteIp отклонено",
+                    details = "Обмен в локальной сети выключен в настройках приватности; доставка идёт только через оверлей Yggdrasil"
+                )
+                return
+            }
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
             val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
             // One connection may carry many frames: the call media channel keeps a

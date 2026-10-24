@@ -215,7 +215,10 @@ object YggNotificationCenter {
                     .addAction(0, "Ответить", answerIntent)
                     .addAction(0, "Отклонить", declineIntent)
             } else {
+                // Message content is masked before it reaches this class when the owner asked
+                // for it; PRIVATE keeps even the masked line off a locked screen's preview.
                 builder.setAutoCancel(true)
+                    .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 if (item.category == YggAlertCategory.NEW_MESSAGE ||
                     item.category == YggAlertCategory.NEW_VOICE
                 ) {

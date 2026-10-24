@@ -497,12 +497,18 @@ object YggCryptoEngine {
         return out.toByteArray().copyOf(outputLength)
     }
 
+    fun isUsablePeerX25519PublicKey(hex: String?): Boolean {
+        val value = hex?.trim()?.lowercase() ?: return false
+        return value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' }
+    }
+
     /**
-     * Seals a message into a self-describing AEAD envelope (stored in cipherPayloadHex).
-     * v2 (real end-to-end): key = HKDF-SHA256(X25519(sender_x_priv, recipient_x_pub)),
-     * AES-256-GCM with random IV and AAD binding the sender key and epoch.
-     * v1 (legacy fallback for peers whose X25519 key is unknown): key = SHA-256 of public
-     * values only — confidentiality relies on the transport, as in previous releases.
+     * Seals a message into a self-describing AEAD envelope (stored in cipherPayloadHex):
+     * key = HKDF-SHA256(X25519(sender_x_priv, recipient_x_pub)), AES-256-GCM with a random
+     * IV and AAD binding the sender key and epoch.
+     * Returns null when the peer X25519 key is unknown: without it there is no shared secret,
+     * and any key derived from public values alone would be readable by anyone who records
+     * the traffic, so the message must not be sent at all.
      */
     fun sealConversationEnvelope(
         plainText: String,
@@ -512,40 +518,31 @@ object YggCryptoEngine {
         keyEpoch: Int = 1,
         ratchetStep: Int = 0,
         sealedSender: Boolean = true
-    ): String {
+    ): String? {
         val senderEdHex = senderEd25519PublicKeyHex.lowercase()
         val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
-        val peerXPub = peerX25519PublicKeyHex?.trim()?.lowercase()
+        val peerXPub = peerX25519PublicKeyHex?.trim()?.lowercase() ?: return null
+        if (!isUsablePeerX25519PublicKey(peerXPub)) return null
 
-        val aad: ByteArray
-        val key: ByteArray
-        val version: Int
-        if (!peerXPub.isNullOrBlank() && peerXPub.length == 64 && peerXPub.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
-            version = 2
-            val peerU = peerXPub.hexToBytes()
-            val shared = x25519(senderX25519PrivateKey, peerU)
-            key = hkdfSha256(
+        val aad = "ygggram-v2:$senderEdHex:$keyEpoch".toByteArray(StandardCharsets.UTF_8)
+        val key = run {
+            val shared = x25519(senderX25519PrivateKey, peerXPub.hexToBytes())
+            hkdfSha256(
                 ikm = shared,
                 salt = sha256Hex("ygggram-cr-v2").hexToBytes(),
                 info = "ygggram-envelope-v2:ep=$keyEpoch".toByteArray(StandardCharsets.UTF_8),
                 outputLength = 32
             )
-            aad = "ygggram-v2:$senderEdHex:$keyEpoch".toByteArray(StandardCharsets.UTF_8)
-        } else {
-            version = 1
-            key = MessageDigest.getInstance("SHA-256")
-                .digest("$senderEdHex:step=$ratchetStep:sealed=$sealedSender".toByteArray(StandardCharsets.UTF_8))
-            aad = ByteArray(0)
         }
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        if (aad.isNotEmpty()) cipher.updateAAD(aad)
+        cipher.updateAAD(aad)
         val encrypted = cipher.doFinal(plainText.toByteArray(StandardCharsets.UTF_8))
 
         return buildString {
             append("{\"v\":")
-            append(version)
+            append(2)
             append(",\"sx\":\"")
             append(x25519PublicKeyFromPrivate(senderX25519PrivateKey).joinToString("") { "%02x".format(it) })
             append("\",\"sp\":\"")
@@ -571,16 +568,7 @@ object YggCryptoEngine {
     )
 
     /**
-     * v2 needs a usable peer X25519 key; otherwise [sealConversationEnvelope] falls back
-     * to the legacy v1 envelope, which provides no confidentiality.
-     */
-    fun envelopeVersionFor(peerX25519PublicKeyHex: String?): Int {
-        val peerXPub = peerX25519PublicKeyHex?.trim()?.lowercase() ?: return 1
-        return if (peerXPub.length == 64 && peerXPub.all { it.isDigit() || it in 'a'..'f' }) 2 else 1
-    }
-
-    /**
-     * Opens a v2 or v1 envelope produced by [sealConversationEnvelope].
+     * Opens an envelope produced by [sealConversationEnvelope].
      * senderEd25519PublicKeyHex comes from the wire frame; a mismatch with the envelope's
      * pinned sender key is rejected. The returned senderX25519PublicKeyHex is the envelope's
      * "sx" value, implicitly authenticated by successful AEAD verification — safe to pin
@@ -609,44 +597,27 @@ object YggCryptoEngine {
         val iv = ivHex.hexToBytes()
         val encrypted = ctHex.hexToBytes()
 
-        val key = when (version) {
-            2 -> {
-                val senderXPub = fields.string("sx").orEmpty().lowercase()
-                if (senderXPub.length != 64) throw SecurityException("Envelope missing sender X25519 key")
-                val epoch = fields.int("ep") ?: 1
-                val shared = x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
-                hkdfSha256(
-                    ikm = shared,
-                    salt = sha256Hex("ygggram-cr-v2").hexToBytes(),
-                    info = "ygggram-envelope-v2:ep=$epoch".toByteArray(StandardCharsets.UTF_8),
-                    outputLength = 32
-                )
-            }
-            1 -> {
-                val step = fields.int("step") ?: 0
-                // "sd" is serialised as a bare JSON boolean (true/false); older
-                // readers looked only for the quoted form and silently derived a
-                // different v1 key, so every legacy envelope failed to open.
-                val sealed = fields.boolean("sd") ?: (fields.string("sd") == "true")
-                MessageDigest.getInstance("SHA-256")
-                    .digest("$senderEdHex:step=$step:sealed=$sealed".toByteArray(StandardCharsets.UTF_8))
-            }
-            else -> throw SecurityException("Unsupported envelope version $version")
+        if (version != 2) {
+            throw SecurityException("Envelope version $version is not accepted: it is keyed from public values only")
         }
+        val senderXPub = fields.string("sx").orEmpty().lowercase()
+        if (senderXPub.length != 64) throw SecurityException("Envelope missing sender X25519 key")
+        val envelopeEpoch = fields.int("ep") ?: 1
+        val shared = x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
+        val key = hkdfSha256(
+            ikm = shared,
+            salt = sha256Hex("ygggram-cr-v2").hexToBytes(),
+            info = "ygggram-envelope-v2:ep=$envelopeEpoch".toByteArray(StandardCharsets.UTF_8),
+            outputLength = 32
+        )
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        if (version == 2) {
-            val envelopeEpoch = fields.int("ep") ?: 1
-            cipher.updateAAD("ygggram-v2:$senderEdHex:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8))
-        }
+        cipher.updateAAD("ygggram-v2:$senderEdHex:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8))
         val plain = cipher.doFinal(encrypted)
         return OpenedConversationEnvelope(
             plainText = String(plain, StandardCharsets.UTF_8),
-            senderX25519PublicKeyHex = when (version) {
-                2 -> fields.string("sx").orEmpty().lowercase()
-                else -> ""
-            },
+            senderX25519PublicKeyHex = senderXPub,
             version = version
         )
     }
@@ -687,26 +658,37 @@ object YggCryptoEngine {
     /**
      * Returns (ivBase64, cipherBase64) for one PCM frame of the call media stream.
      * Base64 is used instead of hex so the wire frame stays ~25% smaller.
+     * The frame number is part of the authenticated data: without it a captured frame
+     * could be replayed or reordered inside the same call and still decrypt.
      */
-    fun sealCallMediaFrame(key: ByteArray, pcm: ByteArray, callId: String): Pair<String, String> {
+    fun sealCallMediaFrame(key: ByteArray, pcm: ByteArray, callId: String, seq: Long): Pair<String, String> {
         val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        cipher.updateAAD("ygggram-call:$callId".toByteArray(StandardCharsets.UTF_8))
+        cipher.updateAAD(callFrameAad(callId, seq))
         val encrypted = cipher.doFinal(pcm)
         val encoder = Base64.getUrlEncoder().withoutPadding()
         return encoder.encodeToString(iv) to encoder.encodeToString(encrypted)
     }
 
-    fun openCallMediaFrame(key: ByteArray, ivBase64: String, cipherBase64: String, callId: String): ByteArray {
+    fun openCallMediaFrame(
+        key: ByteArray,
+        ivBase64: String,
+        cipherBase64: String,
+        callId: String,
+        seq: Long
+    ): ByteArray {
         val decoder = Base64.getUrlDecoder()
         val iv = decoder.decode(ivBase64)
         val encrypted = decoder.decode(cipherBase64)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        cipher.updateAAD("ygggram-call:$callId".toByteArray(StandardCharsets.UTF_8))
+        cipher.updateAAD(callFrameAad(callId, seq))
         return cipher.doFinal(encrypted)
     }
+
+    private fun callFrameAad(callId: String, seq: Long): ByteArray =
+        "ygggram-call:$callId:$seq".toByteArray(StandardCharsets.UTF_8)
 
     /**
      * Strict reader for the flat JSON object used by conversation envelopes. A regex

@@ -193,10 +193,12 @@ object YGrammUpdateEngine {
     fun canRequestInstall(context: Context): Boolean =
         context.packageManager.canRequestPackageInstalls()
 
+    // Started from the application context, so Android requires NEW_TASK; without it the tap on
+    // "Установить" crashed with "Calling startActivity() from outside of an Activity context".
     fun unknownSourcesSettingsIntent(): Intent = Intent(
         Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
         Uri.parse("package:${BuildConfig.APPLICATION_ID}")
-    )
+    ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
 
     fun installIntent(context: Context, apk: File): Intent {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apk)

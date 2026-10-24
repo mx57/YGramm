@@ -9,6 +9,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.annotation.Config
@@ -130,6 +131,27 @@ class YGrammUpdateCodecTest {
     @Test
     fun `pinned release certificate is a full lowercase digest`() {
         assertTrue(YGrammUpdateCodec.isSha256Hex(YGrammUpdateEngine.PINNED_RELEASE_CERT_SHA256_HEX))
+    }
+
+    // Both intents are started from the application context: without NEW_TASK Android throws
+    // "Calling startActivity() from outside of an Activity context", which crashed the real
+    // device run the moment the installer permission had not been granted yet.
+    @Test
+    fun `updater intents are startable from the application context`() {
+        val settings = YGrammUpdateEngine.unknownSourcesSettingsIntent()
+        assertTrue(settings.flags and android.content.Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        // FileProvider maps a POSIX device path; under Robolectric on Windows the data dir comes
+        // back with backslash separators that match no configured root. The flag and MIME
+        // assertions below are what the crash regression is about, so keep them, and let the
+        // resolver itself be covered on Linux CI.
+        assumeTrue("FileProvider path mapping is POSIX-only under Robolectric", File.separatorChar == '/')
+        val apk = File(YGrammUpdateEngine.updateDir(context), "YGramm-flag-check.apk")
+            .apply { writeBytes(byteArrayOf(9)) }
+        val install = YGrammUpdateEngine.installIntent(context, apk)
+        assertTrue(install.flags and android.content.Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+        assertEquals("application/vnd.android.package-archive", install.type)
+        apk.delete()
     }
 
     private companion object {

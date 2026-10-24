@@ -111,7 +111,7 @@ fun VoiceCallOverlaySheet(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "E2EE VoIP PCM/Opus • Yggdrasil 0200::/7",
+                            text = "E2EE VoIP PCM • Yggdrasil 0200::/7",
                             style = MaterialTheme.typography.labelMedium,
                             color = EmeraldPrimary
                         )
@@ -198,7 +198,7 @@ fun VoiceCallOverlaySheet(
                                 modifier = Modifier.size(16.dp)
                             )
                             Text(
-                                text = "PCM/Opus ${callState.audioBitrateKbps} kbps • Кадры TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}",
+                                text = "PCM ${callState.audioBitrateKbps} kbps • Кадры TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}",
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                                 color = CyberTealSecondary
                             )

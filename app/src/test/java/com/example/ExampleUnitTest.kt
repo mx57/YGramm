@@ -14,6 +14,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -88,6 +90,7 @@ class ExampleUnitTest {
             peerX25519PublicKeyHex = bob.x25519IdentityPubHex,
             keyEpoch = 1
         )
+        requireNotNull(envelope)
         val opened = YggCryptoEngine.openConversationEnvelope(
             envelope = envelope,
             recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobMnemonic, epoch = 1),
@@ -95,6 +98,125 @@ class ExampleUnitTest {
         )
         assertEquals("Проверка E2E: AES-256-GCM + X25519", opened.plainText)
         assertEquals(alice.x25519IdentityPubHex, opened.senderX25519PublicKeyHex)
+    }
+
+    @Test
+    fun envelopeSeal_refusesWithoutPeerKey_andReaderRejectsPublicOnlyEnvelope() {
+        val aliceMnemonic = listOf(
+            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+        )
+        val bobMnemonic = listOf(
+            "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
+            "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
+        )
+        val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceMnemonic, epoch = 1)
+        val senderPriv = YggCryptoEngine.x25519PrivateKeyFromMnemonic(aliceMnemonic, epoch = 1)
+
+        // No peer key means no shared secret: nothing may be sealed, not even a stub.
+        assertNull(YggCryptoEngine.sealConversationEnvelope("текст", senderPriv, alice.yggNodePublicKeyHex, null))
+        assertNull(
+            YggCryptoEngine.sealConversationEnvelope(
+                "текст", senderPriv, alice.yggNodePublicKeyHex, "not-a-key"
+            )
+        )
+
+        // The v1 envelope was keyed from public values alone, so anyone who recorded the
+        // traffic could decrypt it. Such frames must be refused, not silently opened.
+        val forgedV1 = "{\"v\":1,\"sp\":\"${alice.yggNodePublicKeyHex}\",\"step\":7,\"sd\":true," +
+            "\"iv\":\"${"0".repeat(24)}\",\"ct\":\"00\"}"
+        assertThrows(SecurityException::class.java) {
+            YggCryptoEngine.openConversationEnvelope(
+                envelope = forgedV1,
+                recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobMnemonic, epoch = 1),
+                senderEd25519PublicKeyHex = alice.yggNodePublicKeyHex
+            )
+        }
+    }
+
+    @Test
+    fun attachmentEnvelope_sealsBytesAndStaysUnreadableOnTheWire() {
+        val aliceMnemonic = listOf(
+            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+        )
+        val bobMnemonic = listOf(
+            "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
+            "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
+        )
+        val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceMnemonic, epoch = 1)
+        val bob = YggCryptoEngine.deriveHierarchyFromMnemonic(bobMnemonic, epoch = 1)
+
+        // A chunk of a real voice WAV, base64'd exactly the way the attachment sender does it.
+        val wavHeader = "RIFF$\u0000\u0000\u0000WAVEfmt ".toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1)
+        val payload = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(wavHeader + ByteArray(2047) { (it % 251).toByte() })
+
+        val sealed = YggCryptoEngine.sealConversationEnvelope(
+            plainText = payload,
+            senderX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(aliceMnemonic, epoch = 1),
+            senderEd25519PublicKeyHex = alice.yggNodePublicKeyHex,
+            peerX25519PublicKeyHex = bob.x25519IdentityPubHex,
+            keyEpoch = 1
+        )
+        requireNotNull(sealed)
+        assertFalse("Sealed chunk must not carry its own clear payload", sealed.contains(payload))
+        assertTrue(sealed.contains("\"v\":"))
+        val opened = YggCryptoEngine.openConversationEnvelope(
+            envelope = sealed,
+            recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobMnemonic, epoch = 1),
+            senderEd25519PublicKeyHex = alice.yggNodePublicKeyHex
+        )
+        assertEquals(payload, opened.plainText)
+    }
+
+    @Test
+    fun callMediaFrame_isBoundToItsSequenceNumber() {
+        val bobMnemonic = listOf(
+            "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
+            "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
+        )
+        val aliceMnemonic = listOf(
+            "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+            "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+        )
+        val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceMnemonic, epoch = 1)
+        val bob = YggCryptoEngine.deriveHierarchyFromMnemonic(bobMnemonic, epoch = 1)
+        val callId = "call_0f2e1d"
+        val pcm = ByteArray(1280) { (it % 7).toByte() }
+
+        val aliceKey = YggCryptoEngine.deriveCallMediaKey(
+            YggCryptoEngine.x25519PrivateKeyFromMnemonic(aliceMnemonic, epoch = 1),
+            bob.x25519IdentityPubHex,
+            callId
+        )
+        val bobKey = YggCryptoEngine.deriveCallMediaKey(
+            YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobMnemonic, epoch = 1),
+            alice.x25519IdentityPubHex,
+            callId
+        )
+        val (iv, ct) = YggCryptoEngine.sealCallMediaFrame(aliceKey, pcm, callId, seq = 42L)
+        assertTrue(
+            "Frame must decrypt to the exact PCM bytes",
+            pcm.contentEquals(YggCryptoEngine.openCallMediaFrame(bobKey, iv, ct, callId, seq = 42L))
+        )
+
+        // Reordered or replayed inside the same call: the sequence is authenticated data, so
+        // the tag fails instead of playing audio out of order.
+        assertThrows(javax.crypto.AEADBadTagException::class.java) {
+            YggCryptoEngine.openCallMediaFrame(bobKey, iv, ct, callId, seq = 43L)
+        }
+        // The same frame in another call must fail too (the key is derived per call id).
+        assertThrows(javax.crypto.AEADBadTagException::class.java) {
+            YggCryptoEngine.openCallMediaFrame(
+                YggCryptoEngine.deriveCallMediaKey(
+                    YggCryptoEngine.x25519PrivateKeyFromMnemonic(bobMnemonic, epoch = 1),
+                    alice.x25519IdentityPubHex,
+                    "call_99a0bb"
+                ),
+                iv, ct, "call_99a0bb", seq = 42L
+            )
+        }
     }
 
     @Test
