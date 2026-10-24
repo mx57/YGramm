@@ -113,17 +113,38 @@ interface YggDao {
     )
     suspend fun getGroupConversation(groupId: String, ownerProfileId: String): ConversationEntity?
 
-    @Query("SELECT * FROM group_members WHERE chatId = :chatId ORDER BY addedAt ASC")
+    @Query(
+        "SELECT * FROM group_members WHERE chatId = :chatId AND removedAt = 0 ORDER BY addedAt ASC"
+    )
     suspend fun getGroupMembers(chatId: String): List<GroupMemberEntity>
 
-    @Query("SELECT * FROM group_members WHERE chatId = :chatId ORDER BY addedAt ASC")
+    @Query(
+        "SELECT * FROM group_members WHERE chatId = :chatId AND removedAt = 0 ORDER BY addedAt ASC"
+    )
     fun observeGroupMembers(chatId: String): Flow<List<GroupMemberEntity>>
 
-    @Query("SELECT chatId AS chatId, COUNT(*) AS memberCount FROM group_members GROUP BY chatId")
+    @Query(
+        "SELECT chatId AS chatId, COUNT(*) AS memberCount FROM group_members " +
+            "WHERE removedAt = 0 GROUP BY chatId"
+    )
     fun observeGroupMemberCounts(): Flow<List<GroupMemberCount>>
 
-    @Query("DELETE FROM group_members WHERE chatId = :chatId AND memberIpv6 = :memberIpv6")
-    suspend fun removeGroupMember(chatId: String, memberIpv6: String)
+    @Query(
+        "UPDATE group_members SET removedAt = :removedAt " +
+            "WHERE chatId = :chatId AND memberIpv6 = :memberIpv6"
+    )
+    suspend fun markGroupMemberRemoved(chatId: String, memberIpv6: String, removedAt: Long)
+
+    /**
+     * The roster as stored, removals included. Roster merging needs it: a peer keeps
+     * advertising an address this device took out of the group, and the merge has to see the
+     * flag to keep it down instead of re-adding the member.
+     */
+    @Query("SELECT * FROM group_members WHERE chatId = :chatId ORDER BY addedAt ASC")
+    suspend fun getAllGroupMembersIncludingRemoved(chatId: String): List<GroupMemberEntity>
+
+    @Query("DELETE FROM group_members WHERE chatId = :chatId")
+    suspend fun clearGroupMembers(chatId: String)
 
     /**
      * Recording which members acknowledged a group message. Written as a whole because the
@@ -160,6 +181,17 @@ interface YggDao {
             "ORDER BY CASE WHEN messageId = :wireMessageId THEN 0 ELSE 1 END LIMIT 1"
     )
     suspend fun getMessageByWireId(wireMessageId: String): MessageEntity?
+
+    /**
+     * Received copies of one wire frame, scoped to a single chat. The bridge keeps a
+     * in-RAM set of frame ids, but that set is lost when the process restarts, so the
+     * store is the only durable record of what this device already accepted.
+     */
+    @Query(
+        "SELECT * FROM messages WHERE chatId = :chatId AND peerMessageId = :wireMessageId " +
+            "AND isOutgoing = 0 LIMIT 1"
+    )
+    suspend fun getIncomingCopyByWireId(chatId: String, wireMessageId: String): MessageEntity?
 
     @Query("UPDATE messages SET deliveryState = :newState WHERE messageId = :messageId")
     suspend fun updateMessageDeliveryState(messageId: String, newState: String)

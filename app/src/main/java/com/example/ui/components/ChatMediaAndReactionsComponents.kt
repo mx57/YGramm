@@ -23,17 +23,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.filled.Image
@@ -44,6 +47,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -95,7 +99,34 @@ import kotlinx.coroutines.launch
 val DEFAULT_QUICK_REACTIONS = listOf("👍", "❤️", "🔥", "⚡", "🛡️", "😂", "🎉", "👀")
 
 /**
+ * Full reaction catalogue, grouped the way the dropdown presents it. Kept beside the quick
+ * row so a new emoji added here shows up in the list without touching the picker code.
+ */
+data class ReactionCategory(val title: String, val emojis: List<String>)
+
+val REACTION_CATEGORIES = listOf(
+    ReactionCategory(
+        "Жесты",
+        listOf("👍", "👎", "👌", "🤝", "🙏", "👏", "💪", "✌️", "🤞", "👋", "🫡", "🤙")
+    ),
+    ReactionCategory(
+        "Сердца и символы",
+        listOf("❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "💔", "💖", "✨", "⚡", "🛡️", "🔒", "✅", "❌", "❓", "💯")
+    ),
+    ReactionCategory(
+        "Эмоции",
+        listOf("😂", "😀", "🙂", "😉", "😍", "🤩", "😎", "🤔", "😐", "🙃", "😴", "😢", "😭", "😡", "🤯", "🥶", "😱", "🤗", "🤫")
+    ),
+    ReactionCategory(
+        "События",
+        listOf("🎉", "🥳", "🔥", "💥", "🚀", "🏆", "🎯", "👀", "💤", "☕", "🍻", "🕊️", "⚠️", "🧨")
+    )
+)
+
+/**
  * Floating Telegram/WhatsApp-style quick emoji reaction picker pill bar.
+ * The quick row stays one tap away; every other emoji in the catalogue opens in the
+ * dropdown so the bar never has to be scrolled to find something rare.
  */
 @Composable
 fun ReactionQuickPickerBar(
@@ -105,6 +136,7 @@ fun ReactionQuickPickerBar(
     onReply: (() -> Unit)? = null,
     onForward: (() -> Unit)? = null
 ) {
+    var showAllReactions by rememberSaveable(messageId) { mutableStateOf(false) }
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHighest,
         shape = RoundedCornerShape(24.dp),
@@ -169,6 +201,77 @@ fun ReactionQuickPickerBar(
                         text = emoji,
                         style = MaterialTheme.typography.titleMedium
                     )
+                }
+            }
+            Box {
+                IconButton(
+                    onClick = { showAllReactions = !showAllReactions },
+                    modifier = Modifier
+                        .size(34.dp)
+                        .testTag("reaction_show_all_$messageId")
+                ) {
+                    Icon(
+                        Icons.Default.ExpandMore,
+                        contentDescription = "Все реакции",
+                        tint = CyberTealSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                ReactionDropdownList(
+                    expanded = showAllReactions,
+                    onDismissRequest = { showAllReactions = false },
+                    onSelectEmoji = { emoji ->
+                        showAllReactions = false
+                        onSelectEmoji(emoji)
+                        onDismiss()
+                    }
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Every reaction in the catalogue as one scrollable dropdown, grouped by category.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ReactionDropdownList(
+    expanded: Boolean,
+    onDismissRequest: () -> Unit,
+    onSelectEmoji: (String) -> Unit
+) {
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = Modifier
+            .heightIn(max = 320.dp)
+            .testTag("reaction_dropdown_list")
+    ) {
+        Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+            REACTION_CATEGORIES.forEach { category ->
+                Text(
+                    text = category.title,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp)
+                )
+                FlowRow(
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    category.emojis.forEach { emoji ->
+                        Box(
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .clickable { onSelectEmoji(emoji) }
+                                .testTag("reaction_dropdown_${emoji}"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(text = emoji, style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
                 }
             }
         }

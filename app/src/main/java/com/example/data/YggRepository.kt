@@ -511,29 +511,39 @@ class YggRepository(
     private suspend fun mergeGroupRoster(chatId: String, packet: IncomingTwinPacket) {
         val ownAddresses = dao.getAllProfilesNow().map { it.yggIpv6Address.lowercase() }.toSet()
         val now = System.currentTimeMillis()
+        // A frame from another node only carries the speaker's name; everyone else arrives
+        // as a bare address. REPLACE would then wipe a name learned earlier — from a contact
+        // row or from that member speaking itself — so the known values are carried over.
+        val known = dao.getAllGroupMembersIncludingRemoved(chatId)
+            .associateBy { it.memberIpv6.lowercase() }
         val rows = mutableListOf<GroupMemberEntity>()
         // The speaker is listed first: it is the one member whose name the frame really
         // carries, and distinctBy below keeps the first row for an address.
         val senderAddress = packet.senderIpv6.trim().lowercase()
         if (senderAddress.contains(':') && senderAddress !in ownAddresses) {
+            val previously = known[senderAddress]
             rows += GroupMemberEntity(
                 chatId = chatId,
                 memberIpv6 = senderAddress,
-                memberPubKeyHex = packet.senderPubKeyHex.trim().lowercase().takeIf { isEd25519Hex(it) }.orEmpty(),
-                memberName = packet.senderNodeLabel,
-                addedAt = now
+                memberPubKeyHex = packet.senderPubKeyHex.trim().lowercase()
+                    .takeIf { isEd25519Hex(it) } ?: previously?.memberPubKeyHex.orEmpty(),
+                memberName = packet.senderNodeLabel.trim().ifBlank { previously?.memberName.orEmpty() },
+                addedAt = previously?.addedAt ?: now,
+                removedAt = previously?.removedAt ?: 0
             )
         }
         packet.groupMembersCsv.split(',').map { it.trim() }.filter { it.isNotBlank() }.forEach { entry ->
             val address = entry.substringBefore('|').trim().lowercase()
             val key = entry.substringAfter('|', "").trim().lowercase()
             if (address.contains(':') && address !in ownAddresses) {
+                val previously = known[address]
                 rows += GroupMemberEntity(
                     chatId = chatId,
                     memberIpv6 = address,
-                    memberPubKeyHex = if (isEd25519Hex(key)) key else "",
-                    memberName = "",
-                    addedAt = now
+                    memberPubKeyHex = if (isEd25519Hex(key)) key else previously?.memberPubKeyHex.orEmpty(),
+                    memberName = previously?.memberName.orEmpty(),
+                    addedAt = previously?.addedAt ?: now,
+                    removedAt = previously?.removedAt ?: 0
                 )
             }
         }
@@ -556,6 +566,77 @@ class YggRepository(
         val state = if (total in 1..delivered.size) "DELIVERED" else msg.deliveryState
         dao.updateMessageGroupDelivery(messageId, delivered.joinToString(","), state)
         return delivered.size to total
+    }
+
+    /**
+     * Attributing an acknowledgement that arrives after the fan-out to the member that sent
+     * it. The overlay names the responder by its node key and a direct socket by its address,
+     * so both forms are accepted and matched against the roster — by stored key, by the
+     * address derived from that key, then by the address itself.
+     *
+     * @return the member's address and the running delivered/total counts, or "" when the
+     * responder cannot be placed in this group.
+     */
+    suspend fun recordGroupMemberAckBySender(
+        messageId: String,
+        ackSenderKey: String
+    ): Pair<String, Pair<Int, Int>> {
+        val msg = dao.getMessageById(messageId) ?: return "" to (0 to 0)
+        val members = dao.getGroupMembers(msg.chatId)
+        val alreadyDelivered = msg.deliveredMemberCsv.split(',').filter { it.isNotBlank() }
+        val sender = ackSenderKey.trim().lowercase()
+        val senderAddress = if (sender.contains(':')) YggCryptoEngine.normalizeIpv6Literal(sender) else null
+        val member = members.firstOrNull { stored ->
+            val byKey = isEd25519Hex(sender) &&
+                (stored.memberPubKeyHex.trim().lowercase() == sender ||
+                    YggCryptoEngine.addressMatchesEd25519Key(stored.memberIpv6, sender))
+            byKey || (senderAddress != null &&
+                YggCryptoEngine.normalizeIpv6Literal(stored.memberIpv6) == senderAddress)
+        } ?: return "" to (alreadyDelivered.size to members.size)
+        return member.memberIpv6 to recordGroupMemberDelivery(messageId, member.memberIpv6)
+    }
+
+    /**
+     * Renaming a group. The title travels with every later frame, so the peers learn the
+     * new name from the next message rather than from a dedicated packet.
+     */
+    suspend fun renameGroup(chatId: String, newTitle: String): Boolean {
+        val title = newTitle.trim().take(80)
+        if (title.isEmpty()) return false
+        val group = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return false
+        if (group.title == title) return false
+        dao.upsertConversation(group.copy(title = title))
+        return true
+    }
+
+    /**
+     * Removing one member. The stored address is matched case- and format-insensitively
+     * because rows created from a contact keep the literal the contact was added with, while
+     * roster merges store the lowercase form.
+     *
+     * @return the roster size after the removal.
+     */
+    suspend fun removeMemberFromGroup(chatId: String, memberIpv6: String): Int {
+        val group = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return 0
+        val wanted = YggCryptoEngine.normalizeIpv6Literal(memberIpv6)
+        val target = dao.getAllGroupMembersIncludingRemoved(group.chatId).firstOrNull { stored ->
+            stored.memberIpv6.lowercase() == memberIpv6.trim().lowercase() ||
+                (wanted != null && YggCryptoEngine.normalizeIpv6Literal(stored.memberIpv6) == wanted)
+        } ?: return dao.getGroupMembers(group.chatId).size
+        dao.markGroupMemberRemoved(group.chatId, target.memberIpv6, System.currentTimeMillis())
+        return dao.getGroupMembers(group.chatId).size
+    }
+
+    /**
+     * Leaving a group: the roster and the chat go, together with the messages that were
+     * fanned out into it. Nothing is sent to the remaining members — the group simply stops
+     * addressing this node, and the next roster they advertise no longer lists us.
+     */
+    suspend fun leaveGroup(chatId: String): Boolean {
+        val group = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return false
+        dao.clearGroupMembers(group.chatId)
+        deleteConversation(group.chatId)
+        return true
     }
 
     suspend fun deleteSecondaryProfile(profileId: String): List<UserProfileEntity> {
@@ -1095,15 +1176,16 @@ class YggRepository(
         emoji: String,
         added: Boolean
     ): MessageEntity? {
-        if (wireMessageId.isBlank() || emoji.isBlank()) return null
+        val reactionEmoji = normalizeReactionEmoji(emoji)
+        if (wireMessageId.isBlank() || reactionEmoji.isBlank()) return null
         val msg = dao.getMessageByWireId(wireMessageId) ?: return null
         val currentMap = parseReactionsMap(msg.reactionsJson).toMutableMap()
-        val existing = currentMap[emoji]
+        val existing = currentMap[reactionEmoji]
         if (added) {
-            currentMap[emoji] = if (existing == null) 1 to false else (existing.first + 1) to existing.second
+            currentMap[reactionEmoji] = if (existing == null) 1 to false else (existing.first + 1) to existing.second
         } else if (existing != null) {
             val newCount = (existing.first - 1).coerceAtLeast(0)
-            if (newCount == 0) currentMap.remove(emoji) else currentMap[emoji] = newCount to existing.second
+            if (newCount == 0) currentMap.remove(reactionEmoji) else currentMap[reactionEmoji] = newCount to existing.second
         }
         val encoded = serializeReactionsMap(currentMap)
         dao.updateMessageReactions(msg.messageId, encoded)
@@ -1116,21 +1198,23 @@ class YggRepository(
         byMe: Boolean
     ): MessageEntity? {
         val msg = dao.getMessageById(messageId) ?: return null
+        val reactionEmoji = normalizeReactionEmoji(emoji)
+        if (reactionEmoji.isBlank()) return null
         val currentMap = parseReactionsMap(msg.reactionsJson).toMutableMap()
-        val existing = currentMap[emoji]
+        val existing = currentMap[reactionEmoji]
         if (existing != null) {
             if (byMe) {
                 if (existing.second) {
                     val newCount = (existing.first - 1).coerceAtLeast(0)
-                    if (newCount == 0) currentMap.remove(emoji) else currentMap[emoji] = newCount to false
+                    if (newCount == 0) currentMap.remove(reactionEmoji) else currentMap[reactionEmoji] = newCount to false
                 } else {
-                    currentMap[emoji] = (existing.first + 1) to true
+                    currentMap[reactionEmoji] = (existing.first + 1) to true
                 }
             } else {
-                currentMap[emoji] = (existing.first + 1) to existing.second
+                currentMap[reactionEmoji] = (existing.first + 1) to existing.second
             }
         } else {
-            currentMap[emoji] = 1 to byMe
+            currentMap[reactionEmoji] = 1 to byMe
         }
         val encoded = serializeReactionsMap(currentMap)
         dao.updateMessageReactions(messageId, encoded)
@@ -1167,6 +1251,21 @@ class YggRepository(
                 "$emoji:${pair.first}:$tag"
             }
         }
+
+        /**
+         * The stored form is `emoji:count:tag`, so a separator inside an emoji would split one
+         * reaction into two rows. A peer sends the emoji over the wire unfiltered, so the token
+         * is cleaned here rather than trusted: separators and control characters are dropped and
+         * a runaway label cannot grow into the stored string. The limit counts UTF-16 units, so
+         * a cut can land inside an emoji pair; the trailing half is dropped rather than stored,
+         * because a lone surrogate would render as a box and no later tap could match it back.
+         */
+        fun normalizeReactionEmoji(raw: String): String {
+            val cleaned = raw.filter { !":|\u0000".contains(it) && !Character.isISOControl(it) }.trim()
+            return cleaned.take(REACTION_EMOJI_MAX_CODEPOINTS * 4).trimEnd { it.isHighSurrogate() }
+        }
+
+        private const val REACTION_EMOJI_MAX_CODEPOINTS = 8
     }
 
     suspend fun markMessageSentP2P(messageId: String) {
@@ -1378,6 +1477,15 @@ class YggRepository(
             )
             dao.upsertConversation(created)
             conv = created
+        }
+
+        // The bridge's in-RAM frame-id set forgets everything on process restart and stops
+        // remembering after ten minutes, so a sender retry arriving then would be inserted
+        // a second time. The message store is the durable list of what this device already
+        // accepted, and the frame's wire id is the only identity both sides agree on.
+        if (packet.messageId.isNotBlank()) {
+            val alreadyStored = dao.getIncomingCopyByWireId(conv.chatId, packet.messageId)
+            if (alreadyStored != null) return alreadyStored.chatId
         }
 
         val resolvedAttachmentUri = if (appContext != null && (packet.attachmentName != null || packet.attachmentType != null)) {

@@ -2,6 +2,7 @@
 package com.example.data
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 @Entity(tableName = "ygg_profiles")
@@ -60,7 +61,12 @@ data class ConversationEntity(
     val groupId: String = ""
 )
 
-@Entity(tableName = "messages")
+@Entity(
+    tableName = "messages",
+    // Every incoming frame is looked up by (chat, wire id) before it is stored, and the
+    // chat list reads one chat at a time; without this index both scanned the whole table.
+    indices = [Index("chatId", "peerMessageId")]
+)
 data class MessageEntity(
     @PrimaryKey val messageId: String,
     val chatId: String,
@@ -194,6 +200,10 @@ data class CallLogEntity(
  * Members are stored by identity rather than by a local contact id because that is the
  * only form both sides of the wire agree on: the roster a peer advertises references
  * addresses, and each device resolves them into its own contact rows.
+ *
+ * `removedAt` is non-zero for a member this device took out of the group. The row is kept
+ * instead of deleted because every incoming group frame re-advertises the roster, and a
+ * deleted row would simply come back with the next message.
  */
 @Entity(tableName = "group_members", primaryKeys = ["chatId", "memberIpv6"])
 data class GroupMemberEntity(
@@ -201,6 +211,7 @@ data class GroupMemberEntity(
     val memberIpv6: String,
     val memberPubKeyHex: String,
     val memberName: String,
-    val addedAt: Long
+    val addedAt: Long,
+    val removedAt: Long = 0
 )
 

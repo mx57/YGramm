@@ -140,7 +140,26 @@ class NetworkDpiController(
             onBannerMessage(reason)
         }
         val candidatePeers = _peerScanner.value.discoveredPeers
-        val validCandidates = candidatePeers.filter { it.endpointUri.isNotBlank() }
+        // The shipped catalog ages: a public node taken down months ago is not a spare,
+        // and under a whitelist uplink the nodes that still answer are exactly the ones a
+        // stale list cannot name. Ask the directory once, here, because this path only runs
+        // when the current links are already failing.
+        val livePeers = withContext(Dispatchers.IO) {
+            try {
+                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }.filter { it.endpointUri.isNotBlank() }
+        if (livePeers.isNotEmpty()) {
+            _peerScanner.update { state ->
+                state.copy(
+                    discoveredPeers = (state.discoveredPeers + livePeers).distinctBy { it.endpointUri }
+                )
+            }
+        }
+        val validCandidates = (candidatePeers + livePeers).filter { it.endpointUri.isNotBlank() }
+            .distinctBy { it.endpointUri }
 
         for (candidate in validCandidates.shuffled().take(5)) {
             val probe = networkEngine.probeRealYggdrasilPeer(
@@ -214,10 +233,7 @@ class NetworkDpiController(
         onBannerMessage("Применен профиль: ${preset.title}")
 
         scope.launch {
-            repository.updatePeersTransportProfile(
-                whitelistMode = updatedConfig.whitelistCdnWssEnabled,
-                preferredSni = updatedConfig.whitelistSniDomain
-            )
+            applyWhitelistTransport()
         }
     }
 
@@ -229,11 +245,61 @@ class NetworkDpiController(
             )
         }
         scope.launch {
-            val cfg = _antiDpiConfig.value
-            repository.updatePeersTransportProfile(
-                whitelistMode = cfg.whitelistCdnWssEnabled,
-                preferredSni = domain
+            applyWhitelistTransport()
+        }
+    }
+
+    /**
+     * Persists the whitelist transport choice and hands it to the running node. The SNI a
+     * peer is dialled with is baked into the link the node already opened, so saving the
+     * domain into the Room rows alone left the live core sending the old ClientHello until
+     * the app restarted — on a whitelist-only uplink the setting looked applied and changed
+     * nothing. Dropping the link is what the node accepts as a re-dial instruction.
+     */
+    private suspend fun applyWhitelistTransport() {
+        val cfg = _antiDpiConfig.value
+        val domain = cfg.whitelistSniDomain
+        repository.updatePeersTransportProfile(
+            whitelistMode = cfg.whitelistCdnWssEnabled,
+            preferredSni = domain
+        )
+        val peers = repository.getAllPeersNow().filter { it.isWhitelistCompatible }
+        var applied = 0
+        // The node's own reason is quoted, not paraphrased: «no running node» and «this peer
+        // is not in the dial list» are different facts the user has to tell apart.
+        var coreReason = ""
+        for (peer in peers) {
+            val uri = peer.endpointUri.trim()
+            if (uri.isBlank()) continue
+            // yggdrasil identifies a link by scheme/host/port and ignores the SNI query, so
+            // this drops exactly the peer being rewritten. A peer the user never switched on
+            // answers «not configured» and stays off — this call must not enable it.
+            val removed = networkEngine.applyPeerChangeToCores(uri, enabled = false)
+            if (removed.applied == 0) {
+                if (coreReason.isBlank()) coreReason = removed.errorDetail.orEmpty()
+                continue
+            }
+            val added = networkEngine.applyPeerChangeToCores(uri, enabled = true, sniDomain = domain)
+            if (added.applied > 0) {
+                applied++
+            } else if (coreReason.isBlank()) {
+                coreReason = added.errorDetail.orEmpty()
+            }
+        }
+        _antiDpiConfig.update { state ->
+            state.copy(
+                lastProbeReport = when {
+                    applied > 0 -> "SNI: $domain • ядро переподключает $applied пиров"
+                    peers.isEmpty() -> "SNI: $domain • в базе нет пиров с поддержкой белых списков"
+                    else -> "SNI: $domain • живой линк с новым SNI не поднят" +
+                        if (coreReason.isBlank()) "" else ": $coreReason"
+                }
             )
+        }
+        if (applied > 0) {
+            withContext(Dispatchers.Main) {
+                onBannerMessage("Ядро переподключает $applied пиров с SNI $domain")
+            }
         }
     }
 

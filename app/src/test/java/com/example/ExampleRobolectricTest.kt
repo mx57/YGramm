@@ -107,7 +107,7 @@ class ExampleRobolectricTest {
                     incomingMessageReceived.complete(packet)
                 }
             },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {},
             onReactionReceived = { reaction ->
@@ -120,7 +120,7 @@ class ExampleRobolectricTest {
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, messageId, _ ->
+            onDeliveryAckReceived = { _, messageId, _, _ ->
                 if (!ackReceived.isCompleted) {
                     ackReceived.complete(messageId)
                 }
@@ -259,14 +259,14 @@ class ExampleRobolectricTest {
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { if (!rx.isCompleted) rx.complete(it) },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -496,7 +496,7 @@ class ExampleRobolectricTest {
                     receivedByProfile.complete(pkt)
                 }
             },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -563,7 +563,7 @@ class ExampleRobolectricTest {
         val node = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = { logs.add(it) }
         )
@@ -623,14 +623,14 @@ class ExampleRobolectricTest {
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { packets.add(it) },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -807,14 +807,14 @@ class ExampleRobolectricTest {
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { packets.add(it) },
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -918,10 +918,134 @@ class ExampleRobolectricTest {
             val afterAllAcks = senderRepo.getMessage(outgoing.messageId)
             assertEquals("DELIVERED", afterAllAcks?.deliveryState)
             assertEquals(2, afterAllAcks?.deliveredMemberCsv?.split(',')?.size)
+
+            // 5. An ACK arriving later is attributed to the member that sent it, so the
+            //    «N из M» counter keeps moving instead of freezing at the synchronous pass.
+            val second = senderRepo.sendEncryptedMessage(
+                chatId = groupChatId,
+                plainText = "Второе для счётчика ACK",
+                senderIpv6 = senderIdentity.yggIpv6Address,
+                isOfflineMode = false,
+                sealedSenderGlobal = false,
+                powDifficultyBits = 1
+            )
+            requireNotNull(second)
+            val (ackedMember, firstLateCounts) = senderRepo.recordGroupMemberAckBySender(
+                messageId = second.messageId,
+                ackSenderKey = memberTwoIpv6.uppercase()
+            )
+            assertTrue("The acknowledging member is resolved from the roster", ackedMember.isNotBlank())
+            assertEquals(1 to 2, firstLateCounts)
+            val (unknownMember, secondLateCounts) = senderRepo.recordGroupMemberAckBySender(
+                messageId = second.messageId,
+                ackSenderKey = "0209:0000:0000:0000:0000:0000:0000:0001"
+            )
+            assertTrue("A node outside the roster is not counted as a member", unknownMember.isEmpty())
+            assertEquals(1, secondLateCounts.first)
+
+            // 6. Removing a member is local and sticky. Every later group frame re-advertises
+            //    the same roster, and without the flag the address would come back by itself.
+            senderRepo.removeMemberFromGroup(groupChatId, memberOneIpv6)
+            assertEquals(1, senderRepo.getGroupMembers(groupChatId).size)
+            senderRepo.recordIncomingTwinMessage(frame, activeChatId = null)
+            assertFalse(
+                "A member the owner removed must not return with the next advertised roster",
+                senderRepo.getGroupMembers(groupChatId).any { it.memberIpv6 == memberOneIpv6 }
+            )
         } finally {
             receiverNode.stop()
             senderNode.stop()
         }
+    }
+
+    @Test
+    fun `reaction token from the wire cannot smuggle separators into the stored map`() {
+        // The stored form is emoji:count:tag, so a separator inside a peer's emoji would
+        // split one reaction into two rows, and a runaway label would grow the row.
+        assertEquals("👍", YggRepository.normalizeReactionEmoji(" 👍 "))
+        assertEquals("👍1me", YggRepository.normalizeReactionEmoji("👍:1:me"))
+        assertEquals("👍", YggRepository.normalizeReactionEmoji("👍|"))
+        assertEquals("", YggRepository.normalizeReactionEmoji("::"))
+        assertEquals("", YggRepository.normalizeReactionEmoji("   "))
+        assertTrue(
+            "a runaway emoji label has to be cut short",
+            YggRepository.normalizeReactionEmoji("🔥".repeat(40)).length <= 8 * 4
+        )
+        // The limit counts UTF-16 units, and a family emoji is several pairs glued together,
+        // so a long enough token is cut inside one. A stored key ending in a lone high
+        // surrogate renders as a box and the next tap cannot match it to remove the reaction.
+        val family = "👨‍👩‍👧‍👦"
+        val cut = YggRepository.normalizeReactionEmoji(family.repeat(4))
+        assertFalse(
+            "a cut must not leave half an emoji behind",
+            cut.isNotEmpty() && cut.last().isHighSurrogate()
+        )
+    }
+
+    @Test
+    fun `quick reaction row stays inside the dropdown catalogue`() {
+        val catalogue = com.example.ui.components.REACTION_CATEGORIES.flatMap { it.emojis }
+        assertTrue(
+            "every quick pill must also exist in the full list",
+            catalogue.containsAll(com.example.ui.components.DEFAULT_QUICK_REACTIONS)
+        )
+        assertEquals(
+            "the dropdown must not show one emoji twice",
+            catalogue.size,
+            catalogue.distinct().size
+        )
+        assertTrue("the catalogue is the extended picker", catalogue.size >= 40)
+    }
+
+    /**
+     * A sender retries when its ACK is lost, and the bridge remembers frame ids only in
+     * memory for ten minutes. A retry landing after a restart therefore has nothing in
+     * that set, and only the message store can prove this frame was already accepted —
+     * otherwise the user watches the same message twice for a packet sent once.
+     */
+    @Test
+    fun `redelivered frame is stored once even when the in-memory frame ids are gone`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val repo = YggRepository(db.yggDao())
+        val identity = YggCryptoEngine.deriveHierarchyFromMnemonic(
+            listOf(
+                "glacier", "helium", "cascade", "nebula", "cobalt", "lattice",
+                "photon", "quartz", "onyx", "harbor", "vertex", "cedar"
+            ),
+            epoch = 1
+        )
+        repo.ensureInitialized(identity)
+
+        val frame = IncomingTwinPacket(
+            targetChatId = "",
+            messageId = "wire_retry_late",
+            recipientIpv6 = identity.yggIpv6Address,
+            senderNodeLabel = "Узел ретрая",
+            senderIpv6 = "0203:abcd:1111:2222:3333:4444:5555:6666",
+            plainText = "тот же кадр",
+            cipherPayloadHex = "",
+            hashcashToken = "",
+            attachmentName = null,
+            attachmentSizeBytes = 0,
+            rttMs = 42,
+            timestamp = 1_700_000_000_000
+        )
+
+        val first = repo.recordIncomingTwinMessage(frame, activeChatId = null)
+        // Nothing but the rows survives a process restart; the second call is what the
+        // sender's retry then becomes. The return value is the chat the message landed in.
+        val second = repo.recordIncomingTwinMessage(frame, activeChatId = null)
+
+        assertEquals(first, second)
+        assertEquals(1, repo.observeMessagesForChat(first).first().size)
+
+        // A different frame from the same peer is still a new message: the guard keys on
+        // the wire id, not on the sender.
+        repo.recordIncomingTwinMessage(frame.copy(messageId = "wire_retry_next"), activeChatId = null)
+        assertEquals(2, repo.observeMessagesForChat(first).first().size)
     }
 
     /** Same 44-byte RIFF header the recorder writes, so the test exercises a real WAV file. */

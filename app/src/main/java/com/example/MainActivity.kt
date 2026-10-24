@@ -744,6 +744,9 @@ fun YggGramRootApp(
                                 onCreateNewChat = viewModel::createNewChat,
                                 onCreateGroup = viewModel::createGroup,
                                 onAddContactsToGroup = viewModel::addContactsToGroup,
+                                onRenameGroup = viewModel::renameGroup,
+                                onRemoveGroupMember = viewModel::removeGroupMember,
+                                onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
                                 onOpenSelfYggdrasilChat = { runOverlayProbe ->
