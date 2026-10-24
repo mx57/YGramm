@@ -835,6 +835,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         lastMeshSignature = signature
                         if (now - lastMeshChangeFlushAt >= 12_000L &&
                             networkEngine.isRealNetworkAvailable() &&
+                            _uiState.value.privacyMatrix.autoSyncOnMeshConnect &&
                             repository.getQueuedMessages().isNotEmpty()
                         ) {
                             lastMeshChangeFlushAt = now
@@ -2176,7 +2177,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
             if (queued.isNotEmpty()) {
                 val attachmentNote = if (queueBlocked > 0) {
-                    " • не отправлено без ключа X25519 или без читаемого файла: $queueBlocked, остались в очереди"
+                    " • не отправлено без ключа X25519, без читаемого файла или слишком " +
+                        "большое вложение: $queueBlocked, остались в очереди"
                 } else ""
                 _uiState.update {
                     it.copy(
@@ -2358,7 +2360,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentBase64 = encodedB64.takeIf { it.isNotBlank() }
                 if (attachmentBase64 == null) {
                     _uiState.update {
-                        it.copy(statusBannerMessage = "Вложение не отправлено: файл не читается. Выберите его заново.")
+                        it.copy(statusBannerMessage = attachmentRefusalReason(localSavedUri))
                     }
                     return@launch
                 }
@@ -3124,6 +3126,39 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * The bridge ACKs every RINGING before this layer sees it, so a guard that refuses the
+     * call has to answer with DECLINE: silence leaves the caller on "сигнал доставлен,
+     * ожидание ответа" for a phone that never rang.
+     */
+    private fun rejectUnringableCall(
+        callSig: IncomingCallSignalPacket,
+        targetProfile: UserProfileEntity?,
+        chatId: String,
+        reason: String
+    ) {
+        val ctx = CallSessionContext(
+            chatId = chatId,
+            callId = callSig.callId,
+            peerTitle = callSig.callerName.ifBlank { "Узел Yggdrasil" },
+            peerIpv6 = callSig.callerIpv6,
+            peerNodeKeyHex = callSig.senderNodePubKeyHex,
+            peerLanHint = callSig.senderLanHint,
+            localProfileId = targetProfile?.profileId.orEmpty(),
+            localIpv6 = targetProfile?.yggIpv6Address.orEmpty(),
+            localName = targetProfile?.displayName ?: "Узел Yggdrasil",
+            localX25519PrivateKey = ByteArray(32),
+            localX25519PubHex = "",
+            peerX25519PubHex = callSig.senderX25519PubKeyHex.trim().lowercase(),
+            isIncoming = true
+        )
+        sendCallControlSignalAsync(ctx, "DECLINE")
+        logClosedCall(ctx, "DECLINED", callSig.transport)
+        _uiState.update {
+            it.copy(statusBannerMessage = "Входящий вызов от «${ctx.peerTitle}» отклонён: $reason")
+        }
+    }
+
     private suspend fun handleIncomingRing(callSig: IncomingCallSignalPacket) {
         if (callSig.callId.isBlank() || callSig.callerIpv6.isBlank()) return
         pruneRecentlyEndedCalls()
@@ -3148,8 +3183,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val targetProfile = allProfs.find {
             it.profileId == callSig.recipientProfileId ||
                 sameMeshAddress(it.yggIpv6Address, callSig.recipientIpv6)
-        } ?: allProfs.find { it.isCurrentPrimary } ?: return
-        if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) return
+        } ?: allProfs.find { it.isCurrentPrimary }
+        if (targetProfile == null) {
+            rejectUnringableCall(callSig, null, callSig.chatId, "на этом узле нет ни одного профиля")
+            return
+        }
+        if (!targetProfile.isActiveInBackground && !targetProfile.isCurrentPrimary) {
+            rejectUnringableCall(
+                callSig, targetProfile, callSig.chatId,
+                "профиль «${targetProfile.displayName}» не активен в фоне"
+            )
+            return
+        }
 
         val callerTitle = callSig.callerName.ifBlank { "Узел Yggdrasil" }
         val conversationChatId = repository.createNewConversation(
@@ -3170,7 +3215,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val profileWords = targetProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
         val localPrivateKey = runCatching {
             YggCryptoEngine.x25519PrivateKeyFromMnemonic(profileWords, 1)
-        }.getOrNull() ?: return
+        }.getOrNull()
+        if (localPrivateKey == null) {
+            rejectUnringableCall(
+                callSig, targetProfile, conversationChatId,
+                "из мнемоники профиля «${targetProfile.displayName}» не выводится X25519-ключ"
+            )
+            return
+        }
         val localPubHex = x25519PublicHex(localPrivateKey)
         // The incoming LAN connection can appear as 127.0.0.1 (port-forwarded
         // emulators) and then carries no usable reply hint. Fall back to the
@@ -3758,6 +3810,32 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     /**
      * Retries sending an offline/queued message over the real Yggdrasil network when tapped in chat.
      */
+    /**
+     * `prepareAttachmentForP2P` returns an empty payload for both an unreadable file and one over
+     * the inline ceiling, and it keeps the local copy either way - so the size on disk says which
+     * of the two warnings is the true one.
+     */
+    private fun attachmentRefusalReason(localSavedUri: String?): String {
+        val onDiskBytes = localSavedUri?.let { raw ->
+            try {
+                java.io.File(android.net.Uri.parse(raw).path ?: "").let { f ->
+                    if (f.exists()) f.length() else 0L
+                }
+            } catch (_: Throwable) {
+                0L
+            }
+        } ?: 0L
+        val limit = YggAudioMediaEngine.MAX_P2P_INLINE_BYTES
+        val limitMb = limit / (1024 * 1024)
+        return if (onDiskBytes > limit) {
+            "Вложение не отправлено: файл ${(onDiskBytes / (1024 * 1024))} МБ не " +
+                "проходит по оверлею (предел $limitMb МБ). Обрезанную копию " +
+                "собеседник бы не открыл."
+        } else {
+            "Вложение не отправлено: файл не читается. Выберите его заново."
+        }
+    }
+
     fun retrySendMessage(message: MessageEntity) {
         viewModelScope.launch {
             updateConnectivitySnapshot()
@@ -3790,7 +3868,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
             if (wantsAttachment && attachmentBase64 == null) {
                 _uiState.update {
-                    it.copy(statusBannerMessage = "Повтор не отправлен: файл вложения не читается. Прикрепите его заново.")
+                    it.copy(statusBannerMessage = attachmentRefusalReason(message.attachmentUri))
                 }
                 return@launch
             }
@@ -4462,10 +4540,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val newVector = repository.syncAllLinkedDevicesNow(isOnline = true)
             _uiState.update {
                 it.copy(
+                    // Only the LAN beacon leaves the device here; StateVector is local
+                    // bookkeeping, so the banner must not claim an overlay sync request.
                     statusBannerMessage = if (newVector > 0) {
-                        "Запрос синхронизации отправлен в LAN и оверлей Yggdrasil (StateVector #$newVector)"
+                        "Отправлен LAN-маяк обнаружения, локальный StateVector #$newVector. " +
+                            "История сообщений по оверлею не передаётся."
                     } else {
-                        "Отправлен LAN-маяк синхронизации (нет привязанных устройств)"
+                        "Отправлен LAN-маяк обнаружения (нет привязанных устройств)"
                     }
                 )
             }

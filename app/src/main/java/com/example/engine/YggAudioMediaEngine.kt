@@ -61,10 +61,10 @@ data class RecordedVoiceNoteResult(
 object YggAudioMediaEngine {
 
     private const val SAMPLE_RATE = 16000
-    // The overlay transport now splits large attachments into ACKed chunks, so the
-    // old 384 KB ceiling (which silently truncated photos and long voice notes) can
-    // be raised. 4 MB covers phone photos and multi-minute WAV recordings.
-    private const val MAX_P2P_INLINE_BYTES = 4 * 1024 * 1024
+    // The overlay transport splits large attachments into ACKed chunks, but the whole base64
+    // payload is still assembled in memory on both ends, so the ceiling stays. Over-cap files
+    // are refused with this number in the message rather than sent truncated.
+    const val MAX_P2P_INLINE_BYTES = 4 * 1024 * 1024
 
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -804,12 +804,12 @@ object YggAudioMediaEngine {
                     } else {
                         attachmentUri
                     }
-                    val capped = if (rawBytes.size > MAX_P2P_INLINE_BYTES) {
-                        rawBytes.copyOf(MAX_P2P_INLINE_BYTES)
-                    } else {
-                        rawBytes
+                    if (rawBytes.size > MAX_P2P_INLINE_BYTES) {
+                        // Truncating used to hand the peer a corrupt file while the sender saw
+                        // "sent": over-cap payloads are refused outright, the local copy stays.
+                        return localCopy to ""
                     }
-                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(capped)
+                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(rawBytes)
                     return localCopy to b64
                 }
             } catch (_: Throwable) {

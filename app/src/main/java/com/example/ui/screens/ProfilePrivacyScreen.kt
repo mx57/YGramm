@@ -1095,8 +1095,10 @@ fun ProfilePrivacyScreen(
                     )
 
                     PrivacyToggleItem(
-                        title = "Автосинхронизация дельт при выходе в оверлей Yggdrasil",
-                        subtitle = "Фоновая сверка вектора состояния StateVector и очереди S&F между вашими устройствами",
+                        title = "Автосинхронизация очереди при выходе в оверлей Yggdrasil",
+                        subtitle = "Отправлять очередь S&F сразу, как только меняется mesh-топология. " +
+                            "Если выключено, отправка идёт только по таймеру 45 секунд. " +
+                            "История сообщений между вашими устройствами по оверлею не передаётся.",
                         checked = privacy.autoSyncOnMeshConnect,
                         tag = "privacy_autosync_switch",
                         onCheckedChange = {

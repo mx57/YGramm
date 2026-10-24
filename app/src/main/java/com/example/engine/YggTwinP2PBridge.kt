@@ -1997,7 +1997,9 @@ class YggTwinP2PBridge(
                         logPacket(
                             direction = "RELAY <-> YGG",
                             summary = if (role == "SF_BLIND_RELAY") {
-                                "Принят и ретранслирован слепой S&F конверт (Hashcash PoW OK)"
+                                // Nothing in this build verifies a hashcash stamp on the way in,
+                                // so the log must not imply that the PoW was checked.
+                                "Принят и ретранслирован слепой S&F конверт (Hashcash PoW не проверяется)"
                             } else {
                                 "Ретранслирован транзитный оверлейный пакет Yggdrasil 0200::/7"
                             },
