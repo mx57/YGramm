@@ -63,8 +63,12 @@ object YGrammUpdateEngine {
             )
         }
         if (code == 404) {
+            // GitHub answers 404 both for a missing release and for a private repository,
+            // because an anonymous caller is not allowed to know which one it is.
             return YGrammCheckOutcome.Failed(
-                "Репозиторий ${updateRepo()} не публикует релизов (GitHub ответил 404)"
+                "Релиз ${updateRepo()} не найден анонимным запросом (GitHub ответил 404): " +
+                    "репозиторий приватен или релиза ещё нет. Автообновление работает только " +
+                    "с публичным репозиторием."
             )
         }
         if (code == 403 || code == 429) {

@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -150,59 +149,68 @@ fun ReactionQuickPickerBar(
     ) {
         Row(
             modifier = Modifier
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                .padding(horizontal = 10.dp, vertical = 6.dp)
+                .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (onReply != null) {
-                IconButton(
-                    onClick = onReply,
-                    modifier = Modifier
-                        .size(34.dp)
-                        .testTag("reply_to_message_$messageId")
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Reply,
-                        contentDescription = "Ответить на сообщение",
-                        tint = CyberTealSecondary,
-                        modifier = Modifier.size(18.dp)
-                    )
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (onReply != null) {
+                    IconButton(
+                        onClick = onReply,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("reply_to_message_$messageId")
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.Reply,
+                            contentDescription = "Ответить на сообщение",
+                            tint = CyberTealSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+                if (onForward != null) {
+                    IconButton(
+                        onClick = onForward,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("forward_message_$messageId")
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.Forward,
+                            contentDescription = "Переслать сообщение",
+                            tint = EmeraldPrimary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+                DEFAULT_QUICK_REACTIONS.forEach { emoji ->
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                onSelectEmoji(emoji)
+                                onDismiss()
+                            }
+                            .testTag("reaction_option_${messageId}_$emoji"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = emoji,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
                 }
             }
-            if (onForward != null) {
-                IconButton(
-                    onClick = onForward,
-                    modifier = Modifier
-                        .size(34.dp)
-                        .testTag("forward_message_$messageId")
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Forward,
-                        contentDescription = "Переслать сообщение",
-                        tint = EmeraldPrimary,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-            }
-            DEFAULT_QUICK_REACTIONS.forEach { emoji ->
-                Box(
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(CircleShape)
-                        .clickable {
-                            onSelectEmoji(emoji)
-                            onDismiss()
-                        }
-                        .testTag("reaction_option_${messageId}_$emoji"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = emoji,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                }
-            }
+            // The catalogue opener stays pinned at the edge: inside the scrolling row it was
+            // clipped by the screen and the extended list became impossible to reach.
             Box {
                 IconButton(
                     onClick = { showAllReactions = !showAllReactions },
@@ -248,29 +256,30 @@ private fun ReactionDropdownList(
             .heightIn(max = 320.dp)
             .testTag("reaction_dropdown_list")
     ) {
-        Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-            REACTION_CATEGORIES.forEach { category ->
-                Text(
-                    text = category.title,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp)
-                )
-                FlowRow(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp)
-                ) {
-                    category.emojis.forEach { emoji ->
-                        Box(
-                            modifier = Modifier
-                                .size(38.dp)
-                                .clip(CircleShape)
-                                .clickable { onSelectEmoji(emoji) }
-                                .testTag("reaction_dropdown_${emoji}"),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(text = emoji, style = MaterialTheme.typography.titleMedium)
-                        }
+        // DropdownMenu already wraps its content in a vertically scrolling column;
+        // a second verticalScroll here measured the inner one with infinite height
+        // and crashed the process on expand.
+        REACTION_CATEGORIES.forEach { category ->
+            Text(
+                text = category.title,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp)
+            )
+            FlowRow(
+                modifier = Modifier.padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                category.emojis.forEach { emoji ->
+                    Box(
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .clickable { onSelectEmoji(emoji) }
+                            .testTag("reaction_dropdown_${emoji}"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(text = emoji, style = MaterialTheme.typography.titleMedium)
                     }
                 }
             }

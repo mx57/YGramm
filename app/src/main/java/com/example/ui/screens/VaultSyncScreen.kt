@@ -25,13 +25,13 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
-import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -326,7 +326,7 @@ fun VaultSyncScreen(
                         ) {
                             Icon(Icons.Default.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Локально", maxLines = 1)
+                            Text("Метка: локально", maxLines = 1)
                         }
 
                         OutlinedButton(
@@ -341,7 +341,7 @@ fun VaultSyncScreen(
                         ) {
                             Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Файл для WebDAV", maxLines = 1)
+                            Text("Метка: WebDAV", maxLines = 1)
                         }
                     }
 
@@ -463,7 +463,9 @@ private fun LinkedDeviceRow(device: LinkedDeviceEntity) {
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "StateVector #${device.stateVectorVersion} • ${device.syncedChunksCount} чанков • Синхр. в ${timeFormatter.format(Date(device.lastSyncTimestamp))}",
+                    // syncedChunksCount stayed at zero for every device because no chunk
+                    // transfer exists, so it is not shown.
+                    text = "StateVector #${device.stateVectorVersion} (локальный учёт) • Маяк в ${timeFormatter.format(Date(device.lastSyncTimestamp))}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -497,9 +499,9 @@ private fun BackupSnapshotCard(
                     modifier = Modifier.weight(1f)
                 ) {
                     Icon(
-                        Icons.Default.VerifiedUser,
-                        contentDescription = null,
-                        tint = EmeraldPrimary,
+                        Icons.Default.Info,
+                        contentDescription = "Снимок метаданных: архив на диск не записан",
+                        tint = AmberShieldTertiary,
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
@@ -518,12 +520,16 @@ private fun BackupSnapshotCard(
             }
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "${snapshot.kdfSpec} • ${snapshot.cipherSpec} • ${snapshot.chunkCountFastCdc} чанков",
+                // These numbers come from buildEncryptedBackupContainer, which estimates a size
+                // from the row counts instead of sealing the database - so they are labelled as
+                // an estimate, not as properties of a file that exists.
+                text = "Оценка: ${snapshot.sizeBytes / 1024} КБ, ${snapshot.chunkCountFastCdc} чанков • " +
+                    "${snapshot.kdfSpec} • ${snapshot.cipherSpec}",
                 style = MaterialTheme.typography.labelSmall,
                 color = CyberTealSecondary
             )
             Text(
-                text = "Merkle SHA-256: ${snapshot.merkleRootHex.take(28)}...",
+                text = "Merkle SHA-256 (от оценки, не от файла): ${snapshot.merkleRootHex.take(28)}...",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -565,7 +571,9 @@ private fun PairCrossPlatformDeviceModal(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Устройства обмениваются зашифрованными дельтами StateVector напрямую по оверлейной сети Yggdrasil или локальной сети LAN без участия сторонних серверов.",
+                    "Устройство добавляется в ваш список и получает LAN-маяк обнаружения. " +
+                        "Передача истории сообщений между устройствами по оверлею ещё не реализована: " +
+                        "сообщения, отправленные на этом узле, останутся только в его базе.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

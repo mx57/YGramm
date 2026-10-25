@@ -67,8 +67,10 @@ class VaultIdentityController(
             )
             val newVector = repository.syncAllLinkedDevicesNow(isOnline = true)
             onBannerMessage(
-                if (newVector > 0) "Запрос синхронизации отправлен в LAN и оверлей Yggdrasil (StateVector #$newVector)"
-                else "Отправлен LAN-маяк синхронизации (нет привязанных устройств)"
+                // Nothing but the LAN beacon leaves the device here; the vector counter is
+                // local bookkeeping and claiming an overlay sync request would be a lie.
+                if (newVector > 0) "Отправлен LAN-маяк обнаружения, локальный StateVector #$newVector. История сообщений по оверлею не передаётся."
+                else "Отправлен LAN-маяк обнаружения (нет привязанных устройств)"
             )
         }
     }
