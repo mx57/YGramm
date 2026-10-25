@@ -99,8 +99,9 @@ enum class CensorshipPreset(
     RU_WHITELIST_CDN(
         title = "Обход Белых Списков (CDN WSS + RU SNI)",
         badge = "WHITELIST WSS",
-        summary = "Пиры с транспортом wss:// и tls://: ядро подставляет выбранный разрешённый SNI-домен " +
-            "в ClientHello реального TLS-рукопожатия. Это единственная маска, которая уходит в трафик."
+        summary = "Пиры tls:// и wss:// на порту 443: рукопожатие идёт через TLS-стек телефона " +
+            "(ALPN h2/http1.1) с выбранным разрешённым SNI; открытые tcp://-пиры дополнительно " +
+            "пробуются как TLS на 443. Это единственная маска, которая уходит в трафик."
     ),
     TSPU_VLESS_SHADOWTLS(
         title = "ТСПУ Анти-Зондирование (VLESS + ShadowTLS v3)",
@@ -145,9 +146,11 @@ data class AntiDpiConfigState(
         "ozone.ru"
     ),
     val utlsProfile: String = "HelloChrome_128_Auto",
+    val coverTransportEnabled: Boolean = true,
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
-    val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil..."
+    val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil...",
+    val coverProbeResults: List<String> = emptyList()
 )
 
 data class DecentralizedUserProfile(
@@ -4380,6 +4383,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         refreshRealPeerConnectivity()
+    }
+
+    fun probeCoverMask() {
+        networkDpiController.probeCoverMask()
     }
 
     fun addCustomPeer(

@@ -100,8 +100,10 @@ import com.example.ui.components.QrContactModal
 import com.example.ui.components.YggAvatar
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
+import com.example.ui.theme.AppTheme
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
+import com.example.ui.theme.YggThemePref
 import com.example.update.YGrammUpdateController
 import com.example.update.YGrammUpdateEngine
 import com.example.viewmodel.YggGramUiState
@@ -1155,6 +1157,38 @@ fun ProfilePrivacyScreen(
                             )
                         }
                     }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                    Text(
+                        text = "Тема оформления:",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        AppTheme.values().forEach { theme ->
+                            FilterChip(
+                                selected = YggThemePref.state.value == theme,
+                                onClick = { YggThemePref.save(context, theme) },
+                                label = { Text(theme.labelRu, style = MaterialTheme.typography.labelMedium) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                ),
+                                modifier = Modifier.testTag("theme_chip_${theme.key}")
+                            )
+                        }
+                    }
+                    Text(
+                        text = "Светлые темы (" + AppTheme.SnowLight.labelRu + ", " +
+                            AppTheme.GraphiteLight.labelRu + ") перекрашивают интерфейс, но в " +
+                            "некоторых экранах часть текста задана белым цветом вне палитры - " +
+                            "на светлом фоне он может читаться плохо.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
         }

@@ -82,6 +82,7 @@ type EngineInstance struct {
 	started   time.Time
 	overlayRx chan OverlayRxPacket
 	done      chan struct{}
+	listeners []*core.Listener
 }
 
 var (
@@ -267,6 +268,27 @@ func YggGramInitCoreImpl(profileID, mnemonic, androidFilesDir string) string {
 		done:      make(chan struct{}),
 	}
 	engines[profileID] = engine
+
+	// A node that only dials is a leaf: nobody can peer with it, so it can neither be
+	// reached nor carry anyone else's traffic. 5985 is the port the public yggdrasil
+	// nodes expect, and the TLS listener tries 443 because that is the port an
+	// allow-list lets through. Every bind is best effort - an unprivileged Android
+	// process is refused on low ports and a second profile finds the port taken - so
+	// the outcome goes into the journal instead of failing the init.
+	for _, uri := range []string{"tcp://0.0.0.0:5985", "tls://0.0.0.0:443"} {
+		u, err := url.Parse(uri)
+		if err != nil {
+			appendLinkLog("ERR bad listen uri %s: %v", uri, err)
+			continue
+		}
+		l, err := node.Listen(u, "")
+		if err != nil {
+			appendLinkLog("ERR listener %s refused: %v", uri, err)
+			continue
+		}
+		engine.listeners = append(engine.listeners, l)
+		appendLinkLog("INFO listener %s bound to %s", uri, l.Addr().String())
+	}
 
 	go watchPeerLinks(engine)
 

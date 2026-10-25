@@ -844,14 +844,17 @@ class YggTwinP2PBridge(
                 coreIdentityByProfileId[profileId] = corePubKeyHex to coreIpv6
             }
             var joinedPeers = 0
-            for (peerUri in uniqueUris) {
-                val added = YggNativeCoreBridge.addPeer(profileId, peerUri)
+            val dials = uniqueUris.flatMap { coreDialsFor(it) }
+            for (dialUri in dials) {
+                val added = YggNativeCoreBridge.addPeer(profileId, dialUri)
                 if (added.ok) joinedPeers++
             }
             logPacket(
                 direction = "SYS • CORE",
                 summary = "Нода Yggdrasil профиля активна в сети 0200::/7 (JNI, Go)",
-                details = "profile=$profileId • Пиров подключено: $joinedPeers из ${uniqueUris.size} • Доставка сообщений — только через интернет-оверлей Yggdrasil"
+                details = "profile=$profileId • Пиров подключено: $joinedPeers из ${dials.size} • " +
+                    coverTransportSummary() +
+                    " • Доставка сообщений — только через интернет-оверлей Yggdrasil"
             )
             startOverlayRecvLoop(profileId)
         }
@@ -868,6 +871,59 @@ class YggTwinP2PBridge(
             if (mesh.available) best = maxOf(best, mesh.liveLinks)
         }
         return best
+    }
+
+    /**
+     * The dial list as the core receives it: the peer's own URI and, when the cover
+     * transport is on, a loopback endpoint whose TLS handshake comes from the phone's stack.
+     * The original URI stays on purpose - a node reachable only over cleartext tcp:// must
+     * keep working on an unfiltered uplink, so the covered link is an extra chance against
+     * an allow-list rather than a replacement.
+     */
+    private fun coreDialsFor(peerUri: String): List<String> {
+        val dial = peerUri.trim()
+        if (dial.isBlank()) return emptyList()
+        val plan = YggCoverTransport.planFor(dial) ?: return listOf(dial)
+        val endpoint = YggCoverTransport.coverEndpoint(plan) ?: return listOf(dial)
+        return listOf(dial, endpoint)
+    }
+
+    private fun coverTransportSummary(): String {
+        if (!YggCoverTransport.enabled) return "Маска TLS со стека телефона выключена"
+        val error = YggCoverTransport.lastError
+        return "Маска TLS со стека телефона: ${YggCoverTransport.activeEndpoints()} эндпоинтов" +
+            if (error.isNullOrBlank()) "" else " • последняя ошибка рукопожатия: $error"
+    }
+
+    /**
+     * Rebuilds only the cover links of the running nodes after the switch changed. The
+     * peer's own dial is left alone: switching the mask off must not drop the connection that
+     * already carried traffic, and switching it on must not renumber the whole dial list.
+     */
+    suspend fun refreshCoverLinks(peerUris: List<String>): Int = withContext(Dispatchers.IO) {
+        val profiles = initializedNativeProfiles.toList()
+        YggCoverTransport.coveredUris().forEach { (realUri, endpoint) ->
+            profiles.forEach { YggNativeCoreBridge.removePeer(it, endpoint) }
+            YggCoverTransport.release(realUri)
+        }
+        var added = 0
+        if (YggCoverTransport.enabled) {
+            for (uri in peerUris) {
+                val extra = coreDialsFor(uri).filterNot { it == uri.trim() }
+                if (extra.isEmpty()) continue
+                for (profileId in profiles) {
+                    extra.forEach { if (YggNativeCoreBridge.addPeer(profileId, it).ok) added++ }
+                }
+            }
+            profiles.forEach { YggNativeCoreBridge.retryPeers(it) }
+        }
+        logPacket(
+            direction = "SYS • CORE",
+            summary = if (YggCoverTransport.enabled) "Маска TLS со стека телефона переприменена"
+            else "Маска TLS со стека телефона снята",
+            details = coverTransportSummary() + " • cover-линков добавлено: $added"
+        )
+        added
     }
 
     /**
@@ -914,10 +970,22 @@ class YggTwinP2PBridge(
             } else {
                 failure = res.error.ifBlank { "ядро отклонило пир" }
             }
+            // The cover link is best-effort and never decides the outcome: the peer the
+            // user toggled is the one reported, and a cover endpoint that was simply never
+            // added must not turn a successful removal into an error line.
+            if (enabled) {
+                coreDialsFor(dialUri)
+                    .filterNot { it == dialUri }
+                    .forEach { YggNativeCoreBridge.addPeer(profileId, it) }
+            } else {
+                YggCoverTransport.coveredUri(dialUri)
+                    ?.let { YggNativeCoreBridge.removePeer(profileId, it) }
+            }
             val mesh = YggNativeCoreBridge.readMeshState(profileId)
             live = maxOf(live, mesh.liveLinks)
             total = maxOf(total, mesh.totalLinks)
         }
+        if (!enabled) YggCoverTransport.release(dialUri)
         if (enabled && applied > 0) {
             // The core dials new peers on its own backoff timer; interrupt it so the
             // link the user just asked for is attempted now rather than minutes later.
@@ -3808,6 +3876,9 @@ class YggTwinP2PBridge(
         listenersRequested = false
         tcpListenerJob?.cancel()
         tcpListenerJob = null
+        // The cover endpoints exist only to feed the running nodes; with them left bound, a
+        // restarted bridge would keep loopback listeners nobody dials any more.
+        YggCoverTransport.releaseAll()
         try {
             tcpServerSocket?.close()
             tcpServerSocket = null
