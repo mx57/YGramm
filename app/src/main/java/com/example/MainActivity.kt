@@ -122,6 +122,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyScreenshotBlock()
+        com.example.ui.theme.YggThemePref.load(
+            getSharedPreferences("ygggram_ui_prefs", android.content.Context.MODE_PRIVATE)
+        )
         incomingNotificationIntent.value = intent
         enableEdgeToEdge()
         setContent {
@@ -793,6 +796,7 @@ fun YggGramRootApp(
                                 onUpdateScannerSearch = viewModel::updateScannerSearchQuery,
                                 onUpdateScannerSort = viewModel::updateScannerSortMode,
                                 onImportCustomPeers = viewModel::importCustomPeersFromText,
+                                onProbeCoverMask = viewModel::probeCoverMask,
                                 onClearPacketLogs = viewModel::clearPacketLogs
                             )
 

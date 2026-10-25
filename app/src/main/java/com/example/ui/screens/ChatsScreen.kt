@@ -1141,14 +1141,6 @@ private fun MeshStatusTopCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(
-                    Brush.horizontalGradient(
-                        listOf(
-                            Color(0xFF0C1F1A),
-                            Color(0xFF121A24)
-                        )
-                    )
-                )
                 .padding(14.dp)
         ) {
             Row(

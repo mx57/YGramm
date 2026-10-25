@@ -6,6 +6,7 @@ import com.example.data.YggDatabase
 import com.example.data.YggPeerEntity
 import com.example.data.YggRepository
 import com.example.engine.DiscoveredYggPeer
+import com.example.engine.YggCoverTransport
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
@@ -62,7 +63,81 @@ class NetworkDpiController(
     private var peerScanJob: Job? = null
 
     init {
+        syncCoverTransport()
         startSmartWatchdog()
+    }
+
+    /**
+     * Hands the anti-DPI choices to the transport layer. The mask reads them per dial, so a
+     * domain saved only into the UI state would change nothing on the wire until restart.
+     */
+    private fun syncCoverTransport() {
+        val cfg = _antiDpiConfig.value
+        YggCoverTransport.enabled = cfg.coverTransportEnabled
+        YggCoverTransport.whitelistMode = cfg.whitelistCdnWssEnabled
+        YggCoverTransport.whitelistSni = cfg.whitelistSniDomain
+    }
+
+    /** Re-dials only the cover links, so switching the mask takes effect on the running node. */
+    private suspend fun reDialCoverLinks(): String {
+        val uris = repository.getAllPeersNow()
+            .filter { it.isConnected }
+            .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
+            .filter { it.isNotBlank() }
+        val added = networkEngine.refreshCoverLinks(uris)
+        return when {
+            !YggCoverTransport.enabled ->
+                "Маска TLS снята • cover-линков осталось: ${YggCoverTransport.activeEndpoints()}"
+            added > 0 -> "Маска TLS: $added линков через стек телефона " +
+                "(SNI ${YggCoverTransport.whitelistSni}, ALPN h2/http1.1)"
+            else -> "Маска TLS включена, но ни один пир под неё не подошёл: нужны tls:// или " +
+                "tcp://-пиры, у которых тот же узел слушает TLS на 443" +
+                (YggCoverTransport.lastError?.let { " • $it" } ?: "")
+        }
+    }
+
+    /**
+     * Probes the mask against every saved peer and shows what the network really allows.
+     *
+     * The mask is only worth anything if a covered handshake completes on the current link, so
+     * this handshakes to each peer with the phone's TLS stack and prints the result per peer.
+     * Nothing here is estimated: a peer that does not answer is reported as refused, and a list
+     * with no accepted peer means the overlay still travels over the core's own dials.
+     */
+    fun probeCoverMask() {
+        if (_antiDpiConfig.value.isProbingRoutes) return
+        setProbingRoutes(
+            true,
+            "Проверка маски: TLS-рукопожатие со стека телефона к каждому пиру " +
+                "(SNI ${YggCoverTransport.whitelistSni}, ALPN h2/http/1.1)..."
+        )
+        scope.launch(Dispatchers.IO) {
+            val uris = repository.getAllPeersNow()
+                .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
+                .filter { it.isNotBlank() }
+            val probes = YggCoverTransport.probeMask(uris)
+            val accepted = probes.count { it.accepted }
+            // The two facts are different and the user must not read one as the other: the
+            // network letting a masked handshake through says nothing about the far node
+            // finishing the overlay handshake, and vice versa.
+            val liveLinks = networkEngine.coreLiveLinkCount()
+            val linkSuffix = if (liveLinks >= 0) " • линков ядра сейчас: $liveLinks" else ""
+            val summary = when {
+                probes.isEmpty() -> "Проверять маску не на чём: список пиров пуст."
+                accepted == 0 -> "Ни один пир из ${probes.size} не принял рукопожатие с SNI " +
+                    "${YggCoverTransport.whitelistSni}: на 443 им отвечать некому, и оверлей " +
+                    "идёт прямыми dial-ами ядра. Маска работает только там, где узел слушает TLS." +
+                    linkSuffix
+                else -> "Замаскированное рукопожатие приняли $accepted из ${probes.size} пиров" +
+                    linkSuffix + ": " +
+                    probes.filter { it.accepted }.joinToString(", ") { it.detail.substringBefore(" •") }
+            }
+            val lines = probes.map { "${if (it.accepted) "принят" else "отвергнут"} • ${it.detail}" }
+            _antiDpiConfig.update {
+                it.copy(isProbingRoutes = false, lastProbeReport = summary, coverProbeResults = lines)
+            }
+            withContext(Dispatchers.Main) { onBannerMessage(summary) }
+        }
     }
 
     /**
@@ -258,6 +333,7 @@ class NetworkDpiController(
      */
     private suspend fun applyWhitelistTransport() {
         val cfg = _antiDpiConfig.value
+        syncCoverTransport()
         val domain = cfg.whitelistSniDomain
         repository.updatePeersTransportProfile(
             whitelistMode = cfg.whitelistCdnWssEnabled,
@@ -316,7 +392,16 @@ class NetworkDpiController(
         _antiDpiConfig.update { state ->
             when (flagName) {
                 "WHITELIST_WSS" -> state.copy(whitelistCdnWssEnabled = !state.whitelistCdnWssEnabled)
+                "COVER_TLS" -> state.copy(coverTransportEnabled = !state.coverTransportEnabled)
                 else -> state
+            }
+        }
+        if (flagName == "COVER_TLS" || flagName == "WHITELIST_WSS") {
+            syncCoverTransport()
+            scope.launch {
+                val report = reDialCoverLinks()
+                _antiDpiConfig.update { it.copy(lastProbeReport = report) }
+                withContext(Dispatchers.Main) { onBannerMessage(report) }
             }
         }
     }

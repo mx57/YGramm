@@ -127,6 +127,7 @@ fun NetworkDpiScreen(
     onUpdateScannerSearch: (String) -> Unit = {},
     onUpdateScannerSort: (String) -> Unit = {},
     onImportCustomPeers: (String) -> Unit = {},
+    onProbeCoverMask: () -> Unit = {},
     onClearPacketLogs: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -258,6 +259,7 @@ fun NetworkDpiScreen(
                 onConnectScannedPeer = onConnectScannedPeer,
                 onToggleAntiDpiFlag = onToggleAntiDpiFlag,
                 onSelectPreset = onSelectPreset,
+                onProbeCoverMask = onProbeCoverMask,
                 onSwitchToExpertMode = { viewMode = NetworkViewMode.EXPERT }
             )
         } else {
@@ -1129,19 +1131,38 @@ fun NetworkDpiScreen(
                             Text(
                                 text = "Работает: пир считается живым только после реального TLS-рукопожатия с " +
                                     "подменой SNI и ответа по протоколу Yggdrasil; для wss://-пиров фреймы идут " +
-                                    "поверх WebSocket на 443.\n" +
+                                    "поверх WebSocket на 443. Рукопожатие tls://-пиров делает TLS-стек телефона: " +
+                                    "ALPN h2 и http/1.1 (с Android 10), TLS 1.3, выбранный разрешённый SNI — вместо " +
+                                    "Go-hello без " +
+                                    "ALPN, которое фильтр на белом списке сбрасывает как «не HTTPS». Открытые " +
+                                    "tcp://-пиры в режиме белых списков дополнительно пробуются как TLS на 443, " +
+                                    "не перестав подключаться и по-старому.\n" +
                                     "Не реализовано и переключателей нет: uTLS-подмена фингерпринта, VLESS Reality, " +
-                                    "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH.",
+                                    "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH.\n" +
+                                    "Маска не меняет адрес назначения: если провайдер сверяет SNI с IP из белого " +
+                                    "списка, подмена имени не поможет — нужен свой ретранслятор на разрешённом " +
+                                    "домене, и приложение честно покажет, какие пиры под маску не попали.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
 
                             DpiSwitchRow(
                                 title = "Туннель WebSocket поверх CDN (wss:// Белый список)",
-                                subtitle = "Инкапсуляция фреймов Yggdrasil в HTTP/2 и WebSocket через разрешенные IP-диапазоны CDN",
+                                subtitle = "Фреймы Yggdrasil идут поверх WebSocket (HTTP/1.1 Upgrade) на порту 443 " +
+                                    "к пирам wss://. Адрес берётся из списка пиров: приложение не подбирает " +
+                                    "«разрешённые диапазоны CDN» само",
                                 checked = cfg.whitelistCdnWssEnabled,
                                 tag = "switch_whitelist_wss",
                                 onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
+                            )
+
+                            DpiSwitchRow(
+                                title = "Маска TLS со стека телефона (ALPN + SNI)",
+                                subtitle = "Ядро подключается к 127.0.0.1, а рукопожатие с настоящим пиром делает " +
+                                    "TLS-стек Android. Ключи и шифрование Yggdrasil остаются на концах канала.",
+                                checked = cfg.coverTransportEnabled,
+                                tag = "switch_cover_tls",
+                                onToggle = { onToggleAntiDpiFlag("COVER_TLS") }
                             )
                         }
                     }
@@ -1675,6 +1696,7 @@ private fun SimpleNetworkShieldContent(
     onConnectScannedPeer: (DiscoveredYggPeer) -> Unit,
     onToggleAntiDpiFlag: (String) -> Unit,
     onSelectPreset: (CensorshipPreset) -> Unit,
+    onProbeCoverMask: () -> Unit,
     onSwitchToExpertMode: () -> Unit
 ) {
     val cfg = uiState.antiDpiConfig
@@ -1748,10 +1770,21 @@ private fun SimpleNetworkShieldContent(
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    // liveRoutes is a peer link count, not proof against DPI: the core
-                                    // dials a plain TLS link, so the shield must not claim censorship
-                                    // bypass it has no way to observe.
-                                    text = if (hasOverlayLink) "Линк к пиру есть • маскировки трафика нет"
+                                    // liveRoutes is a peer link count, not proof against DPI. The mask
+                                    // line reads the cover registry, which is the only place that knows
+                                    // whether this build actually has a phone-stack TLS path to a peer;
+                                    // an open endpoint is still not a confirmed overlay link.
+                                    text = if (hasOverlayLink) {
+                                        val covered = com.example.engine.YggCoverTransport.activeEndpoints()
+                                        when {
+                                            covered > 0 -> "Линк к пиру есть • маска TLS со стека телефона: " +
+                                                "$covered эндпоинтов (SNI + ALPN), линк подтверждает ядро"
+                                            com.example.engine.YggCoverTransport.enabled ->
+                                                "Линк к пиру есть • маска включена, но ни под одного пира " +
+                                                    "её эндпоинт не поднялся"
+                                            else -> "Линк к пиру есть • маскировки трафика нет"
+                                        }
+                                    }
                                     else if (!isOnline) "Сеть недоступна или Авиарежим"
                                     else "Поиск стабильного узла 0200::/7",
                                     style = MaterialTheme.typography.bodySmall,
@@ -2031,6 +2064,9 @@ private fun SimpleNetworkShieldContent(
 
                     Text(
                         text = "Работает: подмена SNI в реальном TLS-рукопожатии и транспорт wss:// на 443.\n" +
+                            "Замерено на проводе: hello маски - 512 байт с server_name и ALPN h2,http/1.1, " +
+                            "тогда как рукопожатие ядра идёт без обоих. Принимает ли сеть замаскированное " +
+                            "соединение - зависит от пира, это и показывает проверка ниже.\n" +
                             "Не реализовано: uTLS-фингерпринт, VLESS Reality, ShadowTLS v3, padding QUIC, DHT BEP-44.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -2038,11 +2074,37 @@ private fun SimpleNetworkShieldContent(
 
                     DpiSwitchRow(
                         title = "Маскировка под HTTPS CDN (RU SNI)",
-                        subtitle = "Трафик выглядит для ТСПУ как обращение к разрешенным сайтам (Яндекс, Госуслуги)",
+                        subtitle = "В ClientHello называется разрешённый домен (Яндекс, Госуслуги) и предлагается h2/http/1.1",
                         checked = cfg.whitelistCdnWssEnabled,
                         tag = "simple_switch_whitelist_mode",
                         onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
                     )
+
+                    OutlinedButton(
+                        onClick = onProbeCoverMask,
+                        enabled = !cfg.isProbingRoutes,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = if (cfg.isProbingRoutes) {
+                                "Проверка маски идёт..."
+                            } else {
+                                "Проверить маску на моих пирах"
+                            }
+                        )
+                    }
+
+                    // A mask nobody measured is a guess, so the per-peer verdict lives next to
+                    // the switch that turns the mask on.
+                    if (cfg.coverProbeResults.isNotEmpty()) {
+                        cfg.coverProbeResults.take(12).forEach { line ->
+                            Text(
+                                text = line,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             }
         }
