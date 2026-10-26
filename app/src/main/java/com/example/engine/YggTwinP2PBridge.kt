@@ -1066,8 +1066,9 @@ class YggTwinP2PBridge(
     }
 
     /**
-     * Live public links across the running nodes: 0 means the node has no route to the
-     * overlay, -1 that no core is running to ask. The DB peer flags say neither.
+     * Public links the running nodes finished an overlay handshake on: 0 means the node has
+     * no route to the overlay, -1 that no core is running to ask. The DB peer flags say
+     * neither, and an open socket to a peer says less than nothing.
      */
     fun coreLiveLinkCount(): Int {
         var best = -1
@@ -1217,7 +1218,7 @@ class YggTwinP2PBridge(
                 enabled -> "Пир добавлен в работающую ноду Yggdrasil"
                 else -> "Пир удалён из работающей ноды Yggdrasil"
             },
-            details = "$dialUri • живых линков ядра: $live из $total" +
+            details = "$dialUri • линков ядра с рукопожатием: $live из $total" +
                 (failure?.let { " • $it" } ?: "")
         )
         PeerApplyOutcome(applied, live, total, failure)
@@ -4048,7 +4049,8 @@ class YggTwinP2PBridge(
                 logPacket(
                     direction = "ERR • YGG",
                     summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение возвращено в очередь",
-                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра переподключены, автоповтор через 45 с"
+                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра " +
+                        "переподключены, автоповтор от 45 с до 15 мин"
                 )
                 // A path entry outlives the links it was learned on: the frame is then
                 // forwarded into a dead path and vanishes with no error anywhere. Put the

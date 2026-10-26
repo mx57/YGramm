@@ -140,7 +140,7 @@ fun NetworkMapScreen(
         countryFlag = "📱",
         region = if (core.available) {
             val restartSuffix = if (core.restartCount > 0) " • перезапусков ${core.restartCount}" else ""
-            "Go-ядро: линков ${core.liveLinks}/${core.totalLinks} • сессий ${core.sessionCount}$restartSuffix"
+            "Go-ядро: линков с рукопожатием ${core.liveLinks}/${core.totalLinks} • сессий ${core.sessionCount}$restartSuffix"
         } else {
             "Ядро недоступно"
         },
@@ -204,7 +204,7 @@ fun NetworkMapScreen(
                 deliveryStatus = status,
                 hops = listOf(
                     "Мой узел (${uiState.identity.yggIpv6Address.take(12)}…)",
-                    "Оверлей 0200::/7 • живых линков ядра: ${core.liveLinks}",
+                    "Оверлей 0200::/7 • линков ядра с рукопожатием: ${core.liveLinks}",
                     "Узел «$recipName» (${conv?.yggIpv6Address?.take(12) ?: "0200::"}…)"
                 ),
                 rttMs = -1,

@@ -149,7 +149,14 @@ fun NetworkDpiScreen(
     val totalRoutes = if (coreMesh.available) coreMesh.totalLinks else peers.size
     val coreStatusLine = if (coreMesh.available) {
         val restartSuffix = if (coreMesh.restartCount > 0) " • перезапусков ядра: ${coreMesh.restartCount}" else ""
-        "Ядро в сети: живых линков ${coreMesh.liveLinks} из ${coreMesh.totalLinks} • узлов в routing tree: ${coreMesh.knownNodes} • сессий: ${coreMesh.sessionCount}$restartSuffix"
+        // A socket to a peer is not a link: the core marks a peer up as soon as the
+        // connection exists and only names it after the overlay handshake. Say how many
+        // are missing that confirmation instead of letting the two numbers look equal.
+        val pendingSuffix = if (coreMesh.transportLinks > coreMesh.liveLinks) {
+            " • соединений без рукопожатия: ${coreMesh.transportLinks - coreMesh.liveLinks}"
+        } else ""
+        "Ядро в сети: линков с рукопожатием ${coreMesh.liveLinks} из ${coreMesh.totalLinks}$pendingSuffix" +
+            " • узлов в routing tree: ${coreMesh.knownNodes} • сессий: ${coreMesh.sessionCount}$restartSuffix"
     } else if (!com.example.engine.YggNativeCoreBridge.isNativeLibraryLoaded) {
         "Ядро не загружено: APK собран без libygggram.so — пересоберите Go-ядро из core/"
     } else {
@@ -602,7 +609,7 @@ fun NetworkDpiScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 CoreMeshStat(
-                                    label = "Живых линков",
+                                    label = "Линков с рукопожатием",
                                     value = if (coreMesh.available) "${coreMesh.liveLinks}/${coreMesh.totalLinks}" else "-",
                                     modifier = Modifier.weight(1f)
                                 )
@@ -1141,8 +1148,10 @@ fun NetworkDpiScreen(
                                     "ALPN h2 и http/1.1 (с Android 10), TLS 1.3, выбранный разрешённый SNI — вместо " +
                                     "Go-hello без " +
                                     "ALPN, которое фильтр на белом списке сбрасывает как «не HTTPS». Открытые " +
-                                    "tcp://-пиры в режиме белых списков дополнительно пробуются как TLS на 443, " +
-                                    "не перестав подключаться и по-старому.\n" +
+                                    "tcp://-пиры в режиме белых списков набираются только как TLS на 443: " +
+                                    "исходный диал ядро снимает, чтобы не повторять рукопожатие, которое " +
+                                    "фильтр уже сбросил. К нему узел возвращается, если локальный " +
+                                    "эндпоинт маски не поднялся.\n" +
                                     "Не реализовано и переключателей нет: uTLS-подмена фингерпринта, VLESS Reality, " +
                                     "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH.\n" +
                                     "Маска не меняет адрес назначения: если провайдер сверяет SNI с IP из белого " +
@@ -1784,10 +1793,12 @@ private fun SimpleNetworkShieldContent(
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
-                                    // liveRoutes is a peer link count, not proof against DPI. The mask
-                                    // line reads the cover registry, which is the only place that knows
-                                    // whether this build actually has a phone-stack TLS path to a peer;
-                                    // an open endpoint is still not a confirmed overlay link.
+                                    // liveRoutes is a peer link count, not proof against DPI, and
+                                    // the link count only claims what the core proved: a peer
+                                    // joins it after the overlay handshake, not when the socket
+                                    // opens. The mask line reads the cover registry, which is the
+                                    // only place that knows whether this build actually has a
+                                    // phone-stack TLS path to a peer.
                                     text = if (hasOverlayLink) {
                                         val covered = com.example.engine.YggCoverTransport.activeEndpoints()
                                         when {

@@ -100,8 +100,9 @@ enum class CensorshipPreset(
         title = "Обход Белых Списков (CDN WSS + RU SNI)",
         badge = "WHITELIST WSS",
         summary = "Пиры tls:// и wss:// на порту 443: рукопожатие идёт через TLS-стек телефона " +
-            "(ALPN h2/http1.1) с выбранным разрешённым SNI; открытые tcp://-пиры дополнительно " +
-            "пробуются как TLS на 443. Это единственная маска, которая уходит в трафик."
+            "(ALPN h2/http1.1) с выбранным разрешённым SNI; открытые tcp://-пиры под этим " +
+            "профилем набираются только как TLS на 443 — исходный диал ядро снимает. " +
+            "Это единственная маска, которая уходит в трафик."
     ),
     TSPU_VLESS_SHADOWTLS(
         title = "ТСПУ Анти-Зондирование (VLESS + ShadowTLS v3)",
@@ -531,7 +532,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     repository.updateConversationRouteStatus(
                         chatId = chatId,
                         isOnline = true,
-                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток), автоповтор каждые 45 с"
+                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток) • " +
+                            "автоповтор от 45 с до 15 мин, сразу при новом маршруте"
                     )
                 }
             }
@@ -859,41 +861,51 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         // transition, so a message queued while the overlay had no live peer stayed
         // queued for the whole session even after the route recovered.
         viewModelScope.launch {
+            // A queue with no route drains nothing: each tick only re-runs the same lookup.
+            // The mesh observer still flushes on a new link or tree entry, so a queue that
+            // made no progress slows its own polling instead of hammering a dead overlay.
+            var lastQueuedSize = -1
+            var idleTicks = 0
             while (true) {
-                delay(45_000L)
-                if (repository.getQueuedMessages().isEmpty()) continue
+                val waitMs = minOf(45_000L shl minOf(idleTicks, 5), 15 * 60_000L)
+                delay(waitMs)
+                val queuedSize = repository.getQueuedMessages().size
+                if (queuedSize == 0) {
+                    lastQueuedSize = 0
+                    idleTicks = 0
+                    continue
+                }
                 if (!networkEngine.isRealNetworkAvailable()) continue
-                flushQueuedMessagesOverRealNetwork("таймер 45 с")
+                idleTicks = if (queuedSize == lastQueuedSize) idleTicks + 1 else 0
+                lastQueuedSize = queuedSize
+                flushQueuedMessagesOverRealNetwork("таймер ${waitMs / 1000} с")
             }
         }
 
         // The peer card must reflect the real Go core: only the core knows which
         // public links are up and which remote nodes its routing tree reached.
         viewModelScope.launch {
-            var lastMeshSignature = ""
+            var lastFlushLiveLinks = -1
+            var lastFlushKnownNodes = -1
             var lastMeshChangeFlushAt = 0L
             while (true) {
                 refreshCoreMeshState()
-                // A new live link or a routing tree that grew is the moment a queued
-                // message can finally leave; waiting for the 45 s tick made the user
-                // watch «в очереди» long after the overlay had recovered. Debounced
-                // because a flapping peer changes the signature every few seconds.
+                // A routing tree that grew, or a real jump in live links, is the moment a queued
+                // message can finally leave. Link count alone flaps by one every few seconds on a
+                // public-peer node, and flushing on each change drained the same queue nonstop.
                 val mesh = _uiState.value.coreMesh
-                if (mesh.available) {
-                    val signature = "${mesh.liveLinks}/${mesh.knownNodes}/" +
-                        mesh.upPeers.keys.sorted().joinToString(",")
-                    val now = android.os.SystemClock.elapsedRealtime()
-                    if (signature != lastMeshSignature) {
-                        lastMeshSignature = signature
-                        if (now - lastMeshChangeFlushAt >= 12_000L &&
-                            networkEngine.isRealNetworkAvailable() &&
-                            _uiState.value.privacyMatrix.autoSyncOnMeshConnect &&
-                            repository.getQueuedMessages().isNotEmpty()
-                        ) {
-                            lastMeshChangeFlushAt = now
-                            flushQueuedMessagesOverRealNetwork("изменение mesh")
-                        }
-                    }
+                val grew = mesh.available &&
+                    (mesh.knownNodes > lastFlushKnownNodes || mesh.liveLinks >= lastFlushLiveLinks + 3)
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (grew && now - lastMeshChangeFlushAt >= 30_000L &&
+                    networkEngine.isRealNetworkAvailable() &&
+                    _uiState.value.privacyMatrix.autoSyncOnMeshConnect &&
+                    repository.getQueuedMessages().isNotEmpty()
+                ) {
+                    lastMeshChangeFlushAt = now
+                    lastFlushLiveLinks = mesh.liveLinks
+                    lastFlushKnownNodes = mesh.knownNodes
+                    flushQueuedMessagesOverRealNetwork("mesh вырос")
                 }
                 delay(8_000L)
             }
@@ -919,11 +931,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
      * a handshake it is allowed to speak, and a node that refuses that guess can still
      * hold a working Yggdrasil link over the same endpoint — the greyed-out cards next
      * to growing RX/TX counters were that contradiction on screen.
+     *
+     * Only a peer that finished the overlay handshake counts: a socket to a port that
+     * answers TLS and never joins the routing tree is not a link, and marking it live
+     * promised the user a route that did not exist.
      */
     private suspend fun applyCoreLinkStatusToPeers(state: YggNativeCoreBridge.CoreMeshState) {
         if (!state.available) return
         repository.getAllPeersNow().forEach { peer ->
-            val coreLatency = state.upPeers[peer.endpointUri.substringBefore("?").trim().lowercase()]
+            val coreLatency = state.livePeers[peer.endpointUri.substringBefore("?").trim().lowercase()]
             // The core only measures latency once a session round trip happened, so a
             // live link without a number keeps the last real measurement of the same port.
             val target = when {
@@ -2172,8 +2188,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
             val app = getApplication<Application>()
             val queued = repository.getQueuedMessages()
-            // Which trigger fired matters when a queue drains late: in logcat the 45 s
-            // timer and the mesh-change path are otherwise indistinguishable.
+            // Which trigger fired matters when a queue drains late: in logcat the adaptive
+            // timer and the mesh-growth path are otherwise indistinguishable.
             Log.d("YggSF", "flush(${trigger}): сообщений в очереди ${queued.size}")
             var deliveredCount = 0
             var confirmedCount = 0
