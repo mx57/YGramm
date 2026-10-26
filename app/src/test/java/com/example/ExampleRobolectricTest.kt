@@ -538,23 +538,27 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `core peer json decides which links count as up`() {
+    fun `only a peer that finished the overlay handshake counts as a link`() {
         val raw = """
-            {"ok":true,"upCount":1,"total":3,"peers":[
+            {"ok":true,"upCount":3,"total":4,"peers":[
               {"URI":"tcp://10.0.2.2:21001?maxbackoff=20s","Up":false},
-              {"URI":"TLS://Example.COM:443?maxbackoff=20s","Up":true,"Latency":155000000},
-              {"URI":"","Up":true}
+              {"URI":"TLS://Example.COM:443?maxbackoff=20s","Up":true,"Latency":155000000,
+               "Key":"uzPfp2F7XkOu9gPpXWAERrB9y5AaXr3M3SbYS6u4m3M="},
+              {"URI":"tls://95.217.35.148:443?maxbackoff=20s","Up":true},
+              {"URI":"tls://185.20.26.100:443?maxbackoff=20s","Up":true,"Key":null},
+              {"URI":"","Up":true,"Key":"uzPfp2F7XkOu9gPpXWAERrB9y5AaXr3M3SbYS6u4m3M="}
             ]}
         """.trimIndent()
-        val up = com.example.engine.YggNativeCoreBridge.readCoreUpPeers(raw)
+        val live = com.example.engine.YggNativeCoreBridge.readCoreConfirmedPeers(raw)
         assertEquals(
-            "Only links the core holds count, keyed by the endpoint form stored in the database",
+            "A socket with no peer key behind it is not a link; only keyed ones count, " +
+                "keyed by the endpoint form stored in the database",
             mapOf("tls://example.com:443" to 155),
-            up
+            live
         )
         assertTrue(
             "A broken native answer must not invent live peers",
-            com.example.engine.YggNativeCoreBridge.readCoreUpPeers("{not json").isEmpty()
+            com.example.engine.YggNativeCoreBridge.readCoreConfirmedPeers("{not json").isEmpty()
         )
     }
 

@@ -1066,8 +1066,9 @@ class YggTwinP2PBridge(
     }
 
     /**
-     * Live public links across the running nodes: 0 means the node has no route to the
-     * overlay, -1 that no core is running to ask. The DB peer flags say neither.
+     * Public links the running nodes finished an overlay handshake on: 0 means the node has
+     * no route to the overlay, -1 that no core is running to ask. The DB peer flags say
+     * neither, and an open socket to a peer says less than nothing.
      */
     fun coreLiveLinkCount(): Int {
         var best = -1
@@ -1217,7 +1218,7 @@ class YggTwinP2PBridge(
                 enabled -> "Пир добавлен в работающую ноду Yggdrasil"
                 else -> "Пир удалён из работающей ноды Yggdrasil"
             },
-            details = "$dialUri • живых линков ядра: $live из $total" +
+            details = "$dialUri • линков ядра с рукопожатием: $live из $total" +
                 (failure?.let { " • $it" } ?: "")
         )
         PeerApplyOutcome(applied, live, total, failure)

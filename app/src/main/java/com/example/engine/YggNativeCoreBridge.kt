@@ -37,16 +37,21 @@ object YggNativeCoreBridge {
      */
     data class CoreMeshState(
         val available: Boolean,
+        // Public links the far side completed the overlay handshake on. This is the only
+        // number that means «the node is in the network»; see [readCoreConfirmedPeers].
         val liveLinks: Int = 0,
+        // Sockets the core currently holds to peers, handshaked or not. Kept separate
+        // because a TLS port that answers is not a route.
+        val transportLinks: Int = 0,
         val totalLinks: Int = 0,
         val knownNodes: Int = 0,
         val sessionCount: Int = 0,
         val restartCount: Int = 0,
-        // Endpoint (query stripped, lowercased) -> link latency in ms for the links
-        // the core itself reports up. The TCP scanner cannot know this: a node can
-        // refuse a plain handshake while the Yggdrasil link over the same endpoint
-        // carries traffic, and the scanner used to grey out exactly those peers.
-        val upPeers: Map<String, Int> = emptyMap()
+        // Endpoint (query stripped, lowercased) -> link latency in ms for the links the core
+        // confirmed. The TCP scanner cannot know this: a node can refuse a plain handshake
+        // while the Yggdrasil link over the same endpoint carries traffic, and the scanner
+        // used to grey out exactly those peers.
+        val livePeers: Map<String, Int> = emptyMap()
     )
 
     private external fun nativeInitCore(profileId: String, mnemonic: String, filesDir: String): String?
@@ -137,30 +142,39 @@ object YggNativeCoreBridge {
     /**
      * Reads the live mesh state of a profile's core. This is the authoritative
      * source for "is the node really connected": the Kotlin side can only see
-     * TCP/TLS reachability of a peer list, while the core knows which public
-     * links are up and which remote nodes its routing tree reached.
+     * TCP/TLS reachability of a peer list, while the core knows which remote nodes
+     * its routing tree reached and which links finished the overlay handshake.
      */
     fun readMeshState(profileId: String): CoreMeshState {
         val result = getPeersJson(profileId)
         if (!result.ok) return CoreMeshState(available = false)
         val raw = result.rawJson
-        val upPeers = readCoreUpPeers(raw)
+        val livePeers = readCoreConfirmedPeers(raw)
         return CoreMeshState(
             available = true,
-            liveLinks = extractJsonInt(raw, "upCount", 0),
+            liveLinks = livePeers.size,
+            transportLinks = extractJsonInt(raw, "upCount", 0),
             totalLinks = extractJsonInt(raw, "total", 0),
             knownNodes = extractJsonInt(raw, "knownNodes", 0),
             sessionCount = extractJsonInt(raw, "sessionCount", 0),
-            upPeers = upPeers
+            livePeers = livePeers
         )
     }
 
     /**
-     * Per-link state straight from the core's dial table. The URI the core reports
-     * carries the `maxbackoff` query it appended, so it is stripped here to match the
-     * endpoint exactly as the database stores it.
+     * The peers this node really has an overlay link with.
+     *
+     * `Up` alone is not enough. yggdrasil-go (src/core/api.go, v0.5.14) sets it the moment a
+     * connection object exists and fills `Key`, `Root` and `Latency` only from the ironwood
+     * debug table, which the far side joins after it completes the overlay handshake. Counting
+     * `Up` reported 14 "live links" on a node whose routing tree knew one node, had zero
+     * sessions and never got a handshake back from any peer - sockets to ports that answer
+     * TLS are not routes.
+     *
+     * The URI the core reports carries the `maxbackoff` query it appended, so it is stripped
+     * here to match the endpoint exactly as the database stores it.
      */
-    internal fun readCoreUpPeers(rawJson: String): Map<String, Int> {
+    internal fun readCoreConfirmedPeers(rawJson: String): Map<String, Int> {
         val peers = try {
             JSONObject(rawJson).optJSONArray("peers")
         } catch (_: Exception) {
@@ -170,6 +184,10 @@ object YggNativeCoreBridge {
         for (i in 0 until peers.length()) {
             val peer = peers.optJSONObject(i) ?: continue
             if (!peer.optBoolean("Up", false)) continue
+            // ed25519.PublicKey marshals to a base64 string; a peer with no key behind the
+            // socket never shook hands, so it is not a link.
+            val key = peer.opt("Key")
+            if (key !is String || key.isBlank()) continue
             val endpoint = peer.optString("URI").substringBefore("?").trim().lowercase()
             if (endpoint.isNotBlank()) {
                 result[endpoint] = (peer.optLong("Latency", 0L) / 1_000_000L).toInt()
@@ -263,25 +281,15 @@ object YggNativeCoreBridge {
         invoke { nativeProbeOverlay(profileId, timeoutMs) }
 
     /**
-     * Number of public peer links that are currently up, as reported by the
-     * core. -1 when the core cannot be queried at all.
+     * Public links finished with an overlay handshake, as reported by the core.
+     * -1 when the core cannot be queried at all. Callers treat anything above zero as
+     * «the node can reach the mesh», so counting sockets here would let a node holding
+     * only unanswered connections claim a route it does not have.
      */
     fun livePeerCount(profileId: String): Int {
         val result = getPeersJson(profileId)
         if (!result.ok) return -1
-        val raw = result.rawJson
-        val marker = "\"upCount\":"
-        val start = raw.indexOf(marker)
-        if (start < 0) return -1
-        var i = start + marker.length
-        var value = 0
-        var digits = 0
-        while (i < raw.length && raw[i].isDigit()) {
-            value = value * 10 + (raw[i] - '0')
-            i++
-            digits++
-        }
-        return if (digits > 0) value else -1
+        return readCoreConfirmedPeers(result.rawJson).size
     }
 
     /**

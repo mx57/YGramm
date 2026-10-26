@@ -61,6 +61,7 @@ class NetworkDpiController(
 
     private var watchdogJob: Job? = null
     private var peerScanJob: Job? = null
+    private var lastWatchdogFailoverAt = 0L
 
     init {
         syncCoverTransport()
@@ -121,7 +122,7 @@ class NetworkDpiController(
             // network letting a masked handshake through says nothing about the far node
             // finishing the overlay handshake, and vice versa.
             val liveLinks = networkEngine.coreLiveLinkCount()
-            val linkSuffix = if (liveLinks >= 0) " • линков ядра сейчас: $liveLinks" else ""
+            val linkSuffix = if (liveLinks >= 0) " • линков с рукопожатием: $liveLinks" else ""
             val summary = when {
                 probes.isEmpty() -> "Проверять маску не на чём: список пиров пуст."
                 accepted == 0 -> "Ни один пир из ${probes.size} не принял рукопожатие с SNI " +
@@ -155,10 +156,16 @@ class NetworkDpiController(
                 val liveLinks = networkEngine.coreLiveLinkCount()
                 if (liveLinks < 0) continue
                 if (liveLinks < 2) {
-                    // The node itself is the authority: at one public link every route
-                    // depends on a single flapping neighbour, whatever the stored peer
-                    // flags say.
-                    autoCascadeFailover("Ядро держит лишь $liveLinks живых линков: автопилот добавляет резервные узлы...")
+                    // The node itself is the authority: at one confirmed link every route
+                    // depends on a single flapping neighbour, whatever the stored peer flags
+                    // say. The count is now peers that finished the overlay handshake, so a
+                    // node holding a dozen dead sockets and shaking hands on none is finally
+                    // seen as isolated - and needs a pause between spare-node hunts, otherwise
+                    // this branch would hit the peer directory every 30 seconds.
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now - lastWatchdogFailoverAt < WATCHDOG_FAILOVER_COOLDOWN_MS) continue
+                    lastWatchdogFailoverAt = now
+                    autoCascadeFailover("Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы...")
                     continue
                 }
                 val connectedPeers = repository.getAllPeersNow().filter { it.isConnected }
@@ -293,6 +300,10 @@ class NetworkDpiController(
 
     private companion object {
         const val WATCHDOG_PEER_ID = "peer_watchdog_active"
+
+        // How often the watchdog is allowed to hunt for a spare node while the core reports
+        // fewer than two handshaked links.
+        const val WATCHDOG_FAILOVER_COOLDOWN_MS = 300_000L
 
         // A scan has to finish while the user is watching the screen. The freshest nodes are
         // probed first, so the budget cuts the stale tail of the catalog rather than the live
