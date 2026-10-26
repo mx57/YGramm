@@ -100,8 +100,9 @@ enum class CensorshipPreset(
         title = "Обход Белых Списков (CDN WSS + RU SNI)",
         badge = "WHITELIST WSS",
         summary = "Пиры tls:// и wss:// на порту 443: рукопожатие идёт через TLS-стек телефона " +
-            "(ALPN h2/http1.1) с выбранным разрешённым SNI; открытые tcp://-пиры дополнительно " +
-            "пробуются как TLS на 443. Это единственная маска, которая уходит в трафик."
+            "(ALPN h2/http1.1) с выбранным разрешённым SNI; открытые tcp://-пиры под этим " +
+            "профилем набираются только как TLS на 443 — исходный диал ядро снимает. " +
+            "Это единственная маска, которая уходит в трафик."
     ),
     TSPU_VLESS_SHADOWTLS(
         title = "ТСПУ Анти-Зондирование (VLESS + ShadowTLS v3)",
@@ -531,7 +532,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     repository.updateConversationRouteStatus(
                         chatId = chatId,
                         isOnline = true,
-                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток), автоповтор каждые 45 с"
+                        routeSummary = "Очередь S&F • узел не ответил ACK за 2 минуты ($attempts попыток) • " +
+                            "автоповтор от 45 с до 15 мин, сразу при новом маршруте"
                     )
                 }
             }
@@ -859,11 +861,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         // transition, so a message queued while the overlay had no live peer stayed
         // queued for the whole session even after the route recovered.
         viewModelScope.launch {
+            // A queue with no route drains nothing: each tick only re-runs the same lookup.
+            // The mesh observer still flushes on a new link or tree entry, so a queue that
+            // made no progress slows its own polling instead of hammering a dead overlay.
+            var lastQueuedSize = -1
+            var idleTicks = 0
             while (true) {
-                delay(45_000L)
-                if (repository.getQueuedMessages().isEmpty()) continue
+                val waitMs = minOf(45_000L shl minOf(idleTicks, 5), 15 * 60_000L)
+                delay(waitMs)
+                val queuedSize = repository.getQueuedMessages().size
+                if (queuedSize == 0) {
+                    lastQueuedSize = 0
+                    idleTicks = 0
+                    continue
+                }
                 if (!networkEngine.isRealNetworkAvailable()) continue
-                flushQueuedMessagesOverRealNetwork("таймер 45 с")
+                idleTicks = if (queuedSize == lastQueuedSize) idleTicks + 1 else 0
+                lastQueuedSize = queuedSize
+                flushQueuedMessagesOverRealNetwork("таймер ${waitMs / 1000} с")
             }
         }
 

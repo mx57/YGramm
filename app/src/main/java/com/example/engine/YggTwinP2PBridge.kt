@@ -4048,7 +4048,8 @@ class YggTwinP2PBridge(
                 logPacket(
                     direction = "ERR • YGG",
                     summary = "ACK от «$peerTitle» не получен за 2 минуты — сообщение возвращено в очередь",
-                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра переподключены, автоповтор через 45 с"
+                    details = "messageId=${messageId.take(12)} • выполнено попыток: $attempt • линки ядра " +
+                        "переподключены, автоповтор от 45 с до 15 мин"
                 )
                 // A path entry outlives the links it was learned on: the frame is then
                 // forwarded into a dead path and vanishes with no error anywhere. Put the
