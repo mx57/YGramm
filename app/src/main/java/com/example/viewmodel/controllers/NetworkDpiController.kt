@@ -220,23 +220,28 @@ class NetworkDpiController(
         // stale list cannot name. Ask the directory once, here, because this path only runs
         // when the current links are already failing.
         val livePeers = withContext(Dispatchers.IO) {
-            try {
-                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
-            } catch (_: Exception) {
-                emptyList()
-            }
-        }.filter { it.endpointUri.isNotBlank() }
+            YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200).peers
+        }
         if (livePeers.isNotEmpty()) {
             _peerScanner.update { state ->
                 state.copy(
-                    discoveredPeers = (state.discoveredPeers + livePeers).distinctBy { it.endpointUri }
+                    discoveredPeers = (livePeers + state.discoveredPeers).distinctBy { it.endpointUri }
                 )
             }
         }
-        val validCandidates = (candidatePeers + livePeers).filter { it.endpointUri.isNotBlank() }
+        val validCandidates = (candidatePeers + livePeers)
+            .filter { it.endpointUri.isNotBlank() }
             .distinctBy { it.endpointUri }
+            // Freshest first: this path runs precisely because the current links died, and the
+            // spare most likely to still be up is a node the directory saw answering recently,
+            // not one picked at random out of a list that ages.
+            .sortedWith(
+                compareByDescending<DiscoveredYggPeer> { it.lastSeenAtMs }
+                    .thenByDescending { if (it.latencyMs > 0) 1 else 0 }
+            )
+            .take(5)
 
-        for (candidate in validCandidates.shuffled().take(5)) {
+        for (candidate in validCandidates) {
             val probe = networkEngine.probeRealYggdrasilPeer(
                 endpointUri = candidate.endpointUri,
                 sniOverride = candidate.sniDomain,
@@ -288,6 +293,11 @@ class NetworkDpiController(
 
     private companion object {
         const val WATCHDOG_PEER_ID = "peer_watchdog_active"
+
+        // A scan has to finish while the user is watching the screen. The freshest nodes are
+        // probed first, so the budget cuts the stale tail of the catalog rather than the live
+        // head, and the summary states how many candidates were left unprobed.
+        const val MAX_PEER_PROBES_PER_SCAN = 96
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {
@@ -455,23 +465,29 @@ class NetworkDpiController(
                 )
             }
 
+            val directory = withContext(Dispatchers.IO) {
+                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
+            }
             val candidateCatalog = withContext(Dispatchers.IO) {
-                val liveFetched = try {
-                    YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                if (liveFetched.isNotEmpty()) {
-                    (_peerScanner.value.discoveredPeers + liveFetched).distinctBy { it.endpointUri }
+                if (directory.peers.isNotEmpty()) {
+                    // Live entries first and deduplicated on the live copy: it is the one that
+                    // carries a real sighting timestamp, and the same node can appear in the
+                    // shipped catalog under a hostname instead of the IP it resolved to.
+                    (directory.peers + _peerScanner.value.discoveredPeers)
+                        .distinctBy { it.endpointUri.lowercase() }
                 } else {
                     _peerScanner.value.discoveredPeers
                 }
             }
 
-            val toProbe = candidateCatalog.filter {
+            val matching = candidateCatalog.filter {
                 (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
                     (!_peerScanner.value.onlyWhitelistCompatible || it.whitelistCompatible)
             }
+            // The catalog is already ordered freshest-first, so the probe budget is spent on
+            // the nodes another network just saw answering. Probing all three hundred would
+            // take half a minute and mostly confirm what the directory already reported dead.
+            val toProbe = matching.take(MAX_PEER_PROBES_PER_SCAN)
 
             val probedMap = withContext(Dispatchers.IO) {
                 toProbe.chunked(16).flatMap { batch ->
@@ -507,11 +523,28 @@ class NetworkDpiController(
             }
             val bestRtt = reachableInSelection.minOfOrNull { it.latencyMs }
 
-            val summary = if (reachableInSelection.isNotEmpty()) {
-                "Живой замер завершен: ответили ${reachableInSelection.size} из ${toProbe.size} узлов • Лучший пинг: $bestRtt мс"
-            } else {
-                "Проверено ${toProbe.size} узлов: ни один не ответил на прямое TCP/TLS соединение"
+            val dropped = mutableListOf<String>().apply {
+                if (directory.skippedDown > 0) add("не отвечает каталогу: ${directory.skippedDown}")
+                if (directory.skippedStale > 0) add("не виден ${YggPeerScannerCatalog.freshWindowMs / 60000} мин: ${directory.skippedStale}")
+                if (directory.skippedOldProtocol > 0) add("старый протокол: ${directory.skippedOldProtocol}")
             }
+            val directoryPart = when {
+                directory.errorDetail != null ->
+                    "Каталог недоступен (${directory.errorDetail}), проверен упакованный список"
+                directory.peers.isEmpty() ->
+                    "Каталог вернул 0 свежих узлов из ${directory.reportedTotal}"
+                else ->
+                    "Каталог: ${directory.reportedTotal} узлов, свежих ${directory.usableCount}" +
+                        if (dropped.isEmpty()) "" else " • отброшено ${dropped.joinToString(" • ")}"
+            }
+            val probePart = if (reachableInSelection.isNotEmpty()) {
+                "ответили ${reachableInSelection.size} из ${toProbe.size} проверенных" +
+                    if (matching.size > toProbe.size) " (в очереди ещё ${matching.size - toProbe.size})" else ""
+            } else {
+                "из ${toProbe.size} проверенных не ответил ни один"
+            }
+            val summary = "$directoryPart • $probePart" +
+                (if (bestRtt != null) " • лучший пинг $bestRtt мс" else "")
 
             _peerScanner.update { state ->
                 state.copy(

@@ -7,9 +7,11 @@ import android.net.NetworkCapabilities
 import android.provider.Settings
 import com.example.data.UserProfileEntity
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.io.PrintWriter
+import java.io.RandomAccessFile
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -63,6 +65,9 @@ data class IncomingTwinPacket(
     val attachmentType: String? = null,
     val attachmentUri: String? = null,
     val attachmentBase64: String? = null,
+    // Set when the bytes came through the piece stream and this device verified the Merkle root
+    // itself; an inline payload leaves it empty and the receiver hashes the file it saved.
+    val streamedAttachmentRoot: String = "",
     val voiceDurationSec: Int = 0,
     val voiceWaveformCsv: String? = null,
     // Wire id of the message this one quotes, and the original author for forwards.
@@ -99,6 +104,66 @@ data class ReactionDispatchResult(
     val transport: String = "",
     val rttMs: Long = -1L,
     val errorDetail: String? = null
+)
+
+/**
+ * A request to erase one message from this device. [proofEnvelope] is the AEAD proof that the
+ * requester authored that message; the repository refuses the request when it does not verify.
+ */
+data class IncomingDeletePacket(
+    val chatId: String,
+    val wireMessageId: String,
+    val deleteId: String,
+    val senderIpv6: String,
+    val proofEnvelope: String
+)
+
+data class DeleteDispatchResult(
+    val delivered: Boolean,
+    val endToEndConfirmed: Boolean = false,
+    val transport: String = "",
+    val rttMs: Long = -1L,
+    val errorDetail: String? = null
+)
+
+/**
+ * One frame of a streamed large-file transfer. Each piece is its own AEAD message keyed by the
+ * conversation and bound to its index, so a piece that does not decrypt is dropped rather than
+ * written; the transfer only completes when the Merkle root over the pieces actually written
+ * matches the root the sender declared up front.
+ */
+data class IncomingFilePieceFrame(
+    val chatId: String,
+    val transferId: String,
+    val senderIpv6: String,
+    val senderEd25519PubHex: String
+)
+
+data class FileStreamDispatchResult(
+    val delivered: Boolean,
+    val piecesSent: Int = 0,
+    val piecesTotal: Int = 0,
+    val bytesTransferred: Long = 0L,
+    val merkleRootHex: String = "",
+    val errorDetail: String? = null
+)
+
+/**
+ * Live state of one streamed transfer. Both ends report it: the sender counts acknowledged
+ * pieces, the receiver counts written ones, so the progress bar and the transfer ledger show
+ * bytes that really moved instead of an estimate.
+ */
+data class FileTransferProgress(
+    val chatId: String,
+    val transferId: String,
+    val fileName: String,
+    val doneBytes: Long,
+    val totalBytes: Long,
+    val elapsedMs: Long,
+    val merkleRootHex: String,
+    val isOutgoing: Boolean,
+    // "STREAMING" while pieces move, "VERIFIED" after the Merkle root matched, "FAILED" otherwise.
+    val state: String
 )
 
 data class IncomingCallSignalPacket(
@@ -234,6 +299,20 @@ class YggTwinP2PBridge(
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
     private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {},
+    private val onDeleteForEveryoneReceived: suspend (IncomingDeletePacket) -> Unit = {},
+    /**
+     * Gives the AEAD key for one streamed file transfer: the repository derives it from the
+     * conversation's pinned peer X25519 key and the local profile's own private key, so a piece
+     * from any other node simply fails to decrypt and is refused.
+     */
+    private val resolveFileTransferKey: suspend (profileId: String, chatId: String, transferId: String) -> ByteArray? = { _, _, _ -> null },
+    /**
+     * Finds the local dialog an inbound stream belongs to. The chatId inside the frame is the
+     * sender's own row and means nothing on this device, and without the local dialog there is
+     * no pinned peer key to verify the pieces against.
+     */
+    private val resolveIncomingDialogChatId: suspend (profileId: String, senderPubKeyHex: String, senderIpv6: String) -> String? = { _, _, _ -> null },
+    private val onFileTransferProgress: suspend (FileTransferProgress) -> Unit = {},
     private val onReadReceiptReceived: suspend (chatId: String, wireMessageIds: List<String>) -> Unit = { _, _ -> },
     private val onTypingReceived: suspend (chatId: String, senderNodeLabel: String, senderIpv6: String) -> Unit = { _, _, _ -> },
     private val onIncomingCallSignalReceived: suspend (IncomingCallSignalPacket) -> Unit = {},
@@ -270,6 +349,11 @@ class YggTwinP2PBridge(
     private val packetCounter = AtomicLong(1L)
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
+    // The last round trip this node actually measured from the peer. An internet overlay route
+    // answers in tens of seconds while a LAN frame returns in milliseconds, so every stream
+    // budget is derived from what the wire really costs instead of a fixed guess.
+    private val observedOverlayAckRttMs = AtomicLong(0L)
+
     // Known direct IP:Port endpoints discovered via LAN multicast or explicit contact URI (only used when allowDirectLanRouting = true)
     private val directEndpointTable = ConcurrentHashMap<String, InetSocketAddress>()
 
@@ -283,6 +367,21 @@ class YggTwinP2PBridge(
     private val incomingAttachmentAssemblies = ConcurrentHashMap<String, AttachmentAssembly>()
     private val completedAttachmentPayloads = ConcurrentHashMap<String, Pair<String, Long>>()
     private val pendingChunkAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
+
+    // Streamed large files. Inbound: one open .part file per transfer plus the digests of the
+    // pieces actually written, which are what the Merkle root is re-checked against. Outbound:
+    // the highest piece count the peer has acknowledged and the coroutine waiting on it.
+    private val incomingFileStreams = ConcurrentHashMap<String, IncomingFileStream>()
+    private val completedFileStreams = ConcurrentHashMap<String, CompletedFileStream>()
+    private val outgoingStreamHave = ConcurrentHashMap<String, Int>()
+    // A stream of a real file runs for minutes, so the queue happily launches a second attempt
+    // for the same message while the first is still going. Both then wait on the one ack-waiter
+    // keyed by this transfer and each steals the other's acknowledgement, so neither window ever
+    // completes. One attempt per transfer runs at a time.
+    private val runningFileStreams = ConcurrentHashMap.newKeySet<String>()
+    private val outgoingStreamVerified = ConcurrentHashMap<String, Boolean>()
+    private val outgoingStreamRefusal = ConcurrentHashMap<String, String>()
+    private val streamAckWaiters = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Int>>()
 
     private data class CallMediaSession(
         val callId: String,
@@ -309,6 +408,49 @@ class YggTwinP2PBridge(
         val chunks = ConcurrentHashMap<Int, String>()
     }
 
+    private class CompletedFileStream(
+        val localUri: String,
+        val merkleRootHex: String,
+        val fileName: String,
+        val totalBytes: Long,
+        val completedAtMs: Long
+    )
+
+    /**
+     * One inbound streamed file. Pieces are accepted strictly in index order, so the resume
+     * point is a single counter and the digest list is already in leaf order for the tree.
+     */
+    private class IncomingFileStream(
+        val transferId: String,
+        val chatId: String,
+        val fileName: String,
+        val fileType: String,
+        val totalBytes: Long,
+        val pieceBytes: Int,
+        val pieceCount: Int,
+        val declaredRoot: String,
+        val key: ByteArray,
+        val partFile: File,
+        val startedAtMs: Long
+    ) {
+        // Pieces are accepted in whatever order the overlay delivers them, exactly like a
+        // torrent: one lost datagram must not throw away the thirty-two that arrived after it.
+        // `nextIndex` is therefore the cumulative prefix the sender resumes from, not a cursor.
+        val have = BooleanArray(pieceCount)
+        val digests = arrayOfNulls<ByteArray>(pieceCount)
+        var nextIndex = 0
+        var writtenBytes = 0L
+        // -1 until a hole has already been reported for the current prefix, so a window of
+        // out-of-order pieces answers once instead of once per piece.
+        var holeAckedFor = -1
+        // The prefix the sender was last told about. Pieces arrive out of order, so the prefix
+        // jumps by whatever the hole filled in — an absolute window boundary can be skipped
+        // entirely and the sender would sit on a timeout for nothing.
+        var lastAckedPrefix = 0
+        // Pieces that failed to open. One is a bit in transit; a whole window is the wrong key.
+        var rejects = 0
+    }
+
     private companion object {
         // Base64 chars per chunk. Values are Base64-encoded again by the wire frame,
         // so 18k chars become a ~25k datagram — below any plausible session MTU.
@@ -318,6 +460,18 @@ class YggTwinP2PBridge(
         const val ATTACHMENT_CHUNK_WINDOW = 4
         const val ATTACHMENT_CHUNK_ACK_TIMEOUT_MS = 6_000L
         const val CHUNK_ASSEMBLY_TTL_MS = 10 * 60 * 1000L
+
+        // Pieces in flight before the sender waits for the peer's cumulative acknowledgement.
+        // A mesh round trip is seconds, not milliseconds, so the window has to be wide enough
+        // that one acknowledgement pays for a meaningful slice of the file.
+        const val FILE_PIECE_WINDOW = 32
+        const val FILE_PIECE_ACK_TIMEOUT_MS = 9_000L
+        // Consecutive windows with no forward progress abort the stream with a real reason.
+        // The peer now accepts pieces out of order, so a window only counts as stalled when the
+        // hole at its front survived a re-send — eight of those means the route is truly broken.
+        const val FILE_STREAM_MAX_STALLED_WINDOWS = 8
+        const val FILE_STREAM_TTL_MS = 45 * 60 * 1000L
+        const val FILE_COMPLETED_LOOKUP_TTL_MS = 20 * 60 * 1000L
 
         const val CORE_WATCHDOG_INTERVAL_MS = 15_000L
         const val CORE_RETRY_MIN_BACKOFF_MS = 20_000L
@@ -576,6 +730,7 @@ class YggTwinP2PBridge(
 
     fun start() {
         listenersRequested = true
+        pruneStalePartFiles()
         scope.launch {
             if (tcpListenerJob?.isActive == true) return@launch
             tcpListenerJob = launch { runPrimaryTcpListener() }
@@ -594,6 +749,35 @@ class YggTwinP2PBridge(
             launch {
                 applyLanDiscoveryState()
             }
+        }
+    }
+
+    /**
+     * Removing the piece scratch left by a previous run.
+     *
+     * An inbound stream lives only in this process, so a «.part» file found at startup belongs to
+     * nothing that can still be resumed: the sender re-opens the transfer with FILE_BEGIN, which
+     * starts the file over. Without this sweep an interrupted large file stayed on disk forever —
+     * no message row points at it, so the orphan purge deliberately ignores «.part» files.
+     */
+    private fun pruneStalePartFiles() {
+        val dir = context?.filesDir?.let { File(it, "ygg_attachments") } ?: return
+        val live = incomingFileStreams.values.mapTo(mutableSetOf()) { it.partFile.name }
+        val children = dir.listFiles { file: File ->
+            file.name.startsWith("stream_") && file.name.endsWith(".part") && !live.contains(file.name)
+        } ?: return
+        var freed = 0L
+        children.forEach { file ->
+            val size = file.length()
+            if (file.delete()) freed += size
+        }
+        if (freed > 0L) {
+            logPacket(
+                direction = "STREAM",
+                summary = "Удалены осколки незавершённых приёмов предыдущего запуска",
+                details = "Освобождено ${freed / 1024} КБ • файлов ${children.size}",
+                mirror = true
+            )
         }
     }
 
@@ -735,6 +919,9 @@ class YggTwinP2PBridge(
     // the id of the message it reacts to, and completing a message ACK with it would
     // falsely upgrade that message to DELIVERED.
     private val pendingReactionAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
+    // A delete is keyed by its own event id, exactly like a reaction: the ACK for a delete of
+    // message X must not be read as the delivery ACK of message X.
+    private val pendingDeleteAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
     private val profileIdToPubKeyMap = ConcurrentHashMap<String, String>() // profileId -> Ed25519 node pubkey hex
     private val pubKeyToProfileIdMap = ConcurrentHashMap<String, String>() // Ed25519 node pubkey hex -> profileId
     // What the running node reported about itself, kept across profile syncs: the stored
@@ -1040,6 +1227,10 @@ class YggTwinP2PBridge(
                     }
                     continue
                 }
+                // An idle poll is not a lost frame: the core answers {"ok":true,"timeout":true}
+                // when nothing arrived, and counting that as loss buried the real drops
+                // under thousands of phantom ones.
+                if (pollResult.rawJson.contains("\"timeout\":true")) continue
                 val decoded = YggNativeCoreBridge.decodeOverlayPayload(pollResult.rawJson)
                 if (decoded == null) {
                     noteOverlayDrop(profileId, "payload оверлея не раскодирован")
@@ -1308,6 +1499,718 @@ class YggTwinP2PBridge(
         return confirmed == chunkCount
     }
 
+    // ── Streamed large-file transport ────────────────────────────────────────
+    // A file above the inline ceiling never becomes one Base64 blob: it travels as
+    // separately encrypted pieces that the receiver writes straight into a .part file at
+    // their own offsets. Nothing here holds more than one piece in memory, the peer can
+    // restart a broken run at the piece it already has, and the whole file is only
+    // accepted once the Merkle root over the written pieces equals the declared one.
+
+    /** The app's own readable copy of an attachment, or null when the Uri is not one. */
+    private fun streamedSourceFile(attachmentUri: String?): File? {
+        val raw = attachmentUri?.takeIf { it.startsWith("file://") } ?: return null
+        val path = try {
+            android.net.Uri.parse(raw).path
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        val file = File(path)
+        return if (file.isFile && file.canRead() && file.length() > 0L) file else null
+    }
+
+    private fun pieceLengthOf(totalBytes: Long, pieceBytes: Int, index: Int): Int {
+        val offset = index.toLong() * pieceBytes
+        return (totalBytes - offset).coerceAtMost(pieceBytes.toLong()).toInt()
+    }
+
+    private fun readPieceAt(raf: RandomAccessFile, offset: Long, length: Int): ByteArray? {
+        if (length <= 0) return null
+        raf.seek(offset)
+        val buffer = ByteArray(length)
+        var filled = 0
+        while (filled < length) {
+            val read = raf.read(buffer, filled, length - filled)
+            if (read < 0) break
+            filled += read
+        }
+        return buffer.takeIf { filled == length }
+    }
+
+    private fun streamAckFrame(
+        kind: String,
+        transferId: String,
+        haveThrough: Int,
+        sentAt: String,
+        rootVerified: Boolean? = null,
+        refusalReason: String? = null
+    ): String = encodeWireFrame(
+        buildMap {
+            put("type", "ACK")
+            put("fileStreamAck", kind)
+            put("transferId", transferId)
+            put("haveThrough", haveThrough.toString())
+            put("sentAt", sentAt)
+            rootVerified?.let { put("rootVerified", if (it) "1" else "0") }
+            refusalReason?.let { put("streamRefusal", it) }
+        }
+    )
+
+    /**
+     * How long a stream frame waits for its acknowledgement. A fixed number is wrong twice: on a
+     * LAN it idles for minutes, on an internet overlay route (measured at tens of seconds here)
+     * it abandons a peer that was about to answer. The budget follows the round trip this node
+     * actually measured, with headroom and hard bounds.
+     */
+    private fun streamAckTimeout(minMs: Long): Long =
+        (observedOverlayAckRttMs.get() * 4L).coerceIn(minMs, 120_000L)
+
+    /**
+     * Registers the waiter before the frame goes out, so an acknowledgement that arrives
+     * immediately is never missed. Returns the peer's cumulative piece count, or -1 when the
+     * frame was not sent or nothing was confirmed inside the budget.
+     */
+    private suspend fun askStreamAck(
+        transferId: String,
+        frame: String,
+        kind: String,
+        send: () -> Boolean,
+        timeoutMs: Long
+    ): Int {
+        val waiter = kotlinx.coroutines.CompletableDeferred<Int>()
+        streamAckWaiters[transferId] = waiter
+        outgoingStreamHave.remove(transferId)
+        if (!send()) {
+            streamAckWaiters.remove(transferId, waiter)
+            return -1
+        }
+        val reported = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { waiter.await() }
+        streamAckWaiters.remove(transferId, waiter)
+        return reported ?: outgoingStreamHave[transferId] ?: -1
+    }
+
+    /**
+     * Streams one file to the peer through the overlay. Returns only after every piece was
+     * acknowledged and the peer confirmed the Merkle root, so the caller can honestly mark the
+     * message delivered; any other outcome comes back with the reason and the piece count lost.
+     *
+     * A second attempt for a transfer that is already running is refused here rather than
+     * started: the two would fight over the single acknowledgement slot of this transfer.
+     */
+    private suspend fun streamFileOverOverlay(
+        senderProfileId: String,
+        recipientKeyHex: String,
+        transferId: String,
+        chatId: String,
+        sourceFile: File,
+        attachmentName: String?,
+        attachmentType: String?,
+        peerIpv6: String,
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        senderNodeLabel: String,
+        send: (String, String) -> Boolean
+    ): FileStreamDispatchResult {
+        if (!runningFileStreams.add(transferId)) {
+            logPacket(
+                direction = "SYS • STREAM",
+                summary = "Повторная попытка не запущена: этот файл уже передаётся",
+                details = "«${attachmentName ?: sourceFile.name}» • transferId=${transferId.take(12)} • сообщение останется в очереди S&F"
+            )
+            return FileStreamDispatchResult(
+                delivered = false,
+                bytesTransferred = 0L,
+                errorDetail = "файл уже передаётся этой очередью — повторная попытка не началась"
+            )
+        }
+        try {
+            return streamFilePieces(
+                senderProfileId = senderProfileId,
+                recipientKeyHex = recipientKeyHex,
+                transferId = transferId,
+                chatId = chatId,
+                sourceFile = sourceFile,
+                attachmentName = attachmentName,
+                attachmentType = attachmentType,
+                peerIpv6 = peerIpv6,
+                senderIpv6 = senderIpv6,
+                senderPubKeyHex = senderPubKeyHex,
+                senderNodeLabel = senderNodeLabel,
+                send = send
+            )
+        } finally {
+            runningFileStreams.remove(transferId)
+        }
+    }
+
+    private suspend fun streamFilePieces(
+        senderProfileId: String,
+        recipientKeyHex: String,
+        transferId: String,
+        chatId: String,
+        sourceFile: File,
+        attachmentName: String?,
+        attachmentType: String?,
+        peerIpv6: String,
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        senderNodeLabel: String,
+        send: (String, String) -> Boolean
+    ): FileStreamDispatchResult {
+        val pieceBytes = YggCryptoEngine.FILE_PIECE_BYTES
+        val name = attachmentName ?: sourceFile.name
+        val totalBytes = sourceFile.length()
+        val streamMb = YggCryptoEngine.MAX_P2P_STREAM_BYTES / (1024 * 1024)
+        val streamStartedAt = System.currentTimeMillis()
+        fun elapsedMs(): Long = System.currentTimeMillis() - streamStartedAt
+
+        fun failed(reason: String): FileStreamDispatchResult {
+            outgoingStreamHave.remove(transferId)
+            outgoingStreamVerified.remove(transferId)
+            val detail = outgoingStreamRefusal.remove(transferId) ?: reason
+            logPacket(
+                direction = "ERR • STREAM",
+                summary = "Потоковая передача не выполнена: $detail",
+                details = "«$name» • ${totalBytes / 1024} КБ • transferId=${transferId.take(12)}"
+            )
+            scope.launch {
+                onFileTransferProgress(
+                    FileTransferProgress(chatId, transferId, name, 0L, totalBytes, elapsedMs(), "", true, "FAILED")
+                )
+            }
+            return FileStreamDispatchResult(false, bytesTransferred = totalBytes, errorDetail = detail)
+        }
+
+        if (totalBytes > YggCryptoEngine.MAX_P2P_STREAM_BYTES) {
+            return failed("файл ${totalBytes / (1024 * 1024)} МБ больше предела потока $streamMb МБ")
+        }
+        val key = resolveFileTransferKey(senderProfileId, chatId, transferId)
+            ?: return failed("нет ключа X25519 собеседника — шифровать нечем")
+        val profile = withContext(Dispatchers.IO) {
+            YggCryptoEngine.pieceProfileOf(sourceFile, pieceBytes)
+        } ?: return failed("файл не читается целиком — контрольные суммы построить нечем")
+        val pieceCount = profile.pieceCount
+
+        val beginFrame = encodeWireFrame(
+            mapOf(
+                "type" to "FILE_BEGIN",
+                "transferId" to transferId,
+                "chatId" to chatId,
+                "attachmentName" to name,
+                "attachmentType" to (attachmentType ?: ""),
+                "totalBytes" to totalBytes.toString(),
+                "pieceBytes" to pieceBytes.toString(),
+                "pieceCount" to pieceCount.toString(),
+                "merkleRoot" to profile.merkleRootHex,
+                "recipientIpv6" to peerIpv6,
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "senderNodeLabel" to senderNodeLabel,
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+        val resumeFrom = askStreamAck(
+            transferId = transferId,
+            frame = beginFrame,
+            kind = "FILE_BEGIN",
+            send = { send(beginFrame, "FILE_BEGIN") },
+            timeoutMs = streamAckTimeout(FILE_PIECE_ACK_TIMEOUT_MS * 2)
+        )
+        if (resumeFrom < 0) return failed("адресат не подтвердил начало потока — проверьте маршрут")
+
+        logPacket(
+            direction = "TX -> STREAM",
+            summary = "Поток файла «$name»: ${pieceCount} кусков по ${pieceBytes / 1024} КБ",
+            details = "Merkle SHA-256 ${profile.merkleRootHex.take(16)}… • собеседник продолжит с куска $resumeFrom"
+        )
+
+        var cursor = resumeFrom.coerceIn(0, pieceCount)
+        var stalledWindows = 0
+        var wireBytes = 0L
+        RandomAccessFile(sourceFile, "r").use { raf ->
+            while (cursor < pieceCount) {
+                val windowStart = cursor
+                val windowEnd = (cursor + FILE_PIECE_WINDOW).coerceAtMost(pieceCount)
+                var windowError: String? = null
+                // The window leaves inside the acknowledgement request, so the waiter is already
+                // registered when the first piece goes out and a fast ACK can never be missed.
+                val sendWindow: () -> Boolean = {
+                    var accepted = true
+                    for (index in windowStart until windowEnd) {
+                        val length = pieceLengthOf(totalBytes, pieceBytes, index)
+                        val plain = readPieceAt(raf, index.toLong() * pieceBytes, length)
+                        if (plain == null) {
+                            windowError = "кусок $index не читается в файле"
+                            accepted = false
+                            break
+                        }
+                        val (ivBase64, cipherBase64) = YggCryptoEngine.sealFilePiece(key, plain, transferId, index)
+                        val pieceFrame = encodeWireFrame(
+                            mapOf(
+                                "type" to "FILE_PIECE",
+                                "transferId" to transferId,
+                                "chatId" to chatId,
+                                "pieceIndex" to index.toString(),
+                                "pieceBytes" to pieceBytes.toString(),
+                                "iv" to ivBase64,
+                                "ct" to cipherBase64,
+                                "senderIpv6" to senderIpv6,
+                                "senderPubKeyHex" to senderPubKeyHex,
+                                "sentAt" to (System.currentTimeMillis()).toString()
+                            )
+                        )
+                        wireBytes += pieceFrame.length
+                        if (!send(pieceFrame, "FILE_PIECE ${index + 1}/$pieceCount")) {
+                            windowError = "оверлей отклонил кусок ${index + 1}/$pieceCount"
+                            accepted = false
+                            break
+                        }
+                    }
+                    accepted
+                }
+                val acked = askStreamAck(
+                    transferId = transferId,
+                    frame = "",
+                    kind = "FILE_PIECE",
+                    send = sendWindow,
+                    timeoutMs = streamAckTimeout(FILE_PIECE_ACK_TIMEOUT_MS)
+                )
+                windowError?.let { return failed(it) }
+                if (acked > cursor) {
+                    stalledWindows = 0
+                    cursor = acked.coerceAtMost(pieceCount)
+                } else {
+                    stalledWindows++
+                    if (stalledWindows >= FILE_STREAM_MAX_STALLED_WINDOWS) {
+                        return failed("куски $windowStart..${windowEnd - 1} не подтверждены адресатом за $stalledWindows попыток")
+                    }
+                }
+                scope.launch {
+                    onFileTransferProgress(
+                        FileTransferProgress(
+                            chatId = chatId,
+                            transferId = transferId,
+                            fileName = name,
+                            doneBytes = (cursor.toLong() * pieceBytes).coerceAtMost(totalBytes),
+                            totalBytes = totalBytes,
+                            elapsedMs = elapsedMs(),
+                            merkleRootHex = profile.merkleRootHex,
+                            isOutgoing = true,
+                            state = "STREAMING"
+                        )
+                    )
+                }
+            }
+        }
+
+        val doneFrame = encodeWireFrame(
+            mapOf(
+                "type" to "FILE_DONE",
+                "transferId" to transferId,
+                "chatId" to chatId,
+                "merkleRoot" to profile.merkleRootHex,
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+        val finalHave = askStreamAck(
+            transferId = transferId,
+            frame = doneFrame,
+            kind = "FILE_DONE",
+            send = { send(doneFrame, "FILE_DONE") },
+            timeoutMs = streamAckTimeout(FILE_PIECE_ACK_TIMEOUT_MS * 2)
+        )
+        val verified = outgoingStreamVerified.remove(transferId) == true
+        if (finalHave < 0 || !verified) {
+            return failed("адресат не подтвердил целостность файла: Merkle корень не совпал или приём прерван")
+        }
+        outgoingStreamHave.remove(transferId)
+        outgoingStreamRefusal.remove(transferId)
+        scope.launch {
+            onFileTransferProgress(
+                FileTransferProgress(chatId, transferId, name, totalBytes, totalBytes, elapsedMs(), profile.merkleRootHex, true, "VERIFIED")
+            )
+        }
+        logPacket(
+            direction = "TX -> STREAM",
+            summary = "Файл «$name» передан потоком: $pieceCount кусков подтверждены адресатом",
+            details = "Merkle SHA-256 ${profile.merkleRootHex.take(24)}… • ${totalBytes / 1024} КБ файла • ${wireBytes / 1024} КБ в эфир"
+        )
+        return FileStreamDispatchResult(
+            delivered = true,
+            piecesSent = pieceCount,
+            piecesTotal = pieceCount,
+            bytesTransferred = totalBytes,
+            merkleRootHex = profile.merkleRootHex
+        )
+    }
+
+    private fun pruneFileStreams() {
+        val cutoff = System.currentTimeMillis() - FILE_STREAM_TTL_MS
+        incomingFileStreams.entries.toList().forEach { entry ->
+            if (entry.value.startedAtMs < cutoff) {
+                incomingFileStreams.remove(entry.key)
+                entry.value.partFile.delete()
+            }
+        }
+        val completedCutoff = System.currentTimeMillis() - FILE_COMPLETED_LOOKUP_TTL_MS
+        completedFileStreams.entries.toList().forEach { entry ->
+            if (entry.value.completedAtMs < completedCutoff) {
+                completedFileStreams.remove(entry.key)
+                try {
+                    android.net.Uri.parse(entry.value.localUri).path?.let { File(it).delete() }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens (or resumes) one inbound stream. The answer is the piece count already on disk:
+     * the sender continues there, so an interrupted run costs the re-sent tail, not the file.
+     */
+    private suspend fun handleFileBegin(
+        profileId: String,
+        senderPubKeyHex: String,
+        map: Map<String, String>,
+        reply: (String) -> Unit
+    ) {
+        val transferId = map["transferId"]?.takeIf { it.isNotBlank() } ?: return
+        val declaredRoot = map["merkleRoot"]?.trim()?.lowercase().orEmpty()
+        val totalBytes = map["totalBytes"]?.toLongOrNull() ?: -1L
+        val pieceBytes = map["pieceBytes"]?.toIntOrNull() ?: YggCryptoEngine.FILE_PIECE_BYTES
+        val pieceCount = map["pieceCount"]?.toIntOrNull() ?: 0
+        val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
+        pruneFileStreams()
+
+        val existing = incomingFileStreams[transferId]
+        if (existing != null && existing.declaredRoot == declaredRoot && existing.totalBytes == totalBytes) {
+            // A re-offered BEGIN is also the sender saying "my last answer never reached me".
+            // Let it report the hole once more, and count the new window from where it resumes.
+            existing.holeAckedFor = -1
+            existing.lastAckedPrefix = existing.nextIndex
+            reply(streamAckFrame("begin", transferId, existing.nextIndex, sentAt))
+            return
+        }
+
+        // The sender's chatId names a row on its own device. Here the dialog is whoever
+        // authenticated the session, because that is the conversation holding the pinned key.
+        val chatId = resolveIncomingDialogChatId(
+            profileId,
+            senderPubKeyHex,
+            map["senderIpv6"].orEmpty()
+        )
+
+        fun refuse(reason: String) {
+            // The sender is told why in the same frame, so it stops at once instead of
+            // re-offering a window this device will never accept.
+            reply(streamAckFrame("refused", transferId, 0, sentAt, refusalReason = reason))
+            logPacket(
+                direction = "ERR • STREAM",
+                summary = "Входящий поток отклонён: $reason",
+                details = "«${map["attachmentName"] ?: "файл"}» • transferId=${transferId.take(12)}"
+            )
+            scope.launch {
+                onFileTransferProgress(
+                    FileTransferProgress(
+                        chatId = chatId.orEmpty(),
+                        transferId = transferId,
+                        fileName = map["attachmentName"] ?: "файл",
+                        doneBytes = 0L,
+                        totalBytes = totalBytes.coerceAtLeast(0L),
+                        elapsedMs = 0L,
+                        merkleRootHex = declaredRoot,
+                        isOutgoing = false,
+                        state = "FAILED"
+                    )
+                )
+            }
+        }
+        if (chatId.isNullOrBlank()) return refuse("на этом устройстве нет диалога с данной нодой — поток не принят")
+        if (declaredRoot.length != 64 || !declaredRoot.all { it in '0'..'9' || it in 'a'..'f' }) {
+            return refuse("обещанный Merkle корень некорректен")
+        }
+        if (totalBytes <= 0 || totalBytes > YggCryptoEngine.MAX_P2P_STREAM_BYTES) {
+            return refuse("размер файла вне предела потока")
+        }
+        if (pieceBytes <= 0 || pieceBytes > YggCryptoEngine.FILE_PIECE_BYTES) {
+            return refuse("размер куска больше разрешённого")
+        }
+        if (pieceCount <= 0 || pieceCount.toLong() * pieceBytes < totalBytes ||
+            (pieceCount - 1).toLong() * pieceBytes >= totalBytes
+        ) {
+            return refuse("число кусков не сходится с размером файла")
+        }
+        val storage = this.context ?: return refuse("нет хранилища приложения")
+        val attachDir = File(storage.filesDir, "ygg_attachments").apply { mkdirs() }
+        val usable = attachDir.usableSpace
+        if (usable < totalBytes + 8L * 1024 * 1024) {
+            return refuse("на устройстве свободно ${usable / (1024 * 1024)} МБ — меньше, чем нужно файлу")
+        }
+        val key = resolveFileTransferKey(profileId, chatId, transferId)
+            ?: return refuse("для этого диалога нет ключа X25519 — куски нечем проверить")
+
+        val safeName = (map["attachmentName"]?.takeIf { it.isNotBlank() } ?: "file")
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_").take(80)
+        val partFile = File(attachDir, "stream_${transferId.take(24)}.part")
+        incomingFileStreams.remove(transferId)
+        if (partFile.exists()) partFile.delete()
+        val stream = IncomingFileStream(
+            transferId = transferId,
+            chatId = chatId,
+            fileName = safeName,
+            fileType = map["attachmentType"] ?: "",
+            totalBytes = totalBytes,
+            pieceBytes = pieceBytes,
+            pieceCount = pieceCount,
+            declaredRoot = declaredRoot,
+            key = key,
+            partFile = partFile,
+            startedAtMs = System.currentTimeMillis()
+        )
+        incomingFileStreams[transferId] = stream
+        logPacket(
+            direction = "RX <- STREAM",
+            summary = "Принят поток файла «$safeName» (${totalBytes / 1024} КБ, $pieceCount кусков)",
+            details = "Ключ проверки — X25519 этого диалога • корень ${declaredRoot.take(16)}…"
+        )
+        reply(streamAckFrame("begin", transferId, 0, sentAt))
+    }
+
+    private suspend fun handleFilePiece(
+        map: Map<String, String>,
+        reply: (String) -> Unit
+    ) {
+        val transferId = map["transferId"]?.takeIf { it.isNotBlank() } ?: return
+        val index = map["pieceIndex"]?.toIntOrNull() ?: return
+        val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
+        val stream = incomingFileStreams[transferId] ?: return
+        // Nothing is acknowledged for an unknown transfer: the sender's window times out and it
+        // restarts with FILE_BEGIN, which is exactly the recovery path for a lost stream state.
+        if (index < 0 || index >= stream.pieceCount) {
+            reply(streamAckFrame("piece", transferId, stream.nextIndex, sentAt))
+            return
+        }
+        if (stream.have[index]) {
+            // Already on disk and already authenticated once. Stay silent: answering a duplicate
+            // with the unchanged prefix would complete the sender's wait immediately and make it
+            // count a window it is about to fill as stalled. The sender learns the real position
+            // from the next boundary acknowledgement or from its own FILE_BEGIN resume.
+            return
+        }
+        if (index > stream.nextIndex && stream.holeAckedFor != stream.nextIndex) {
+            // A piece beyond the prefix means something before it is missing. Report the prefix
+            // once per hole instead of letting the sender burn a whole window timeout on it.
+            stream.holeAckedFor = stream.nextIndex
+            reply(streamAckFrame("piece", transferId, stream.nextIndex, sentAt))
+        }
+        val plain = try {
+            YggCryptoEngine.openFilePiece(
+                key = stream.key,
+                ivBase64 = map["iv"] ?: "",
+                cipherBase64 = map["ct"] ?: "",
+                transferId = transferId,
+                index = index
+            )
+        } catch (_: Throwable) {
+            stream.rejects++
+            logPacket(
+                direction = "ERR • STREAM",
+                summary = "Кусок $index не расшифрован ($stream.rejects из ${stream.pieceCount}) — прошу заново",
+                details = "transferId=${transferId.take(12)} • бит по дороге или письмо шло не от этого собеседника"
+            )
+            if (stream.rejects >= FILE_PIECE_WINDOW) {
+                // A whole window of bad pieces is not transit noise, it is the wrong key.
+                // Keeping the stream would only let the sender pour bytes into a file that
+                // can never be verified, so it is dropped and the sender is told why.
+                stream.partFile.delete()
+                incomingFileStreams.remove(transferId)
+                reply(
+                    streamAckFrame(
+                        "refused",
+                        transferId,
+                        stream.nextIndex,
+                        sentAt,
+                        refusalReason = "куски не расшифровываются — файл принят не будет"
+                    )
+                )
+            } else {
+                reply(streamAckFrame("piece", transferId, stream.nextIndex, sentAt))
+            }
+            return
+        }
+        if (plain.size != pieceLengthOf(stream.totalBytes, stream.pieceBytes, index)) {
+            stream.partFile.delete()
+            incomingFileStreams.remove(transferId)
+            reply(
+                streamAckFrame(
+                    "refused",
+                    transferId,
+                    index,
+                    sentAt,
+                    refusalReason = "длина куска $index не сходится с размером файла"
+                )
+            )
+            return
+        }
+        val wrote = withContext(Dispatchers.IO) {
+            try {
+                RandomAccessFile(stream.partFile, "rw").use { raf ->
+                    raf.seek(index.toLong() * stream.pieceBytes)
+                    raf.write(plain)
+                }
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
+        if (!wrote) {
+            reply(
+                streamAckFrame(
+                    "refused",
+                    transferId,
+                    stream.nextIndex,
+                    sentAt,
+                    refusalReason = "кусок $index не записан на диск"
+                )
+            )
+            return
+        }
+        stream.digests[index] = YggCryptoEngine.sha256Bytes(plain)
+        stream.have[index] = true
+        stream.writtenBytes += plain.size
+        if (index == stream.nextIndex) {
+            while (stream.nextIndex < stream.pieceCount && stream.have[stream.nextIndex]) stream.nextIndex++
+        }
+        val complete = stream.nextIndex >= stream.pieceCount
+        // The sender waits on a cumulative position, not on per-piece receipts, so it is answered
+        // once a whole window of new prefix has landed, on completion, and once per hole.
+        val reportPrefix = complete || stream.nextIndex - stream.lastAckedPrefix >= FILE_PIECE_WINDOW
+        if (reportPrefix) {
+            stream.lastAckedPrefix = stream.nextIndex
+            stream.holeAckedFor = -1
+            reply(streamAckFrame("piece", transferId, stream.nextIndex, sentAt))
+        }
+        // One progress row per piece would put thousands of coroutines on the queue for a
+        // large file, so the bar only advances together with a window acknowledgement.
+        if (reportPrefix) {
+            val doneBytes = stream.writtenBytes
+            val elapsed = System.currentTimeMillis() - stream.startedAtMs
+            scope.launch {
+                onFileTransferProgress(
+                    FileTransferProgress(
+                        chatId = stream.chatId,
+                        transferId = transferId,
+                        fileName = stream.fileName,
+                        doneBytes = doneBytes,
+                        totalBytes = stream.totalBytes,
+                        elapsedMs = elapsed,
+                        merkleRootHex = stream.declaredRoot,
+                        isOutgoing = false,
+                        state = "STREAMING"
+                    )
+                )
+            }
+        }
+    }
+
+    private suspend fun handleFileDone(
+        map: Map<String, String>,
+        reply: (String) -> Unit
+    ) {
+        val transferId = map["transferId"]?.takeIf { it.isNotBlank() } ?: return
+        val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
+        val declared = map["merkleRoot"]?.trim()?.lowercase().orEmpty()
+        val stream = incomingFileStreams[transferId]
+        if (stream == null) {
+            val already = completedFileStreams[transferId]
+            if (already != null && already.merkleRootHex == declared) {
+                reply(streamAckFrame("done", transferId, already.totalBytes.toInt(), sentAt, true))
+            }
+            return
+        }
+        val orderedDigests = stream.digests.filterNotNull()
+        val verified = declared == stream.declaredRoot &&
+            stream.nextIndex == stream.pieceCount &&
+            orderedDigests.size == stream.pieceCount &&
+            YggCryptoEngine.merkleRootOfPieceDigests(orderedDigests) == stream.declaredRoot &&
+            stream.partFile.length() == stream.totalBytes
+        if (!verified) {
+            logPacket(
+                direction = "ERR • STREAM",
+                summary = "Поток «${stream.fileName}» отброшен: контрольная сумма не сошлась",
+                details = "целых кусков ${orderedDigests.size}/${stream.pieceCount} • " +
+                    "подтверждено подряд ${stream.nextIndex}/${stream.pieceCount} • ${stream.writtenBytes}/${stream.totalBytes} Б"
+            )
+            incomingFileStreams.remove(transferId)
+            stream.partFile.delete()
+            reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            val failedBytes = stream.writtenBytes
+            val totalBytesForReport = stream.totalBytes
+            val root = stream.declaredRoot
+            val name = stream.fileName
+            val owner = stream.chatId
+            val elapsed = System.currentTimeMillis() - stream.startedAtMs
+            scope.launch {
+                onFileTransferProgress(
+                    FileTransferProgress(owner, transferId, name, failedBytes, totalBytesForReport, elapsed, root, false, "FAILED")
+                )
+            }
+            return
+        }
+        val finalFile = File(
+            stream.partFile.parentFile,
+            "rx_${System.currentTimeMillis()}_${stream.fileName}"
+        )
+        val moved = withContext(Dispatchers.IO) {
+            if (stream.partFile.renameTo(finalFile)) true
+            else runCatching {
+                stream.partFile.copyTo(finalFile, overwrite = true)
+                stream.partFile.delete()
+                true
+            }.getOrDefault(false)
+        }
+        incomingFileStreams.remove(transferId)
+        if (!moved) {
+            reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            return
+        }
+        val uri = android.net.Uri.fromFile(finalFile).toString()
+        completedFileStreams[transferId] = CompletedFileStream(
+            localUri = uri,
+            merkleRootHex = stream.declaredRoot,
+            fileName = stream.fileName,
+            totalBytes = stream.totalBytes,
+            completedAtMs = System.currentTimeMillis()
+        )
+        logPacket(
+            direction = "RX <- STREAM",
+            summary = "Файл «${stream.fileName}» принят целиком: Merkle корень совпал",
+            details = "${stream.totalBytes / 1024} КБ • ${stream.pieceCount} кусков • SHA-256 ${stream.declaredRoot.take(24)}…"
+        )
+        reply(streamAckFrame("done", transferId, stream.pieceCount, sentAt, true))
+        val owner = stream.chatId
+        val name = stream.fileName
+        val root = stream.declaredRoot
+        val bytes = stream.totalBytes
+        val elapsed = System.currentTimeMillis() - stream.startedAtMs
+        scope.launch {
+            onFileTransferProgress(
+                FileTransferProgress(owner, transferId, name, bytes, bytes, elapsed, root, false, "VERIFIED")
+            )
+        }
+    }
+
+    private suspend fun awaitCompletedStream(transferId: String): CompletedFileStream? {
+        if (transferId.isBlank()) return null
+        val deadline = System.currentTimeMillis() + 8_000L
+        while (System.currentTimeMillis() < deadline) {
+            completedFileStreams[transferId]?.let { return it }
+            delay(250L)
+        }
+        return completedFileStreams[transferId]
+    }
+
     private suspend fun handleOverlayFrame(profileId: String, payload: ByteArray, senderPubKeyHex: String) {
         val map = decodeWireFrame(String(payload, StandardCharsets.UTF_8))
         val senderIpv6 = map["senderIpv6"] ?: ""
@@ -1378,6 +2281,19 @@ class YggTwinP2PBridge(
                         return
                     }
                 }
+                // A streamed file arrived piece by piece before this frame; the MSG only names the
+                // transfer. Until the last piece is verified there is nothing to acknowledge with,
+                // so the message stays unconfirmed and the sender's queue keeps it.
+                var streamedFile = if (map["attachmentChunked"] == "2") awaitCompletedStream(wireMessageId) else null
+                if (map["attachmentChunked"] == "2" && streamedFile == null) {
+                    logPacket(
+                        direction = "ERR • STREAM",
+                        summary = "Поток файла ещё не дописан — сообщение не подтверждено",
+                        details = "messageId=${wireMessageId.take(12)} • получено ${incomingFileStreams[wireMessageId]?.nextIndex ?: 0} кусков"
+                    )
+                    recentIncomingOverlayMessages.remove(wireMessageId)
+                    return
+                }
                 val incoming = IncomingTwinPacket(
                     targetChatId = map["chatId"] ?: "",
                     messageId = wireMessageId,
@@ -1390,10 +2306,11 @@ class YggTwinP2PBridge(
                     cipherPayloadHex = map["cipherPayloadHex"] ?: "",
                     hashcashToken = map["hashcashToken"] ?: "",
                     attachmentName = map["attachmentName"]?.takeIf { it.isNotEmpty() },
-                    attachmentSizeBytes = map["attachmentSizeBytes"]?.toLongOrNull() ?: 0L,
+                    attachmentSizeBytes = streamedFile?.totalBytes ?: (map["attachmentSizeBytes"]?.toLongOrNull() ?: 0L),
                     attachmentType = map["attachmentType"]?.takeIf { it.isNotEmpty() },
-                    attachmentUri = map["attachmentUri"]?.takeIf { it.isNotEmpty() },
+                    attachmentUri = streamedFile?.localUri ?: map["attachmentUri"]?.takeIf { it.isNotEmpty() },
                     attachmentBase64 = inlineAttachment,
+                    streamedAttachmentRoot = streamedFile?.merkleRootHex ?: "",
                     voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                     voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
                     replyToMessageId = map["replyToMessageId"].orEmpty(),
@@ -1426,12 +2343,48 @@ class YggTwinP2PBridge(
                     }
                     return
                 }
+                if (map["fileStreamAck"] != null) {
+                    val transferId = map["transferId"] ?: ""
+                    if (transferId.isBlank()) return
+                    // sentAt is this device's own stamp echoed back, so the difference is a real
+                    // measured round trip — the budget for the next piece window is taken from it.
+                    map["sentAt"]?.toLongOrNull()?.let {
+                        observedOverlayAckRttMs.set((System.currentTimeMillis() - it).coerceAtLeast(1L))
+                    }
+                    if (map["fileStreamAck"] == "refused") {
+                        // The peer named its reason in the same frame; repeating a window this
+                        // device already turned down would only delay the honest banner.
+                        outgoingStreamRefusal[transferId] = map["streamRefusal"] ?: "адресат отклонил поток"
+                        streamAckWaiters.remove(transferId)?.complete(-1)
+                        return
+                    }
+                    // Cumulative: the peer names the piece count it has on disk, which confirms
+                    // every earlier piece too, so one acknowledgement covers the whole window.
+                    val have = map["haveThrough"]?.toIntOrNull() ?: -1
+                    if (have >= 0) {
+                        val best = maxOf(outgoingStreamHave[transferId] ?: 0, have)
+                        outgoingStreamHave[transferId] = best
+                        map["rootVerified"]?.let { outgoingStreamVerified[transferId] = it == "1" }
+                        streamAckWaiters.remove(transferId)?.complete(best)
+                    }
+                    return
+                }
                 val messageId = map["messageId"] ?: ""
                 val reactionId = map["reactionId"] ?: ""
+                val deleteId = map["deleteId"] ?: ""
                 val sentAt = map["sentAt"]?.toLongOrNull() ?: 0L
                 val rtt = if (sentAt > 0) (System.currentTimeMillis() - sentAt).coerceAtLeast(1L) else 1L
+                observedOverlayAckRttMs.set(rtt)
                 onTwinReachableChanged(true)
-                if (reactionId.isNotBlank()) {
+                if (deleteId.isNotBlank()) {
+                    pendingDeleteAcks.remove(deleteId)?.complete(rtt)
+                    logPacket(
+                        direction = "ACK <- YGG",
+                        summary = "Адресат подтвердил приём запроса удаления (RTT: $rtt мс)",
+                        details = "deleteId=${deleteId.take(12)} • messageId=${messageId.take(12)} • От ноды ${senderPubKeyHex.take(16)}...",
+                        mirror = true
+                    )
+                } else if (reactionId.isNotBlank()) {
                     pendingReactionAcks.remove(reactionId)?.complete(rtt)
                     logPacket(
                         direction = "ACK <- YGG",
@@ -1503,6 +2456,50 @@ class YggTwinP2PBridge(
                     )
                 }
             }
+            "MSG_DELETE" -> {
+                val targetMessageId = map["messageId"] ?: ""
+                val deleteId = map["deleteId"] ?: ""
+                val proofEnvelope = map["proof"] ?: ""
+                // The ACK only says this device received the request; whether it erases the
+                // copy is decided by the proof check in the repository.
+                val ackFrame = encodeWireFrame(
+                    mapOf(
+                        "type" to "ACK",
+                        "messageId" to targetMessageId,
+                        "deleteId" to deleteId,
+                        "chatId" to (map["chatId"] ?: ""),
+                        "sentAt" to (map["sentAt"] ?: System.currentTimeMillis().toString())
+                    )
+                )
+                sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK")
+                pruneRecentIncomingOverlayMessages()
+                val seenBefore = deleteId.isNotBlank() &&
+                    recentIncomingOverlayMessages.putIfAbsent("del:$deleteId", System.currentTimeMillis()) != null
+                if (seenBefore) {
+                    logPacket(
+                        direction = "RX <- YGG",
+                        summary = "Дубликат запроса удаления «${deleteId.take(12)}» пропущен (ретрай отправителя)",
+                        details = "Повторный ACK отправлен ноде ${senderPubKeyHex.take(16)}...",
+                        mirror = true
+                    )
+                } else {
+                    logPacket(
+                        direction = "RX <- YGG",
+                        summary = "Принят запрос удалить сообщение через оверлей Yggdrasil",
+                        details = "Сообщение: ${targetMessageId.take(16)}... • От узла $senderIpv6 • ACK отправлен",
+                        mirror = true
+                    )
+                    onDeleteForEveryoneReceived(
+                        IncomingDeletePacket(
+                            chatId = map["chatId"] ?: "",
+                            wireMessageId = targetMessageId,
+                            deleteId = deleteId,
+                            senderIpv6 = senderIpv6,
+                            proofEnvelope = proofEnvelope
+                        )
+                    )
+                }
+            }
             "READ_RECEIPT" -> {
                 onTwinReachableChanged(true)
                 val chatId = map["chatId"] ?: ""
@@ -1517,6 +2514,24 @@ class YggTwinP2PBridge(
                         details = "Диалог ${chatId.take(16)}... • От ноды ${senderPubKeyHex.take(16)}..."
                     )
                     onReadReceiptReceived(chatId, ids)
+                }
+            }
+            "FILE_BEGIN" -> {
+                onTwinReachableChanged(true)
+                handleFileBegin(profileId, senderPubKeyHex, map) { frame ->
+                    sendOverlayFrame(profileId, senderPubKeyHex, frame, "STREAM_ACK")
+                }
+            }
+            "FILE_PIECE" -> {
+                onTwinReachableChanged(true)
+                handleFilePiece(map) { frame ->
+                    sendOverlayFrame(profileId, senderPubKeyHex, frame, "STREAM_ACK")
+                }
+            }
+            "FILE_DONE" -> {
+                onTwinReachableChanged(true)
+                handleFileDone(map) { frame ->
+                    sendOverlayFrame(profileId, senderPubKeyHex, frame, "STREAM_ACK")
                 }
             }
             "ATTACH_CHUNK" -> {
@@ -1823,6 +2838,19 @@ class YggTwinP2PBridge(
                         }
                     }
 
+                    // A LAN frame may point at a stream the overlay already filled: the bytes
+                    // landed in this app's storage either way, so the message resolves to them.
+                    var lanStreamFile = if (map["attachmentChunked"] == "2") awaitCompletedStream(msgId) else null
+                    if (map["attachmentChunked"] == "2" && lanStreamFile == null) {
+                        logPacket(
+                            direction = "ERR • STREAM",
+                            summary = "Поток файла ещё не дописан — LAN-пакет не подтвержден",
+                            details = "messageId=${msgId.take(12)} • получено ${incomingFileStreams[msgId]?.nextIndex ?: 0} кусков"
+                        )
+                        if (msgId.isNotBlank()) recentIncomingOverlayMessages.remove(msgId)
+                        return
+                    }
+
                     val incoming = IncomingTwinPacket(
                         targetChatId = map["chatId"] ?: "",
                         messageId = msgId,
@@ -1835,12 +2863,13 @@ class YggTwinP2PBridge(
                         cipherPayloadHex = map["cipherPayloadHex"] ?: "",
                         hashcashToken = map["hashcashToken"] ?: "",
                         attachmentName = map["attachmentName"]?.takeIf { it.isNotEmpty() },
-                        attachmentSizeBytes = map["attachmentSizeBytes"]?.toLongOrNull() ?: 0L,
+                        attachmentSizeBytes = lanStreamFile?.totalBytes ?: (map["attachmentSizeBytes"]?.toLongOrNull() ?: 0L),
                         rttMs = rtt,
                         timestamp = map["timestamp"]?.toLongOrNull() ?: System.currentTimeMillis(),
                         attachmentType = map["attachmentType"]?.takeIf { it.isNotEmpty() },
-                        attachmentUri = map["attachmentUri"]?.takeIf { it.isNotEmpty() },
+                        attachmentUri = lanStreamFile?.localUri ?: map["attachmentUri"]?.takeIf { it.isNotEmpty() },
                         attachmentBase64 = lanAttachment,
+                        streamedAttachmentRoot = lanStreamFile?.merkleRootHex ?: "",
                         voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                         voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
                         replyToMessageId = map["replyToMessageId"].orEmpty(),
@@ -1935,6 +2964,65 @@ class YggTwinP2PBridge(
                                 senderIpv6 = senderIpv6,
                                 recipientProfileId = resolvedProfileId,
                                 action = action
+                            )
+                        )
+                    }
+                }
+                "FILE_BEGIN", "FILE_PIECE", "FILE_DONE" -> {
+                    onTwinReachableChanged(true)
+                    // The same piece state machine serves a direct socket as the overlay:
+                    // which transport carried a frame never changes what the bytes mean.
+                    val reply: (String) -> Unit = { frame -> writer.println(frame) }
+                    when (map["type"]) {
+                        "FILE_BEGIN" -> handleFileBegin(
+                            recipientProfileId,
+                            map["senderPubKeyHex"].orEmpty(),
+                            map,
+                            reply
+                        )
+                        "FILE_PIECE" -> handleFilePiece(map, reply)
+                        else -> handleFileDone(map, reply)
+                    }
+                }
+                "MSG_DELETE" -> {
+                    onTwinReachableChanged(true)
+                    val messageId = map["messageId"] ?: ""
+                    val deleteId = map["deleteId"] ?: ""
+                    val proofEnvelope = map["proof"] ?: ""
+                    val senderIpv6 = map["senderIpv6"] ?: ""
+                    writer.println(
+                        encodeWireFrame(
+                            mapOf(
+                                "type" to "ACK",
+                                "messageId" to messageId,
+                                "deleteId" to deleteId
+                            )
+                        )
+                    )
+                    pruneRecentIncomingOverlayMessages()
+                    val seenBefore = deleteId.isNotBlank() &&
+                        recentIncomingOverlayMessages.putIfAbsent("del:$deleteId", System.currentTimeMillis()) != null
+                    if (seenBefore) {
+                        logPacket(
+                            direction = "RX <- YGG",
+                            summary = "Дубликат запроса удаления «${deleteId.take(12)}» пропущен (ретрай отправителя)",
+                            details = "Повторный ACK отправлен на $remoteIp:${map["senderTcpPort"] ?: 51921}",
+                            mirror = true
+                        )
+                    } else {
+                        logPacket(
+                            direction = "RX <- YGG",
+                            summary = "Принят запрос удалить сообщение от узла $senderIpv6",
+                            details = "Сообщение: ${messageId.take(16)}... • LAN $remoteIp • ACK отправлен",
+                            mirror = true
+                        )
+                        onDeleteForEveryoneReceived(
+                            IncomingDeletePacket(
+                                chatId = map["chatId"] ?: "",
+                                wireMessageId = messageId,
+                                deleteId = deleteId,
+                                senderIpv6 = senderIpv6,
+                                proofEnvelope = proofEnvelope
                             )
                         )
                     }
@@ -2608,6 +3696,81 @@ class YggTwinP2PBridge(
             }
         }
 
+        // A file above the inline ceiling is never turned into one Base64 blob: the caller hands
+        // over no payload and the bytes travel as separately encrypted pieces, each acknowledged
+        // by the peer and resumable from the first piece it does not have yet.
+        val streamSource = if (attachmentBase64.isNullOrBlank() && !attachmentName.isNullOrBlank()) {
+            streamedSourceFile(attachmentUri)
+        } else {
+            null
+        }
+        var streamedOverlayOk = false
+        if (streamSource != null) {
+            if (!overlayReady) {
+                val err = "Файл «$attachmentName» (${streamSource.length() / (1024 * 1024)} МБ) передаётся " +
+                    "потоком по кускам, а для этого нужен оверлей Yggdrasil — он сейчас не готов"
+                logPacket(
+                    direction = "ERR • STREAM",
+                    summary = "Поток файла не начат: оверлей недоступен",
+                    details = "«$attachmentName» • ${streamSource.length() / 1024} КБ • сообщение остаётся в очереди S&F"
+                )
+                return@withContext SelfYggdrasilRelayResult(
+                    delivered = false,
+                    relayEndpointUri = "",
+                    relayRegionLabel = "",
+                    rttMs = -1L,
+                    txBytes = 0L,
+                    rxBytes = 0L,
+                    errorDetail = err
+                )
+            }
+            val stream = streamFileOverOverlay(
+                senderProfileId = senderProfileId,
+                recipientKeyHex = recipientKeyHex,
+                transferId = messageId,
+                chatId = chatId,
+                sourceFile = streamSource,
+                attachmentName = attachmentName,
+                attachmentType = attachmentType,
+                peerIpv6 = peerIpv6,
+                senderIpv6 = senderIpv6,
+                senderPubKeyHex = senderPubKeyHex,
+                senderNodeLabel = senderNodeLabel
+            ) { frame, kind -> sendOverlayFrame(senderProfileId, recipientKeyHex, frame, kind) }
+            if (!stream.delivered) {
+                return@withContext SelfYggdrasilRelayResult(
+                    delivered = false,
+                    relayEndpointUri = "",
+                    relayRegionLabel = "",
+                    rttMs = -1L,
+                    txBytes = 0L,
+                    rxBytes = 0L,
+                    errorDetail = stream.errorDetail
+                )
+            }
+            streamedOverlayOk = true
+        }
+        if (streamSource == null && attachmentBase64.isNullOrBlank() && !attachmentName.isNullOrBlank()) {
+            // A MSG that names a file nobody can open would still be ACKed as delivered, so the
+            // note stays in the queue with the reason instead.
+            val err = "Вложение «$attachmentName» не передаётся: локальный файл не найден по адресу " +
+                "(${attachmentUri?.take(48) ?: "пусто"}) — сообщение остаётся в очереди S&F"
+            logPacket(
+                direction = "ERR • ATTACH",
+                summary = "Вложение не отправлено: файл недоступен на устройстве",
+                details = "messageId=${messageId.take(12)} • «$attachmentName»"
+            )
+            return@withContext SelfYggdrasilRelayResult(
+                delivered = false,
+                relayEndpointUri = "",
+                relayRegionLabel = "",
+                rttMs = -1L,
+                txBytes = 0L,
+                rxBytes = 0L,
+                errorDetail = err
+            )
+        }
+
         // A single Yggdrasil datagram cannot carry an inline Base64 attachment larger
         // than the ~64 KB MTU. Large attachments travel first as AEAD-adjacent chunk
         // frames (each acknowledged), then the MSG frame references the assembled blob.
@@ -2670,8 +3833,12 @@ class YggTwinP2PBridge(
             "attachmentSizeBytes" to attachmentSizeBytes.toString(),
             "attachmentType" to (attachmentType ?: ""),
             "attachmentUri" to (attachmentUri ?: ""),
-            "attachmentBase64" to (if (chunkedOverlayConfirmed) "" else (attachmentBase64 ?: "")),
-            "attachmentChunked" to (if (chunkedOverlayConfirmed) "1" else "0"),
+            "attachmentBase64" to (if (chunkedOverlayConfirmed || streamedOverlayOk) "" else (attachmentBase64 ?: "")),
+            "attachmentChunked" to when {
+                streamedOverlayOk -> "2"
+                chunkedOverlayConfirmed -> "1"
+                else -> "0"
+            },
             "voiceDurationSec" to voiceDurationSec.toString(),
             "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
             "replyToMessageId" to replyToMessageId,
@@ -3186,6 +4353,169 @@ class YggTwinP2PBridge(
             details = "Причина: $reason • адресат $peerIpv6 • reactionId=${reactionId.take(12)}"
         )
         ReactionDispatchResult(
+            delivered = false,
+            endToEndConfirmed = false,
+            transport = "",
+            rttMs = -1L,
+            errorDetail = reason
+        )
+    }
+
+    /**
+     * Asks one node to erase the copy of [messageId] it holds. [proofEnvelope] is the AEAD proof
+     * of authorship produced for that node; without it the receiving device has no way to tell
+     * the request from a stranger guessing a message id, so the call is refused here as well.
+     * Delivery is confirmed by that node's ACK, keyed by [deleteId].
+     */
+    suspend fun dispatchDeleteFrame(
+        chatId: String,
+        messageId: String,
+        deleteId: String,
+        proofEnvelope: String,
+        peerIpv6: String,
+        directEndpointHint: String,
+        senderIpv6: String,
+        senderPubKeyHex: String = "",
+        recipientNodePubKeyHex: String = "",
+        candidatePeers: List<Triple<String, String, String>> = emptyList(),
+        allowLanFallback: Boolean = allowDirectLanRouting
+    ): DeleteDispatchResult = withContext(Dispatchers.IO) {
+        if (proofEnvelope.isBlank()) {
+            return@withContext DeleteDispatchResult(
+                delivered = false,
+                errorDetail = "Нет ключа собеседника: доказать авторство сообщения нечем"
+            )
+        }
+        if (directEndpointHint.isNotBlank()) {
+            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
+        }
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()] ?: ""
+        val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
+        val directAddress = resolveDirectSocketAddress(
+            peerIpv6 = peerIpv6,
+            directHint = directEndpointHint,
+            senderIpv6 = senderIpv6,
+            allowPassiveLan = allowLanFallback
+        )
+        val hasInternet = isRealNetworkAvailable()
+        val senderCoreReady = senderProfileId.isNotBlank() && initializedNativeProfiles.contains(senderProfileId)
+        val senderPort = activeProfilePortMap[senderProfileId] ?: localTcpPort
+        val wirePayload = encodeWireFrame(
+            mapOf(
+                "type" to "MSG_DELETE",
+                "deleteId" to deleteId,
+                "chatId" to chatId,
+                "messageId" to messageId,
+                "proof" to proofEnvelope,
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "senderTcpPort" to senderPort.toString(),
+                "recipientIpv6" to peerIpv6,
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+
+        var overlayPossible = hasInternet && senderCoreReady && recipientKeyHex.isNotBlank()
+        var livePeers = 0
+        if (overlayPossible) {
+            livePeers = awaitLivePeer(senderProfileId, waitMs = if (directAddress != null) 3500L else 6000L)
+            if (livePeers <= 0) overlayPossible = false
+        }
+        if (overlayPossible) {
+            logPacket(
+                direction = "TX -> YGG",
+                summary = "Запрос удалить сообщение направлен в оверлей Yggdrasil",
+                details = "К получателю $peerIpv6 • deleteId=${deleteId.take(12)} • Живых пиров: $livePeers",
+                mirror = true
+            )
+            val deferred = kotlinx.coroutines.CompletableDeferred<Long>()
+            pendingDeleteAcks[deleteId] = deferred
+            for (attempt in 1..2) {
+                if (!sendOverlayFrame(senderProfileId, recipientKeyHex, wirePayload, "MSG_DELETE")) break
+                val ackRtt = kotlinx.coroutines.withTimeoutOrNull(
+                    if (directAddress != null) 2500L else 4000L
+                ) { deferred.await() }
+                if (ackRtt != null) {
+                    pendingDeleteAcks.remove(deleteId, deferred)
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- YGG",
+                        summary = "Запрос удаления подтверждён адресатом через оверлей Yggdrasil (RTT: $ackRtt мс)",
+                        details = "Узел $peerIpv6 подтвердил приём события ${deleteId.take(12)} по сообщению ${messageId.take(16)}...",
+                        mirror = true
+                    )
+                    return@withContext DeleteDispatchResult(
+                        delivered = true,
+                        endToEndConfirmed = true,
+                        transport = "YGG_OVERLAY",
+                        rttMs = ackRtt
+                    )
+                }
+            }
+            pendingDeleteAcks.remove(deleteId, deferred)
+        }
+
+        if (directAddress != null) {
+            logPacket(
+                direction = "TX -> LAN",
+                summary = "Запрос удалить сообщение направлен напрямую по LAN",
+                details = "${directAddress.hostString}:${directAddress.port} • deleteId=${deleteId.take(12)}"
+            )
+            try {
+                val startedAt = System.currentTimeMillis()
+                var lanRtt: Long? = null
+                Socket().use { socket ->
+                    socket.soTimeout = 5000
+                    socket.connect(directAddress, 3500)
+                    val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+                    writer.println(wirePayload)
+                    val reply = reader.readLine()?.let { decodeWireFrame(it) }
+                    if (reply?.get("type") == "ACK" &&
+                        reply["messageId"] == messageId &&
+                        reply["deleteId"].orEmpty() == deleteId
+                    ) {
+                        lanRtt = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
+                    }
+                }
+                val confirmedRtt = lanRtt
+                if (confirmedRtt != null) {
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- PEER",
+                        summary = "Запрос удаления подтверждён адресатом по LAN (ACK)",
+                        details = "Адресат: $peerIpv6 • ${directAddress.hostString}:${directAddress.port} • deleteId=${deleteId.take(12)}"
+                    )
+                    return@withContext DeleteDispatchResult(
+                        delivered = true,
+                        endToEndConfirmed = true,
+                        transport = "LAN_DIRECT",
+                        rttMs = confirmedRtt
+                    )
+                }
+            } catch (e: Exception) {
+                logPacket(
+                    direction = "ERR • DELETE",
+                    summary = "Запрос удаления не доставлен по LAN (${e.javaClass.simpleName})",
+                    details = "Адресат $peerIpv6 • ${directAddress.hostString}:${directAddress.port}"
+                )
+            }
+        }
+
+        val reason = when {
+            !hasInternet && directAddress == null -> "Нет подключения к интернету, LAN-маршрут к получателю не задан"
+            recipientKeyHex.isBlank() && directAddress == null ->
+                "Неизвестен Ed25519-ключ получателя: добавьте контакт по полной ссылке ygggram://…?pub=… или задайте lan=…"
+            !senderCoreReady && directAddress == null -> "Нода Yggdrasil отправителя не активна"
+            !overlayPossible && livePeers <= 0 && directAddress == null -> "Нода Yggdrasil без живых пиров"
+            else -> "Оверлей Yggdrasil и LAN-маршрут не подтвердили доставку ACK"
+        }
+        logPacket(
+            direction = "ERR • DELETE",
+            summary = "Запрос удаления не подтверждён",
+            details = "Причина: $reason • адресат $peerIpv6 • deleteId=${deleteId.take(12)}"
+        )
+        DeleteDispatchResult(
             delivered = false,
             endToEndConfirmed = false,
             transport = "",
@@ -3858,8 +5188,18 @@ class YggTwinP2PBridge(
         return result
     }
 
-    private fun logPacket(direction: String, summary: String, details: String) {
+    private fun logPacket(
+        direction: String,
+        summary: String,
+        details: String,
+        mirror: Boolean = false
+    ) {
         val id = "pkt_${packetCounter.getAndIncrement()}"
+        if (direction.startsWith("ERR") || direction.contains("STREAM") || mirror) {
+            // The on-screen journal disappears with the process, but a refused send or a stalled
+            // file stream has to be findable in `adb logcat` on a device nobody is looking at.
+            android.util.Log.w("YGG-SEND", "$direction • $summary • $details")
+        }
         val entry = YggLivePacketLogEntry(
             id = id,
             timeFormatted = timeFormat.format(Date()),

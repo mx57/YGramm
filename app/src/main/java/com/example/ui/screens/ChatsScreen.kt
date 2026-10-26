@@ -189,9 +189,11 @@ fun ChatsScreen(
     onRemoveGroupMember: (String, String) -> Unit = { _, _ -> },
     onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
+    onClearChat: (String) -> Unit = {},
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
     onRetryMessage: (MessageEntity) -> Unit = {},
+    onDeleteMessage: (String, Boolean) -> Unit = { _, _ -> },
     onPingChatRoute: (String) -> Unit = {},
     onSetContactVerified: (String, Boolean) -> Unit = { _, _ -> }
 ) {
@@ -335,6 +337,7 @@ fun ChatsScreen(
                             onToggleReaction = onToggleReaction,
                             onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                             onDeleteChat = { onDeleteChat(activeConversation.chatId) },
+                            onClearChat = { onClearChat(activeConversation.chatId) },
                             onPingRoute = { onPingChatRoute(activeConversation.chatId) },
                             typingLabel = uiState.typingPeers[activeConversation.chatId],
                             forwardTargets = conversations,
@@ -355,6 +358,7 @@ fun ChatsScreen(
                                 )
                             },
                             onRetryMessage = onRetryMessage,
+                            onDeleteMessage = onDeleteMessage,
                             groupMembers = activeGroupMembers,
                             groupContactCandidates = conversations,
                             onAddContactsToGroup = { ids ->
@@ -401,6 +405,7 @@ fun ChatsScreen(
                     onToggleReaction = onToggleReaction,
                     onStartVoiceCall = { onStartVoiceCall(activeConversation.chatId) },
                     onDeleteChat = { onDeleteChat(activeConversation.chatId) },
+                    onClearChat = { onClearChat(activeConversation.chatId) },
                     onPingRoute = { onPingChatRoute(activeConversation.chatId) },
                     typingLabel = uiState.typingPeers[activeConversation.chatId],
                     forwardTargets = conversations,
@@ -421,6 +426,7 @@ fun ChatsScreen(
                         )
                     },
                     onRetryMessage = onRetryMessage,
+                    onDeleteMessage = onDeleteMessage,
                     groupMembers = activeGroupMembers,
                     groupContactCandidates = conversations,
                     onAddContactsToGroup = { ids ->
@@ -489,17 +495,6 @@ fun ChatsScreen(
             },
             onPickDocumentFile = {
                 chatFilePickerLauncher.launch("*/*")
-            },
-            onSendCustomFile = { fileName, fileSizeBytes, attachType, caption ->
-                onSendMediaOrFile(
-                    activeConversation.chatId,
-                    fileName,
-                    fileSizeBytes,
-                    attachType,
-                    null,
-                    caption
-                )
-                showP2PAttachDialog = false
             }
         )
     }
@@ -1477,9 +1472,11 @@ private fun ChatDetailPane(
     onToggleReaction: (String, String) -> Unit,
     onStartVoiceCall: () -> Unit,
     onDeleteChat: () -> Unit = {},
+    onClearChat: () -> Unit = {},
     onPingRoute: () -> Unit = {},
     onSendSelfEchoTest: () -> Unit = {},
     onRetryMessage: (MessageEntity) -> Unit = {},
+    onDeleteMessage: (String, Boolean) -> Unit = { _, _ -> },
     typingLabel: String? = null,
     forwardTargets: List<ConversationEntity> = emptyList(),
     onSendReply: (String, String) -> Unit = { _, _ -> },
@@ -1507,6 +1504,7 @@ private fun ChatDetailPane(
     var isRecordingVoice by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var replyTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     var forwardTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
+    var deleteTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     val isSelfChat = YggRepository.isSelfChatId(conversation.chatId)
     val wireIdIndex = remember(messages) {
         buildMap {
@@ -1935,16 +1933,78 @@ private fun ChatDetailPane(
                     onToggleReaction = { emoji -> onToggleReaction(msg.messageId, emoji) },
                     onReply = { replyTarget = msg },
                     onForward = { forwardTarget = msg },
-                    onRetry = { onRetryMessage(msg) }
+                    onRetry = { onRetryMessage(msg) },
+                    onDelete = { deleteTarget = msg }
                 )
             }
+        }
+
+        deleteTarget?.let { target ->
+            AlertDialog(
+                onDismissRequest = { deleteTarget = null },
+                title = { Text("Удалить сообщение?") },
+                text = {
+                    Text(
+                        if (target.isOutgoing) {
+                            "«Удалить у всех» отправит собеседнику доказательство авторства и сотрёт копию " +
+                                "на его устройстве. Успех скажется только после его подтверждения (ACK)."
+                        } else {
+                            "Это сообщение написал собеседник — у него его не удалить. " +
+                                "Копия будет стёрта только на этом устройстве."
+                        }
+                    )
+                },
+                confirmButton = {
+                    if (target.isOutgoing) {
+                        Button(
+                            onClick = {
+                                deleteTarget = null
+                                onDeleteMessage(target.messageId, true)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.testTag("delete_message_for_everyone_${target.messageId}")
+                        ) {
+                            Text("Удалить у всех")
+                        }
+                    } else {
+                        Button(
+                            onClick = {
+                                deleteTarget = null
+                                onDeleteMessage(target.messageId, false)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.testTag("delete_message_for_me_${target.messageId}")
+                        ) {
+                            Text("Удалить у меня")
+                        }
+                    }
+                },
+                dismissButton = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (target.isOutgoing) {
+                            TextButton(
+                                onClick = {
+                                    deleteTarget = null
+                                    onDeleteMessage(target.messageId, false)
+                                },
+                                modifier = Modifier.testTag("delete_message_for_me_${target.messageId}")
+                            ) {
+                                Text("Удалить у меня")
+                            }
+                        }
+                        TextButton(onClick = { deleteTarget = null }) {
+                            Text("Отмена")
+                        }
+                    }
+                }
+            )
         }
 
         if (showDeleteConfirmDialog) {
             AlertDialog(
                 onDismissRequest = { showDeleteConfirmDialog = false },
                 title = { Text("Удалить чат «${conversation.title}»?") },
-                text = { Text("Это действие удалит весь диалог и связанную с ним историю сообщений из памяти устройства.") },
+                text = { Text("«Удалить» убирает диалог целиком, «Очистить» оставляет контакт и стирает историю сообщений и файлы этого чата с устройства.") },
                 confirmButton = {
                     Button(
                         onClick = {
@@ -1957,8 +2017,19 @@ private fun ChatDetailPane(
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showDeleteConfirmDialog = false }) {
-                        Text("Отмена")
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        TextButton(
+                            onClick = {
+                                showDeleteConfirmDialog = false
+                                onClearChat()
+                            },
+                            modifier = Modifier.testTag("clear_chat_${conversation.chatId}")
+                        ) {
+                            Text("Очистить")
+                        }
+                        TextButton(onClick = { showDeleteConfirmDialog = false }) {
+                            Text("Отмена")
+                        }
                     }
                 }
             )
@@ -2424,7 +2495,8 @@ private fun EncryptedMessageBubble(
     onToggleReaction: (String) -> Unit,
     onReply: () -> Unit,
     onForward: () -> Unit,
-    onRetry: () -> Unit
+    onRetry: () -> Unit,
+    onDelete: () -> Unit = {}
 ) {
     var showReactionPicker by rememberSaveable(message.messageId) { mutableStateOf(false) }
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -2459,6 +2531,10 @@ private fun EncryptedMessageBubble(
                 onForward = {
                     showReactionPicker = false
                     onForward()
+                },
+                onDelete = {
+                    showReactionPicker = false
+                    onDelete()
                 }
             )
         }

@@ -24,9 +24,10 @@ import java.io.FileInputStream
         BackupSnapshotEntity::class,
         CryptoKeyRecordEntity::class,
         CallLogEntity::class,
-        GroupMemberEntity::class
+        GroupMemberEntity::class,
+        MessageDeletionEntity::class
     ],
-    version = 11,
+    version = 13,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -131,6 +132,34 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Deletion has to outlive the row it removed: a duplicate copy of a deleted
+                // message arrives with the same wire id after a lost ACK, and the tombstone is
+                // the only thing that can refuse it. An unconfirmed request is kept too, so a
+                // peer that was offline when the delete was sent still gets it later.
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `message_deletions` (" +
+                        "`chatId` TEXT NOT NULL, `wireMessageId` TEXT NOT NULL, " +
+                        "`deleteId` TEXT NOT NULL, `peerIpv6` TEXT NOT NULL, " +
+                        "`requestedAt` INTEGER NOT NULL, `confirmedAt` INTEGER NOT NULL, " +
+                        "`attempts` INTEGER NOT NULL, `localOnly` INTEGER NOT NULL, " +
+                        "PRIMARY KEY (`chatId`, `wireMessageId`))"
+                )
+            }
+        }
+
+        private val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // A remote delete is only honoured for the node that actually authored the
+                // message. That authorship is what the envelope's X25519 key proved on receipt,
+                // so the key has to survive next to the row instead of only in RAM.
+                db.execSQL(
+                    "ALTER TABLE messages ADD COLUMN authorX25519PubHex TEXT NOT NULL DEFAULT ''"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -156,7 +185,7 @@ abstract class YggDatabase : RoomDatabase() {
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
                 .addMigrations(
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11
+                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)

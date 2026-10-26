@@ -61,9 +61,9 @@ data class RecordedVoiceNoteResult(
 object YggAudioMediaEngine {
 
     private const val SAMPLE_RATE = 16000
-    // The overlay transport splits large attachments into ACKed chunks, but the whole base64
-    // payload is still assembled in memory on both ends, so the ceiling stays. Over-cap files
-    // are refused with this number in the message rather than sent truncated.
+    // The whole base64 payload of an inline attachment is still assembled in memory on both ends,
+    // so this stays the ceiling for that path. Larger files are not refused: the bridge hands them
+    // to the piece transport, which encrypts, acknowledges and verifies them chunk by chunk.
     const val MAX_P2P_INLINE_BYTES = 4 * 1024 * 1024
 
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

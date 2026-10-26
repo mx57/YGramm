@@ -228,7 +228,7 @@ class ExampleUnitTest {
         )
         assertTrue(pow.startsWith("hc1:8:"))
 
-        val (chunks, merkleRoot) = YggCryptoEngine.computeFastCdcMerkleProfile(
+        val (chunks, merkleRoot) = YggCryptoEngine.estimateBackupChunkProfile(
             fileName = "ygg_whitelist_bridges_ru.json.zst",
             fileSizeBytes = 262_144L
         )

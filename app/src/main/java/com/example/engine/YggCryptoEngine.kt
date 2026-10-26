@@ -2,6 +2,8 @@
 package com.example.engine
 
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -503,6 +505,29 @@ object YggCryptoEngine {
     }
 
     /**
+     * A "delete for everyone" frame asks another device to erase a message, so it has to prove
+     * the requester wrote that message. The proof is an ordinary conversation envelope whose
+     * plaintext binds the delete event to one message id; opening it under the recipient's own
+     * key authenticates the sender's X25519 key exactly the way a message envelope does.
+     */
+    const val DELETE_PROOF_PREFIX = "ygggram-del-v1"
+
+    data class DeleteProof(val deleteId: String, val wireMessageId: String)
+
+    fun buildDeleteProofText(deleteId: String, wireMessageId: String): String =
+        "$DELETE_PROOF_PREFIX|$deleteId|$wireMessageId"
+
+    /** Null unless the text is a well-formed proof; a message body is never mistaken for one. */
+    fun parseDeleteProofText(plainText: String?): DeleteProof? {
+        val parts = plainText?.split('|') ?: return null
+        if (parts.size != 3 || parts[0] != DELETE_PROOF_PREFIX) return null
+        val deleteId = parts[1].trim()
+        val wireMessageId = parts[2].trim()
+        if (deleteId.isEmpty() || wireMessageId.isEmpty()) return null
+        return DeleteProof(deleteId, wireMessageId)
+    }
+
+    /**
      * Seals a message into a self-describing AEAD envelope (stored in cipherPayloadHex):
      * key = HKDF-SHA256(X25519(sender_x_priv, recipient_x_pub)), AES-256-GCM with a random
      * IV and AAD binding the sender key and epoch.
@@ -690,6 +715,150 @@ object YggCryptoEngine {
     private fun callFrameAad(callId: String, seq: Long): ByteArray =
         "ygggram-call:$callId:$seq".toByteArray(StandardCharsets.UTF_8)
 
+    // ── Large-file piece transport ───────────────────────────────────────────
+    // A file above the inline ceiling travels piece by piece. One AES-256-GCM key
+    // per transfer: the same X25519 identity DH as a message envelope, stretched
+    // with HKDF over the transfer id. Every piece is then its own AEAD message with
+    // its index in the AAD, which is what makes the stream content-addressed the
+    // way a torrent piece is: a piece either authenticates or is dropped, so the
+    // receiver can write it at its own offset and the sender can resume at the
+    // first piece that is still missing. The Merkle root over the real piece
+    // digests is checked once at the end and covers the whole file.
+
+    /** 12 KiB of plaintext stays under one Yggdrasil datagram after base64 + envelope. */
+    const val FILE_PIECE_BYTES = 12 * 1024
+
+    /** The largest file the piece transport will carry; anything bigger is refused. */
+    const val MAX_P2P_STREAM_BYTES = 512L * 1024 * 1024
+
+    fun deriveFileTransferKey(
+        localX25519PrivateKey: ByteArray,
+        peerX25519PublicKeyHex: String,
+        transferId: String
+    ): ByteArray {
+        val peer = peerX25519PublicKeyHex.trim().lowercase()
+        require(isUsablePeerX25519PublicKey(peer)) { "Peer X25519 key must be 32 bytes hex" }
+        val shared = x25519(localX25519PrivateKey, peer.hexToBytes())
+        return hkdfSha256(
+            ikm = shared,
+            salt = sha256Hex("ygggram-file-v1").hexToBytes(),
+            info = "ygggram-file-transfer-v1:$transferId".toByteArray(StandardCharsets.UTF_8),
+            outputLength = 32
+        )
+    }
+
+    private fun filePieceAad(transferId: String, index: Int): ByteArray =
+        "ygggram-file:$transferId:piece=$index".toByteArray(StandardCharsets.UTF_8)
+
+    /** Returns (ivBase64, cipherBase64) for one piece; the index is authenticated. */
+    fun sealFilePiece(key: ByteArray, plain: ByteArray, transferId: String, index: Int): Pair<String, String> {
+        val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(filePieceAad(transferId, index))
+        val encrypted = cipher.doFinal(plain)
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        return encoder.encodeToString(iv) to encoder.encodeToString(encrypted)
+    }
+
+    /** Throws on a tampered piece or one replayed under a different index. */
+    fun openFilePiece(
+        key: ByteArray,
+        ivBase64: String,
+        cipherBase64: String,
+        transferId: String,
+        index: Int
+    ): ByteArray {
+        val decoder = Base64.getUrlDecoder()
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(key, "AES"),
+            GCMParameterSpec(128, decoder.decode(ivBase64))
+        )
+        cipher.updateAAD(filePieceAad(transferId, index))
+        return cipher.doFinal(decoder.decode(cipherBase64))
+    }
+
+    /**
+     * Streams [file] in fixed pieces, handing each one to [onPiece] so the caller can send or
+     * hash it without ever holding the whole file. Returns the byte count actually read.
+     */
+    fun forEachFilePiece(
+        file: File,
+        pieceBytes: Int = FILE_PIECE_BYTES,
+        onPiece: (index: Int, bytes: ByteArray) -> Unit
+    ): Long {
+        if (!file.exists() || pieceBytes <= 0) return 0L
+        var total = 0L
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(pieceBytes)
+            var index = 0
+            while (true) {
+                var filled = 0
+                while (filled < pieceBytes) {
+                    val read = input.read(buffer, filled, pieceBytes - filled)
+                    if (read < 0) break
+                    filled += read
+                }
+                if (filled == 0) break
+                onPiece(index, buffer.copyOf(filled))
+                total += filled
+                index++
+                if (filled < pieceBytes) break
+            }
+        }
+        return total
+    }
+
+    data class PieceProfile(val pieceCount: Int, val totalBytes: Long, val merkleRootHex: String)
+
+    /** Real SHA-256 Merkle root over the file's own piece digests. Null if the file is unreadable. */
+    fun pieceProfileOf(file: File, pieceBytes: Int = FILE_PIECE_BYTES): PieceProfile? {
+        if (!file.exists() || !file.isFile) return null
+        val digests = mutableListOf<ByteArray>()
+        var bytes = 0L
+        forEachFilePiece(file, pieceBytes) { _, piece ->
+            digests += sha256Bytes(piece)
+            bytes += piece.size
+        }
+        return PieceProfile(
+            pieceCount = digests.size,
+            totalBytes = bytes,
+            merkleRootHex = merkleRootOfPieceDigests(digests)
+        )
+    }
+
+    fun sha256Bytes(bytes: ByteArray): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    /**
+     * Binary tree over the piece digests: each parent is SHA-256(left||right), an odd node is
+     * carried up unchanged. An empty list hashes the empty input, so a zero-piece file still has
+     * a root both ends reproduce.
+     */
+    fun merkleRootOfPieceDigests(digests: List<ByteArray>): String {
+        var level = digests
+        if (level.isEmpty()) return sha256Bytes(ByteArray(0)).joinToString("") { "%02x".format(it) }
+        while (level.size > 1) {
+            val next = ArrayList<ByteArray>((level.size + 1) / 2)
+            var i = 0
+            while (i < level.size) {
+                val left = level[i]
+                val right = level.getOrNull(i + 1)
+                next += if (right == null) left else {
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    digest.update(left)
+                    digest.update(right)
+                    digest.digest()
+                }
+                i += 2
+            }
+            level = next
+        }
+        return level[0].joinToString("") { "%02x".format(it) }
+    }
+
     /**
      * Strict reader for the flat JSON object used by conversation envelopes. A regex
      * lookup could match a key inside another value (e.g. plaintext echoed into a
@@ -847,9 +1016,11 @@ object YggCryptoEngine {
     }
 
     /**
-     * Computes FastCDC chunk boundaries and a SHA-256 Merkle root for P2P file transfers or backups.
+     * Chunk count and root for the backup *estimate* only: nothing is read from a file here, the
+     * numbers describe a hypothetical archive built from row counts. Real transfers use
+     * [pieceProfileOf], which hashes the bytes.
      */
-    fun computeFastCdcMerkleProfile(fileName: String, fileSizeBytes: Long): Pair<Int, String> {
+    fun estimateBackupChunkProfile(fileName: String, fileSizeBytes: Long): Pair<Int, String> {
         val avgChunkSize = 64 * 1024L // 64 KB content-defined chunks
         val chunks = ((fileSizeBytes + avgChunkSize - 1) / avgChunkSize).toInt().coerceAtLeast(1)
         val leafHashes = (0 until chunks.coerceAtMost(64)).map { idx ->
@@ -876,7 +1047,7 @@ object YggCryptoEngine {
         val estimatedBytes = (conversationsCount * 4096L) + (messagesCount * 1536L) + (keysCount * 2048L) + 32768L
         val prefix = if (isWebDavCloud) "ygg_webdav_zk" else "ygg_vault_local"
         val fileName = "${prefix}_${now / 1000}.yggbak"
-        val (chunkCount, merkleRoot) = computeFastCdcMerkleProfile(fileName, estimatedBytes)
+        val (chunkCount, merkleRoot) = estimateBackupChunkProfile(fileName, estimatedBytes)
         val authTag = sha256Hex("$derivedKeyHex:$merkleRoot:$estimatedBytes").take(32)
 
         return EncryptedArchiveBundle(

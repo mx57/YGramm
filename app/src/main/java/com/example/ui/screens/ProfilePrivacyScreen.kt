@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Hub
@@ -71,6 +72,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -158,7 +160,9 @@ fun ProfilePrivacyScreen(
     ) -> Unit = { _, _, _, _, _, _, _ -> },
     onAddContactFromQr: (ParsedYggContactQr) -> Unit = {},
     onPickProfileAvatar: (Uri) -> Unit = {},
-    onClearProfileAvatar: () -> Unit = {}
+    onClearProfileAvatar: () -> Unit = {},
+    onRefreshStorage: () -> Unit = {},
+    onPurgeOrphanedFiles: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
@@ -1335,6 +1339,76 @@ fun ProfilePrivacyScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+            }
+        }
+
+        // 5.6 On-disk footprint of this app and the tools to shrink it
+        item {
+            LaunchedEffect(Unit) { onRefreshStorage() }
+            val storage = uiState.storage
+            fun kib(bytes: Long): String = if (bytes >= 1024 * 1024) {
+                "${bytes / 1024 / 1024} МБ"
+            } else {
+                "${bytes / 1024} КБ"
+            }
+            Card(
+                modifier = Modifier.fillMaxWidth().testTag("storage_card"),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.FolderOpen,
+                            contentDescription = null,
+                            tint = CyberTealSecondary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Хранилище устройства",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Файлы вложений: ${kib(storage.attachmentsBytes)}\n" +
+                            "Голосовые: ${kib(storage.voiceBytes)}\n" +
+                            "Аватары: ${kib(storage.avatarBytes)}\n" +
+                            "Зашифрованная база: ${kib(storage.databaseBytes)}\n" +
+                            "Кэш: ${kib(storage.cacheBytes)}\n" +
+                            "Загруженное обновление: ${kib(storage.updateBytes)}\n" +
+                            "Итого: ${kib(storage.totalBytes)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Цифры измерены по самим файлам, а не по счётчикам в базе. " +
+                            "Удаление сообщения или очистка чата стирает его файл сразу; «убрать осиротевшие» " +
+                            "добирает те, на которые не ссылается ни одно сообщение. " +
+                            "Осколки незавершённых приёмов (.part) стираются при следующем запуске моста, " +
+                            "а загруженный APK обновления остаётся до установки — иначе «Установить» не сработает.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onRefreshStorage,
+                            modifier = Modifier.testTag("storage_rescan_button")
+                        ) {
+                            Text("Измерить заново")
+                        }
+                        Button(
+                            onClick = onPurgeOrphanedFiles,
+                            modifier = Modifier.testTag("storage_purge_button")
+                        ) {
+                            Text("Убрать осиротевшие файлы")
+                        }
+                    }
                 }
             }
         }

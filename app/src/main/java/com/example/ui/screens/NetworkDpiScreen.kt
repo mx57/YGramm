@@ -85,6 +85,7 @@ import com.example.R
 import com.example.data.YggPeerEntity
 import com.example.engine.DiscoveredYggPeer
 import com.example.engine.YggNativeCoreBridge
+import com.example.engine.YggPeerScannerCatalog
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
@@ -177,7 +178,12 @@ fun NetworkDpiScreen(
         }
         when (scanner.sortMode) {
             "COUNTRY" -> base.sortedWith(compareBy<DiscoveredYggPeer> { it.countryNameRu }.thenBy { it.cityRu })
-            "UPTIME" -> base.sortedByDescending { it.uptimePercent }
+            // Directory freshness, not a made-up uptime percentage: an entry with no
+            // reported sighting sorts last instead of pretending to be reliable.
+            "FRESH" -> base.sortedWith(
+                compareByDescending<DiscoveredYggPeer> { it.lastSeenAtMs }
+                    .thenByDescending { if (it.latencyMs > 0) it.latencyMs else -1 }
+            )
             else -> base.sortedWith(
                 compareBy<DiscoveredYggPeer> { if (it.latencyMs > 0) 0 else 1 }
                     .thenBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
@@ -811,7 +817,7 @@ fun NetworkDpiScreen(
                                 val sortOptions = listOf(
                                     "PING_ASC" to "Быстрые",
                                     "COUNTRY" to "Страна",
-                                    "UPTIME" to "Аптайм"
+                                    "FRESH" to "Свежие"
                                 )
                                 sortOptions.forEach { (key, title) ->
                                     FilterChip(
@@ -1265,7 +1271,15 @@ private fun ScannedPeerCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "${peer.transportType} • ${if (peer.whitelistCompatible) "Порт 443/WSS" else "Прямой порт"} • ${peer.uptimePercent}%",
+                    text = buildString {
+                        append(peer.transportType)
+                        append(" • ")
+                        append(if (peer.whitelistCompatible) "Порт 443/WSS" else "Прямой порт")
+                        append(" • ")
+                        // How long ago the public directory saw this node answer — a sighting
+                        // reported by somebody else, never presented as a reachability claim.
+                        append(YggPeerScannerCatalog.formatFreshness(peer.lastSeenAtMs))
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,

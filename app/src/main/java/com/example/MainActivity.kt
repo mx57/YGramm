@@ -751,6 +751,7 @@ fun YggGramRootApp(
                                 onRemoveGroupMember = viewModel::removeGroupMember,
                                 onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,
+                                onClearChat = viewModel::clearChatHistory,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
                                 onOpenSelfYggdrasilChat = { runOverlayProbe ->
                                     if (runOverlayProbe) {
@@ -760,6 +761,7 @@ fun YggGramRootApp(
                                     }
                                 },
                                 onRetryMessage = viewModel::retrySendMessage,
+                                onDeleteMessage = viewModel::deleteMessage,
                                 onPingChatRoute = viewModel::pingConversationRoute,
                                 onSetContactVerified = viewModel::setContactKeyVerified
                             )
@@ -834,7 +836,9 @@ fun YggGramRootApp(
                                     viewModel.selectTab(YggNavTab.CHATS)
                                 },
                                 onPickProfileAvatar = viewModel::setProfileAvatar,
-                                onClearProfileAvatar = viewModel::clearProfileAvatar
+                                onClearProfileAvatar = viewModel::clearProfileAvatar,
+                                onRefreshStorage = viewModel::refreshStorageBreakdown,
+                                onPurgeOrphanedFiles = viewModel::purgeOrphanedFiles
                             )
                         }
                     }
