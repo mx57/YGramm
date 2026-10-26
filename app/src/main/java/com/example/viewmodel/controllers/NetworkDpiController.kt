@@ -220,23 +220,28 @@ class NetworkDpiController(
         // stale list cannot name. Ask the directory once, here, because this path only runs
         // when the current links are already failing.
         val livePeers = withContext(Dispatchers.IO) {
-            try {
-                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
-            } catch (_: Exception) {
-                emptyList()
-            }
-        }.filter { it.endpointUri.isNotBlank() }
+            YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200).peers
+        }
         if (livePeers.isNotEmpty()) {
             _peerScanner.update { state ->
                 state.copy(
-                    discoveredPeers = (state.discoveredPeers + livePeers).distinctBy { it.endpointUri }
+                    discoveredPeers = (livePeers + state.discoveredPeers).distinctBy { it.endpointUri }
                 )
             }
         }
-        val validCandidates = (candidatePeers + livePeers).filter { it.endpointUri.isNotBlank() }
+        val validCandidates = (candidatePeers + livePeers)
+            .filter { it.endpointUri.isNotBlank() }
             .distinctBy { it.endpointUri }
+            // Freshest first: this path runs precisely because the current links died, and the
+            // spare most likely to still be up is a node the directory saw answering recently,
+            // not one picked at random out of a list that ages.
+            .sortedWith(
+                compareByDescending<DiscoveredYggPeer> { it.lastSeenAtMs }
+                    .thenByDescending { if (it.latencyMs > 0) 1 else 0 }
+            )
+            .take(5)
 
-        for (candidate in validCandidates.shuffled().take(5)) {
+        for (candidate in validCandidates) {
             val probe = networkEngine.probeRealYggdrasilPeer(
                 endpointUri = candidate.endpointUri,
                 sniOverride = candidate.sniDomain,
@@ -288,6 +293,11 @@ class NetworkDpiController(
 
     private companion object {
         const val WATCHDOG_PEER_ID = "peer_watchdog_active"
+
+        // A scan has to finish while the user is watching the screen. The freshest nodes are
+        // probed first, so the budget cuts the stale tail of the catalog rather than the live
+        // head, and the summary states how many candidates were left unprobed.
+        const val MAX_PEER_PROBES_PER_SCAN = 96
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {
@@ -331,7 +341,7 @@ class NetworkDpiController(
      * the app restarted — on a whitelist-only uplink the setting looked applied and changed
      * nothing. Dropping the link is what the node accepts as a re-dial instruction.
      */
-    private suspend fun applyWhitelistTransport() {
+    private suspend fun applyWhitelistTransport(justDisabledWhitelist: Boolean = false) {
         val cfg = _antiDpiConfig.value
         syncCoverTransport()
         val domain = cfg.whitelistSniDomain
@@ -339,7 +349,12 @@ class NetworkDpiController(
             whitelistMode = cfg.whitelistCdnWssEnabled,
             preferredSni = domain
         )
-        val peers = repository.getAllPeersNow().filter { it.isWhitelistCompatible }
+        val allPeers = repository.getAllPeersNow()
+        val peers = allPeers.filter { it.isWhitelistCompatible }
+        val dialUriOf = { peer: YggPeerEntity ->
+            YggNativeCoreBridge.corePeerUri(peer.endpointUri, peer.sniDomain)
+        }
+        val diallable = allPeers.count { YggCoverTransport.dialsPeer(dialUriOf(it)) }
         var applied = 0
         // The node's own reason is quoted, not paraphrased: «no running node» and «this peer
         // is not in the dial list» are different facts the user has to tell apart.
@@ -362,6 +377,38 @@ class NetworkDpiController(
                 coreReason = added.errorDetail.orEmpty()
             }
         }
+        // Switching the profile has to move the live dial list too, not only the next boot:
+        // a peer the node is already dialling stays reachable until it is dropped. Only rows the
+        // user switched on are touched, so this never enables a peer on its own.
+        var parked = 0
+        var restored = 0
+        var masked = 0
+        for (peer in allPeers.filter { it.isConnected }) {
+            val uri = peer.endpointUri.trim()
+            if (uri.isBlank()) continue
+            val dialUri = YggNativeCoreBridge.corePeerUri(uri, peer.sniDomain)
+            val allowed = YggCoverTransport.dialsPeer(dialUri)
+            // A peer the mask now carries onto 443 is not left on its old dial: the node would
+            // keep repeating the cleartext handshake the filter drops next to the covered one.
+            // Remove-then-add is what replaces it, and the core answers the new link alone.
+            val movedToMask = allowed && YggCoverTransport.maskReplacesRawDial(dialUri)
+            // A peer that stays diallable is either untouched or already re-dialled with the new
+            // SNI above; re-adding it here would only flap a working link.
+            if (allowed && !movedToMask && (peer.isWhitelistCompatible || !justDisabledWhitelist)) continue
+            val change = networkEngine.applyPeerChangeToCores(
+                uri,
+                enabled = allowed,
+                sniDomain = peer.sniDomain
+            )
+            if (change.applied > 0) {
+                when {
+                    !allowed -> parked++
+                    movedToMask -> masked++
+                    else -> restored++
+                }
+            }
+        }
+        val gateNote = whitelistGateNote(cfg.whitelistCdnWssEnabled, parked, restored, masked, diallable)
         _antiDpiConfig.update { state ->
             state.copy(
                 lastProbeReport = when {
@@ -369,14 +416,51 @@ class NetworkDpiController(
                     peers.isEmpty() -> "SNI: $domain • в базе нет пиров с поддержкой белых списков"
                     else -> "SNI: $domain • живой линк с новым SNI не поднят" +
                         if (coreReason.isBlank()) "" else ": $coreReason"
-                }
+                } + gateNote
             )
         }
-        if (applied > 0) {
+        // The profile pass has to be visible even when no SNI re-dial happened: peers taken off
+        // the dial list change what the node can reach, and silence there reads as «ничего не
+        // поменялось».
+        if (applied > 0 || gateNote.isNotBlank()) {
             withContext(Dispatchers.Main) {
-                onBannerMessage("Ядро переподключает $applied пиров с SNI $domain")
+                onBannerMessage(
+                    when {
+                        applied > 0 -> "Ядро переподключает $applied пиров с SNI $domain" + gateNote
+                        else -> "Режим белых списков: список обзвона ядра обновлён" + gateNote
+                    }
+                )
             }
         }
+    }
+
+    /**
+     * How the whitelist profile changed the dial list, in the node's own numbers. When nothing
+     * survives the profile the user has to see that before the overlay silently stops routing.
+     */
+    private fun whitelistGateNote(
+        whitelistMode: Boolean,
+        parked: Int,
+        restored: Int,
+        masked: Int,
+        diallablePeers: Int
+    ): String {
+        // Every number the pass changed is quoted: a profile switch that parked peers and moved
+        // others onto the mask is two facts, and showing only the first hid half of the dial list.
+        val parts = buildList {
+            if (whitelistMode && parked > 0) {
+                add("$parked пиров сняты с обзвона: до них нет пути через 443" +
+                    if (diallablePeers == 0) "; не осталось ни одного — оверлей поднимется без линков" else "")
+            }
+            if (whitelistMode && diallablePeers == 0 && parked == 0) {
+                add("ни один сохранённый пир не проходит под белые списки: обзванивать нечего")
+            }
+            if (whitelistMode && masked > 0) {
+                add("$masked пиров переведены на 443: их открытый диал ядро больше не набирает")
+            }
+            if (!whitelistMode && restored > 0) add("$restored пиров возвращены в список обзвона")
+        }
+        return if (parts.isEmpty()) "" else " • " + parts.joinToString(" • ")
     }
 
     fun selectUtlsFingerprint(fingerprint: String) {
@@ -399,6 +483,13 @@ class NetworkDpiController(
         if (flagName == "COVER_TLS" || flagName == "WHITELIST_WSS") {
             syncCoverTransport()
             scope.launch {
+                // The whitelist profile also decides which peers may be dialled at all, so
+                // switching it has to reach the live dial list, not only the cover links.
+                if (flagName == "WHITELIST_WSS") {
+                    applyWhitelistTransport(
+                        justDisabledWhitelist = !_antiDpiConfig.value.whitelistCdnWssEnabled
+                    )
+                }
                 val report = reDialCoverLinks()
                 _antiDpiConfig.update { it.copy(lastProbeReport = report) }
                 withContext(Dispatchers.Main) { onBannerMessage(report) }
@@ -455,23 +546,29 @@ class NetworkDpiController(
                 )
             }
 
+            val directory = withContext(Dispatchers.IO) {
+                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
+            }
             val candidateCatalog = withContext(Dispatchers.IO) {
-                val liveFetched = try {
-                    YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                if (liveFetched.isNotEmpty()) {
-                    (_peerScanner.value.discoveredPeers + liveFetched).distinctBy { it.endpointUri }
+                if (directory.peers.isNotEmpty()) {
+                    // Live entries first and deduplicated on the live copy: it is the one that
+                    // carries a real sighting timestamp, and the same node can appear in the
+                    // shipped catalog under a hostname instead of the IP it resolved to.
+                    (directory.peers + _peerScanner.value.discoveredPeers)
+                        .distinctBy { it.endpointUri.lowercase() }
                 } else {
                     _peerScanner.value.discoveredPeers
                 }
             }
 
-            val toProbe = candidateCatalog.filter {
+            val matching = candidateCatalog.filter {
                 (selectedCountry == "ALL" || it.countryCode == selectedCountry) &&
                     (!_peerScanner.value.onlyWhitelistCompatible || it.whitelistCompatible)
             }
+            // The catalog is already ordered freshest-first, so the probe budget is spent on
+            // the nodes another network just saw answering. Probing all three hundred would
+            // take half a minute and mostly confirm what the directory already reported dead.
+            val toProbe = matching.take(MAX_PEER_PROBES_PER_SCAN)
 
             val probedMap = withContext(Dispatchers.IO) {
                 toProbe.chunked(16).flatMap { batch ->
@@ -507,11 +604,28 @@ class NetworkDpiController(
             }
             val bestRtt = reachableInSelection.minOfOrNull { it.latencyMs }
 
-            val summary = if (reachableInSelection.isNotEmpty()) {
-                "Живой замер завершен: ответили ${reachableInSelection.size} из ${toProbe.size} узлов • Лучший пинг: $bestRtt мс"
-            } else {
-                "Проверено ${toProbe.size} узлов: ни один не ответил на прямое TCP/TLS соединение"
+            val dropped = mutableListOf<String>().apply {
+                if (directory.skippedDown > 0) add("не отвечает каталогу: ${directory.skippedDown}")
+                if (directory.skippedStale > 0) add("не виден ${YggPeerScannerCatalog.freshWindowMs / 60000} мин: ${directory.skippedStale}")
+                if (directory.skippedOldProtocol > 0) add("старый протокол: ${directory.skippedOldProtocol}")
             }
+            val directoryPart = when {
+                directory.errorDetail != null ->
+                    "Каталог недоступен (${directory.errorDetail}), проверен упакованный список"
+                directory.peers.isEmpty() ->
+                    "Каталог вернул 0 свежих узлов из ${directory.reportedTotal}"
+                else ->
+                    "Каталог: ${directory.reportedTotal} узлов, свежих ${directory.usableCount}" +
+                        if (dropped.isEmpty()) "" else " • отброшено ${dropped.joinToString(" • ")}"
+            }
+            val probePart = if (reachableInSelection.isNotEmpty()) {
+                "ответили ${reachableInSelection.size} из ${toProbe.size} проверенных" +
+                    if (matching.size > toProbe.size) " (в очереди ещё ${matching.size - toProbe.size})" else ""
+            } else {
+                "из ${toProbe.size} проверенных не ответил ни один"
+            }
+            val summary = "$directoryPart • $probePart" +
+                (if (bestRtt != null) " • лучший пинг $bestRtt мс" else "")
 
             _peerScanner.update { state ->
                 state.copy(

@@ -133,7 +133,8 @@ fun ReactionQuickPickerBar(
     onSelectEmoji: (String) -> Unit,
     onDismiss: () -> Unit,
     onReply: (() -> Unit)? = null,
-    onForward: (() -> Unit)? = null
+    onForward: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null
 ) {
     var showAllReactions by rememberSaveable(messageId) { mutableStateOf(false) }
     Surface(
@@ -186,6 +187,21 @@ fun ReactionQuickPickerBar(
                             Icons.AutoMirrored.Filled.Forward,
                             contentDescription = "Переслать сообщение",
                             tint = EmeraldPrimary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+                if (onDelete != null) {
+                    IconButton(
+                        onClick = onDelete,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("delete_message_$messageId")
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = "Удалить сообщение",
+                            tint = MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -994,11 +1010,8 @@ fun RichAttachmentSheetDialog(
     peerTitle: String,
     onDismiss: () -> Unit,
     onPickPhotoFromGallery: () -> Unit,
-    onPickDocumentFile: () -> Unit,
-    onSendCustomFile: (fileName: String, fileSizeBytes: Long, attachmentType: String, caption: String) -> Unit
+    onPickDocumentFile: () -> Unit
 ) {
-    var customFileName by rememberSaveable { mutableStateOf("") }
-    var customCaption by rememberSaveable { mutableStateOf("") }
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
@@ -1028,7 +1041,10 @@ fun RichAttachmentSheetDialog(
                 }
 
                 Text(
-                    text = "Получатель: «$peerTitle» • Побайтовая передача P2P + Merkle SHA-256",
+                    text = "Получатель: «$peerTitle» • AES-256-GCM; файлы больше " +
+                        "${YggAudioMediaEngine.MAX_P2P_INLINE_BYTES / (1024 * 1024)} МБ идут отдельными " +
+                        "кусками с проверкой Merkle SHA-256 и продолжением с первого " +
+                        "неподтверждённого куска",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1068,66 +1084,6 @@ fun RichAttachmentSheetDialog(
                         Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Выбрать файл", style = MaterialTheme.typography.labelLarge)
-                    }
-                }
-
-                OutlinedTextField(
-                    value = customFileName,
-                    onValueChange = { customFileName = it },
-                    label = { Text("Или укажите имя файла / картинки вручную") },
-                    placeholder = { Text("network_topology.png или archive.zip") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("custom_attach_filename_input")
-                )
-
-                OutlinedTextField(
-                    value = customCaption,
-                    onValueChange = { customCaption = it },
-                    label = { Text("Подпись к медиафайлу") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("custom_attach_caption_input")
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            val name = customFileName.trim().ifBlank { "screenshot_ygg.png" }
-                            onSendCustomFile(name, 384_512L, "IMAGE", customCaption.trim())
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("send_quick_image_button")
-                    ) {
-                        Icon(Icons.Default.Image, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Как картинку")
-                    }
-
-                    Button(
-                        onClick = {
-                            val name = customFileName.trim().ifBlank { "document_ygg.pdf" }
-                            val isImg = name.endsWith(".png", true) || name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) || name.endsWith(".webp", true)
-                            onSendCustomFile(
-                                name,
-                                524_288L,
-                                if (isImg) "IMAGE" else "FILE",
-                                customCaption.trim()
-                            )
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("confirm_p2p_send_button")
-                    ) {
-                        Icon(Icons.Default.FolderZip, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Отправить файл")
                     }
                 }
             }

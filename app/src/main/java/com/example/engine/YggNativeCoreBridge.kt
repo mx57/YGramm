@@ -233,6 +233,20 @@ object YggNativeCoreBridge {
     }
 
     /**
+     * Whether an endpoint sits where an allow-listing provider lets traffic through.
+     *
+     * The scanner stores this as a per-peer flag, but the boot gate has URIs only and a peer
+     * pasted in by hand never went through the scanner at all, so the rule is re-read from the
+     * endpoint here: port 443, or a WebSocket tunnel that already rides on it.
+     */
+    fun isWhitelistEndpoint(endpointUri: String): Boolean {
+        val uri = endpointUri.trim().substringBefore('?')
+        if (uri.startsWith("wss://", ignoreCase = true)) return true
+        val authority = uri.substringAfter("://", "").substringBefore('/')
+        return authority.substringAfterLast(':', "").toIntOrNull() == 443
+    }
+
+    /**
      * Interrupts the core's reconnect backoff so a node that lost its public
      * peers dials them again immediately.
      */

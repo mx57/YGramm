@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.MessageEntity
 import com.example.data.YggDatabase
 import com.example.data.YggRepository
 import com.example.engine.IncomingReactionPacket
@@ -1047,6 +1048,77 @@ class ExampleRobolectricTest {
         repo.recordIncomingTwinMessage(frame.copy(messageId = "wire_retry_next"), activeChatId = null)
         assertEquals(2, repo.observeMessagesForChat(first).first().size)
     }
+
+    @Test
+    fun `chat that lost its pinned key heals it from a copy whose sender was authenticated`() =
+        runBlocking {
+            val app = ApplicationProvider.getApplicationContext<Application>()
+            val db = androidx.room.Room.inMemoryDatabaseBuilder(app, YggDatabase::class.java)
+                .allowMainThreadQueries()
+                .build()
+            val dao = db.yggDao()
+            val repo = YggRepository(dao)
+
+            val aliceWords = listOf(
+                "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
+                "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex"
+            )
+            val bobWords = listOf(
+                "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
+                "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
+            )
+            val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceWords, epoch = 1)
+            val bob = YggCryptoEngine.deriveHierarchyFromMnemonic(bobWords, epoch = 1)
+            repo.ensureInitialized(alice)
+
+            val chatId = repo.createNewConversation(
+                title = "Otchety",
+                yggIpv6Input = bob.yggIpv6Address,
+                disappearingSeconds = 0,
+                peerX25519PublicKeyHex = bob.x25519IdentityPubHex,
+                peerEd25519PublicKeyHex = bob.yggNodePublicKeyHex
+            )
+            dao.upsertConversation(dao.getConversationById(chatId)!!.copy(peerX25519PublicKeyHex = ""))
+            assertFalse(
+                "A 1:1 chat with no peer key must refuse to seal",
+                repo.conversationHasEndToEndKey(chatId)
+            )
+
+            // The copy received earlier still carries the key its envelope was opened with —
+            // the same value the receive path writes onto the conversation.
+            dao.insertMessage(
+                MessageEntity(
+                    messageId = "msg_inbound_copy",
+                    chatId = chatId,
+                    senderName = "Otchety",
+                    senderIpv6 = bob.yggIpv6Address,
+                    cipherPayloadHex = "",
+                    plainText = "Привет из оверлея",
+                    timestamp = 1_700_000_000_000L,
+                    isOutgoing = false,
+                    deliveryState = "READ",
+                    ratchetStep = 0,
+                    sealedSenderFlag = true,
+                    hashcashPowToken = "",
+                    authorX25519PubHex = bob.x25519IdentityPubHex
+                )
+            )
+
+            assertTrue(
+                "An authenticated received copy must unblock the chat again",
+                repo.conversationHasEndToEndKey(chatId)
+            )
+            val healed = dao.getConversationById(chatId)!!
+            assertEquals(
+                bob.x25519IdentityPubHex.lowercase(),
+                healed.peerX25519PublicKeyHex.lowercase()
+            )
+            assertNotNull(
+                "The healed chat must seal a real envelope",
+                repo.sealForConversation(healed, "Отчёт доедет")
+            )
+            db.close()
+        }
 
     /** Same 44-byte RIFF header the recorder writes, so the test exercises a real WAV file. */
     private fun wav16Mono(pcm: ByteArray, sampleRate: Int): ByteArray {

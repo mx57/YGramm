@@ -101,7 +101,11 @@ data class MessageEntity(
     // Which group members have ACKed this exact message. A group message is only
     // DELIVERED when that set covers the roster, so the count shown to the user is a
     // count of received acknowledgements and never an assumption.
-    val deliveredMemberCsv: String = ""
+    val deliveredMemberCsv: String = "",
+    // The X25519 key that authenticated this received copy when its envelope opened. A
+    // delete-for-everyone request has to come back sealed from the same key, which is what
+    // makes "only the author may erase it on another device" enforceable with no trust list.
+    val authorX25519PubHex: String = ""
 )
 
 @Entity(tableName = "p2p_file_transfers")
@@ -213,5 +217,28 @@ data class GroupMemberEntity(
     val memberName: String,
     val addedAt: Long,
     val removedAt: Long = 0
+)
+
+/**
+ * A message this device deleted, and (for its own outgoing rows) asked the author-side copy
+ * to delete too. One row covers both directions because the same id is what a retransmitted
+ * frame carries: without the tombstone a duplicate MSG datagram would resurrect a message
+ * the user already removed, and without `confirmedAt` an offline peer's deletion request
+ * would be forgotten as soon as the process died.
+ */
+@Entity(tableName = "message_deletions", primaryKeys = ["chatId", "wireMessageId"])
+data class MessageDeletionEntity(
+    val chatId: String,
+    val wireMessageId: String,
+    // The delete request this device sent for that message: the peer echoes it in its ACK,
+    // so «удалено у собеседника» is only ever claimed for a confirmed request.
+    val deleteId: String,
+    val peerIpv6: String,
+    val requestedAt: Long,
+    // 0 while the peer has not confirmed the deletion.
+    val confirmedAt: Long = 0,
+    val attempts: Int = 0,
+    // True when only this device removed the row; the peer was never asked.
+    val localOnly: Boolean
 )
 

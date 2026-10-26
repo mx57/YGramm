@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import com.example.engine.DerivedIdentityHierarchy
+import com.example.engine.FileTransferProgress
 import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
@@ -959,6 +960,25 @@ class YggRepository(
     )
 
     /**
+     * Heals a 1:1 chat whose pinned key disappeared (contact re-added, storage repaired) while
+     * its history still holds copies whose sender key was authenticated by the envelope itself.
+     * That stored key is the very value the receive path writes onto the conversation, so reusing
+     * it adds no trust the chat did not already have. Groups are excluded: a group row has no
+     * single peer key, and picking one member would seal everyone's copy to the wrong secret.
+     */
+    private suspend fun recoverPeerKeyFromHistory(conv: ConversationEntity): String? {
+        if (conv.chatType == "GROUP" || isSelfChatId(conv.chatId)) return null
+        val recovered = dao.getNewestAuthenticatedIncoming(conv.chatId)
+            ?.authorX25519PubHex
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
+            ?: return null
+        dao.upsertConversation(conv.copy(peerX25519PublicKeyHex = recovered))
+        return recovered
+    }
+
+    /**
      * Keys an outgoing envelope for this conversation would be built from, or null when the
      * peer X25519 key is unknown. Without that key there is no shared secret, and the only
      * alternative is a key anyone can recompute from the public values on the wire, so the
@@ -985,6 +1005,7 @@ class YggRepository(
                     peerProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
                 ).x25519IdentityPubHex.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
             }
+            ?: recoverPeerKeyFromHistory(conv)
             ?: senderIdentity.x25519IdentityPubHex.takeIf {
                 // A group row has no single peer key: its stored envelope is only the local
                 // copy, addressed to ourselves. Every member gets a real envelope sealed to
@@ -1056,9 +1077,12 @@ class YggRepository(
             difficultyBits = powDifficultyBits
         )
         val initialDelivery = "QUEUED_OFFLINE_SF"
-        val merkleRoot = attachmentName?.let {
-            YggCryptoEngine.computeFastCdcMerkleProfile(it, attachmentSizeBytes).second
+        // The manifest is built from the bytes actually on disk, so the ledger and the bubble
+        // quote a real SHA-256 Merkle root over real 12 KiB pieces of this file.
+        val outgoingProfile = attachmentLocalFile(attachmentUri)?.let {
+            YggCryptoEngine.pieceProfileOf(it)
         }
+        val merkleRoot = if (attachmentName != null) outgoingProfile?.merkleRootHex else null
 
         val message = MessageEntity(
             messageId = "msg_${UUID.randomUUID()}",
@@ -1088,20 +1112,21 @@ class YggRepository(
         )
         dao.insertMessage(message)
 
-        if (attachmentName != null && merkleRoot != null && attachmentType != "VOICE") {
-            val (chunks, _) = YggCryptoEngine.computeFastCdcMerkleProfile(attachmentName, attachmentSizeBytes)
+        if (attachmentName != null && outgoingProfile != null && attachmentType != "VOICE") {
             val transfer = P2PFileTransferEntity(
-                transferId = "tx_${UUID.randomUUID()}",
+                transferId = "tx_out_${message.messageId}",
                 chatId = chatId,
                 peerName = conv.title,
                 peerIpv6 = conv.yggIpv6Address,
                 fileName = attachmentName,
-                fileSizeBytes = attachmentSizeBytes,
-                chunkCount = chunks,
-                completedChunks = if (isOfflineMode) 0 else chunks,
-                merkleRootSha256 = merkleRoot,
-                speedKbps = if (isOfflineMode) 0 else 1420,
-                status = if (isOfflineMode) "QUEUED_OFFLINE" else "VERIFIED_COMPLETE",
+                fileSizeBytes = outgoingProfile.totalBytes,
+                chunkCount = outgoingProfile.pieceCount,
+                completedChunks = if (isOfflineMode) 0 else outgoingProfile.pieceCount,
+                merkleRootSha256 = outgoingProfile.merkleRootHex,
+                // Measured by the piece transport when the file really moves; nothing is
+                // reported before it happened.
+                speedKbps = 0,
+                status = if (isOfflineMode) "QUEUED_OFFLINE" else "VERIFIED_LOCAL",
                 isOutgoing = true,
                 protocol = "YGG_OVERLAY_STREAM",
                 timestamp = now
@@ -1151,19 +1176,399 @@ class YggRepository(
             removed += expired.size
             // The chat list keeps its own preview copy: without this the text of a
             // disappeared message would stay visible in the conversation list forever.
-            val newest = dao.getNewestMessage(conv.chatId)
-            dao.upsertConversation(
-                conv.copy(
-                    lastMessagePreview = when {
-                        newest == null -> "Нет сообщений • Начните диалог"
-                        newest.plainText.isNotBlank() -> newest.plainText
-                        else -> "📎 ${newest.attachmentName ?: "Вложение"}"
-                    },
-                    lastTimestamp = newest?.timestamp ?: conv.lastTimestamp
-                )
-            )
+            refreshConversationPreview(conv)
         }
         return removed
+    }
+
+    data class LocalDeletion(
+        val chatId: String,
+        val wireMessageId: String,
+        val wasOutgoing: Boolean,
+        val freedBytes: Long
+    )
+
+    data class PeerDeletion(
+        val chatId: String,
+        val freedBytes: Long
+    )
+
+    data class ChatClearOutcome(
+        val messagesRemoved: Int,
+        val freedBytes: Long
+    )
+
+    /**
+     * Removes a message from this device only: the row, the file this app wrote for it, and a
+     * tombstone so a retransmitted copy cannot bring it back. When [peerWasAsked] the tombstone
+     * stays unconfirmed until the peer's ACK arrives, which is what lets the UI say
+     * «удалено у собеседника» instead of guessing. Returns the bytes actually freed on disk.
+     */
+    suspend fun deleteMessageForMe(
+        messageId: String,
+        wireMessageId: String,
+        deleteId: String,
+        peerIpv6: String,
+        peerWasAsked: Boolean
+    ): LocalDeletion? {
+        val msg = dao.getMessageById(messageId) ?: return null
+        val targetWireId = wireMessageId.ifBlank {
+            if (msg.isOutgoing) msg.messageId else msg.peerMessageId
+        }
+        if (targetWireId.isBlank()) return null
+        val freed = removeMessageRow(msg)
+        dao.upsertMessageDeletion(
+            MessageDeletionEntity(
+                chatId = msg.chatId,
+                wireMessageId = targetWireId,
+                deleteId = deleteId,
+                peerIpv6 = peerIpv6,
+                requestedAt = System.currentTimeMillis(),
+                localOnly = !peerWasAsked
+            )
+        )
+        dao.getConversationById(msg.chatId)?.let { refreshConversationPreview(it) }
+        return LocalDeletion(msg.chatId, targetWireId, msg.isOutgoing, freed)
+    }
+
+    /**
+     * An outgoing delete request travels as a proof envelope, so it needs the same keys an
+     * ordinary message needs. Null means this device cannot prove authorship to that peer at
+     * all, and the caller must keep the deletion local rather than claim it was sent.
+     */
+    suspend fun sealDeleteProof(
+        conv: ConversationEntity,
+        deleteId: String,
+        wireMessageId: String
+    ): String? = sealForConversation(
+        conv = conv,
+        plainText = YggCryptoEngine.buildDeleteProofText(deleteId, wireMessageId)
+    )
+
+    /**
+     * Applies a delete-for-everyone request that came over the wire. Two checks decide it:
+     * the message has to be a received copy authored by the claimed address, and [proofEnvelope]
+     * has to open under this device's key with the same X25519 key that authenticated that
+     * message. Without the second check the address in a frame is only a claim, and any node
+     * that guessed a message id could rewrite somebody else's history. A repeat request is
+     * answered as already-applied rather than as a fresh delete.
+     */
+    suspend fun applyPeerMessageDeletion(
+        wireMessageId: String,
+        senderIpv6: String,
+        deleteId: String,
+        proofEnvelope: String
+    ): PeerDeletion? {
+        if (wireMessageId.isBlank() || senderIpv6.isBlank() || proofEnvelope.isBlank()) return null
+        val msg = dao.getMessageByWireId(wireMessageId) ?: return null
+        if (msg.isOutgoing) return null
+        if (!sameMeshAddress(msg.senderIpv6, senderIpv6)) return null
+        val conv = dao.getConversationById(msg.chatId) ?: return null
+        val authorKey = msg.authorX25519PubHex.ifBlank { conv.peerX25519PublicKeyHex }
+            .trim().lowercase()
+        if (!YggCryptoEngine.isUsablePeerX25519PublicKey(authorKey)) return null
+        val recipientWords = dao.getAllProfilesNow()
+            .find { it.profileId == conv.ownerProfileId }
+            ?.mnemonicCsv?.split(" ")?.filter { it.isNotBlank() }.orEmpty()
+        if (recipientWords.isEmpty()) return null
+        val proof = try {
+            val opened = YggCryptoEngine.openConversationEnvelope(
+                envelope = proofEnvelope,
+                recipientX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(recipientWords),
+                senderEd25519PublicKeyHex = null
+            )
+            val parsed = YggCryptoEngine.parseDeleteProofText(opened.plainText)
+            if (parsed == null || parsed.wireMessageId != wireMessageId || parsed.deleteId != deleteId) {
+                null
+            } else if (opened.senderX25519PublicKeyHex.lowercase() != authorKey) {
+                null
+            } else parsed
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val freed = removeMessageRow(msg)
+        dao.upsertMessageDeletion(
+            MessageDeletionEntity(
+                chatId = msg.chatId,
+                wireMessageId = wireMessageId,
+                deleteId = proof.deleteId,
+                peerIpv6 = senderIpv6,
+                requestedAt = System.currentTimeMillis(),
+                // Nothing to retry here: the author is the one who asked.
+                localOnly = true
+            )
+        )
+        dao.getConversationById(msg.chatId)?.let { refreshConversationPreview(it) }
+        return PeerDeletion(msg.chatId, freed)
+    }
+
+    /**
+     * A deletion tombstone is the durable half of the duplicate guard. The bridge's in-RAM
+     * frame-id set is lost on restart and expires after ten minutes, so a sender retry
+     * arriving later would otherwise re-insert a message the user already removed.
+     */
+    suspend fun isMessageDeleted(chatId: String, wireMessageId: String): Boolean =
+        wireMessageId.isNotBlank() && dao.getMessageDeletion(chatId, wireMessageId) != null
+
+    suspend fun getPendingDeletions(): List<MessageDeletionEntity> = dao.getPendingDeletions()
+
+    suspend fun markDeletionConfirmed(chatId: String, wireMessageId: String) {
+        dao.markDeletionConfirmed(chatId, wireMessageId, System.currentTimeMillis())
+    }
+
+    suspend fun bumpDeletionAttempts(chatId: String, wireMessageId: String) {
+        dao.bumpDeletionAttempts(chatId, wireMessageId)
+    }
+
+    /**
+     * Clears a chat on this device: every message row, every file this app wrote for them,
+     * the transfer ledger and the deletion tombstones, plus the preview the chat list shows.
+     * Returns the message count and the bytes really removed from disk.
+     */
+    suspend fun clearChat(chatId: String): ChatClearOutcome {
+        val conv = dao.getConversationById(chatId) ?: return ChatClearOutcome(0, 0L)
+        val withFiles = dao.getChatMessagesWithFiles(chatId)
+        var freed = 0L
+        withFiles.forEach { msg ->
+            val uri = msg.attachmentUri ?: return@forEach
+            // Only files this app wrote itself may be deleted; content:// rows belong to the provider.
+            if (uri.startsWith("file://")) {
+                Uri.parse(uri).path?.let { path ->
+                    val file = File(path)
+                    if (file.exists()) {
+                        val size = file.length()
+                        if (file.delete()) freed += size
+                    }
+                }
+            }
+        }
+        val cleared = dao.clearMessagesAndGetCount(chatId)
+        dao.clearFileTransfersInChat(chatId)
+        dao.clearDeletionsForChat(chatId)
+        dao.upsertConversation(
+            conv.copy(
+                lastMessagePreview = "Нет сообщений • Начните диалог",
+                unreadCount = 0
+            )
+        )
+        return ChatClearOutcome(cleared, freed)
+    }
+
+    /**
+     * What this app actually holds on disk, measured from the files rather than from the
+     * database counters, so the numbers in Профиль cannot drift away from reality.
+     */
+    data class StorageBreakdown(
+        val attachmentsBytes: Long,
+        val voiceBytes: Long,
+        val avatarBytes: Long,
+        val databaseBytes: Long,
+        val cacheBytes: Long,
+        val updateBytes: Long
+    ) {
+        val totalBytes: Long
+            get() = attachmentsBytes + voiceBytes + avatarBytes + databaseBytes + cacheBytes + updateBytes
+    }
+
+    suspend fun storageBreakdown(): StorageBreakdown {
+        val context = appContext ?: return StorageBreakdown(0L, 0L, 0L, 0L, 0L, 0L)
+        val dbFile = context.getDatabasePath(YggDatabase.DATABASE_NAME)
+        return StorageBreakdown(
+            attachmentsBytes = directoryBytes(File(context.filesDir, "ygg_attachments")),
+            voiceBytes = directoryBytes(File(context.filesDir, "voice_notes")),
+            avatarBytes = directoryBytes(File(context.filesDir, "ygg_avatars")),
+            databaseBytes = dbFile.length(),
+            cacheBytes = directoryBytes(context.cacheDir),
+            // The updater keeps its downloaded APK under files/update, not in the cache dir,
+            // so leaving it out of the card would understate what the app really holds.
+            updateBytes = directoryBytes(File(context.filesDir, "update"))
+        )
+    }
+
+    /**
+     * Deletes orphaned attachment files — every file this app wrote that no remaining message
+     * row points at. Rows are authoritative, so a file whose row was cleared first is garbage.
+     */
+    suspend fun purgeOrphanedAttachmentFiles(): Long {
+        val context = appContext ?: return 0L
+        val referenced = dao.getAllAttachmentUris().toSet()
+        var freed = 0L
+        listOf(File(context.filesDir, "ygg_attachments"), File(context.filesDir, "voice_notes"))
+            .forEach { dir ->
+                val children = dir.listFiles() ?: return@forEach
+                children.forEach { file ->
+                    // A «.part» is scratch space of an inbound stream that may still be running;
+                    // no message row can vouch for it. The bridge deletes every leftover when it
+                    // starts, because a stream never outlives the process that owned it.
+                    if (file.name.startsWith("stream_") && file.name.endsWith(".part")) return@forEach
+                    val uri = Uri.fromFile(file).toString()
+                    if (!referenced.contains(uri)) {
+                        val size = file.length()
+                        if (file.delete()) freed += size
+                    }
+                }
+            }
+        return freed
+    }
+
+    /** The app's own readable copy of an attachment Uri, or null when it is not a local file. */
+    private fun attachmentLocalFile(uri: String?): File? {
+        val raw = uri?.takeIf { it.startsWith("file://") } ?: return null
+        val path = try {
+            Uri.parse(raw).path
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        val file = File(path)
+        return if (file.isFile && file.length() > 0L) file else null
+    }
+
+    /**
+     * AEAD key for one streamed file: X25519 with this profile's own secret and the peer key
+     * pinned in the chat, stretched with the transfer id. Null when the chat has no pinned peer
+     * key — without it the pieces could not be authenticated, so the file is neither sent nor
+     * accepted. Every piece is a separate AEAD message, so a piece from any other node fails to
+     * open and the stream is dropped instead of written.
+     */
+    suspend fun fileTransferKey(profileId: String, chatId: String, transferId: String): ByteArray? {
+        val conv = dao.getConversationById(chatId) ?: return null
+        val ownerProfileId = conv.ownerProfileId.ifBlank { profileId }
+        val words = dao.getAllProfilesNow()
+            .find { it.profileId == ownerProfileId }
+            ?.mnemonicCsv?.split(" ")?.filter { it.isNotBlank() }
+            .orEmpty()
+        if (words.isEmpty()) return null
+        val peer = conv.peerX25519PublicKeyHex.trim().lowercase()
+        if (!YggCryptoEngine.isUsablePeerX25519PublicKey(peer)) return null
+        return try {
+            YggCryptoEngine.deriveFileTransferKey(
+                localX25519PrivateKey = YggCryptoEngine.x25519PrivateKeyFromMnemonic(words),
+                peerX25519PublicKeyHex = peer,
+                transferId = transferId
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Local dialog an inbound file stream belongs to. The chatId inside the frame is a row on the
+     * sender's device and means nothing here, while the per-transfer AEAD key can only be derived
+     * from the pinned peer key of a real local conversation — so the same (owner + mesh address)
+     * rule that routes incoming messages is reused, with the authenticated node key as fallback.
+     */
+    suspend fun incomingDialogChatId(
+        profileId: String,
+        senderPubKeyHex: String,
+        senderIpv6: String
+    ): String? {
+        val allProfiles = dao.getAllProfilesNow()
+        val ownerProfileId = profileId.takeIf { id -> allProfiles.any { it.profileId == id } }
+            ?: DEFAULT_PROFILE_ID
+        val cleanIpv6 = senderIpv6.trim()
+        val nodeKey = senderPubKeyHex.trim().lowercase()
+        return dao.getAllConversationsNow().find {
+            it.ownerProfileId == ownerProfileId &&
+                !isSelfChatId(it.chatId) &&
+                it.chatType != "GROUP" &&
+                ((cleanIpv6.isNotBlank() && sameMeshAddress(it.yggIpv6Address, cleanIpv6)) ||
+                    (nodeKey.isNotBlank() && it.publicKeyHex.trim().lowercase() == nodeKey))
+        }?.chatId
+    }
+
+    /**
+     * Writes the measured state of an outbound streamed transfer into the ledger and the message
+     * row. Only pieces the peer has acknowledged are counted, and the speed is the wall clock of
+     * that run — nothing is reported that did not happen.
+     */
+    suspend fun recordFileTransferProgress(progress: FileTransferProgress) {
+        if (!progress.isOutgoing) return
+        val pieceBytes = YggCryptoEngine.FILE_PIECE_BYTES.toLong()
+        val chunkCount = ((progress.totalBytes + pieceBytes - 1) / pieceBytes).toInt().coerceAtLeast(1)
+        val doneChunks = (progress.doneBytes / pieceBytes).toInt().coerceAtMost(chunkCount)
+        val speedKbps = if (progress.elapsedMs > 300L && progress.doneBytes > 0L) {
+            (progress.doneBytes * 8.0 / 1024.0 / (progress.elapsedMs / 1000.0))
+                .toLong()
+                .coerceAtMost(Int.MAX_VALUE.toLong())
+                .toInt()
+        } else {
+            0
+        }
+        val existing = dao.getFileTransferById("tx_out_${progress.transferId}")
+        val conv = dao.getConversationById(progress.chatId)
+        val transfer = existing ?: P2PFileTransferEntity(
+            transferId = "tx_out_${progress.transferId}",
+            chatId = progress.chatId,
+            peerName = conv?.title ?: "Диалог",
+            peerIpv6 = conv?.yggIpv6Address ?: "",
+            fileName = progress.fileName,
+            fileSizeBytes = progress.totalBytes,
+            chunkCount = chunkCount,
+            completedChunks = doneChunks,
+            merkleRootSha256 = progress.merkleRootHex,
+            speedKbps = speedKbps,
+            status = progress.state,
+            isOutgoing = true,
+            protocol = "YGG_OVERLAY_STREAM",
+            timestamp = System.currentTimeMillis()
+        )
+        dao.upsertFileTransfer(
+            transfer.copy(
+                chunkCount = chunkCount,
+                completedChunks = doneChunks,
+                fileSizeBytes = progress.totalBytes,
+                merkleRootSha256 = progress.merkleRootHex.ifBlank { transfer.merkleRootSha256 },
+                speedKbps = speedKbps,
+                status = progress.state
+            )
+        )
+        val fraction = if (chunkCount > 0) doneChunks.toFloat() / chunkCount else 0f
+        dao.updateMessageTransferProgress(progress.transferId, fraction)
+    }
+
+    private suspend fun removeMessageRow(msg: MessageEntity): Long {
+        var freed = 0L
+        val uri = msg.attachmentUri
+        if (uri != null && uri.startsWith("file://")) {
+            Uri.parse(uri).path?.let { path ->
+                val file = File(path)
+                if (file.exists()) {
+                    val size = file.length()
+                    if (file.delete()) freed += size
+                }
+            }
+        }
+        dao.deleteMessagesByIds(listOf(msg.messageId))
+        return freed
+    }
+
+    private suspend fun refreshConversationPreview(conv: ConversationEntity) {
+        val newest = dao.getNewestMessage(conv.chatId)
+        dao.upsertConversation(
+            conv.copy(
+                lastMessagePreview = when {
+                    newest == null -> "Нет сообщений • Начните диалог"
+                    newest.plainText.isNotBlank() -> newest.plainText
+                    else -> "📎 ${newest.attachmentName ?: "Вложение"}"
+                },
+                lastTimestamp = newest?.timestamp ?: conv.lastTimestamp
+            )
+        )
+    }
+
+    private fun directoryBytes(dir: File): Long {
+        if (!dir.exists()) return 0L
+        var total = 0L
+        val stack = ArrayDeque<File>()
+        stack.addLast(dir)
+        while (stack.isNotEmpty()) {
+            val current = stack.removeLast()
+            val children = current.listFiles() ?: continue
+            children.forEach { child ->
+                if (child.isDirectory) stack.addLast(child) else total += child.length()
+            }
+        }
+        return total
     }
 
     /**
@@ -1486,6 +1891,10 @@ class YggRepository(
         if (packet.messageId.isNotBlank()) {
             val alreadyStored = dao.getIncomingCopyByWireId(conv.chatId, packet.messageId)
             if (alreadyStored != null) return alreadyStored.chatId
+            // A retransmitted copy of a message that was already deleted — locally or by the
+            // author's delete-for-everyone request — must not resurrect it. The tombstone is
+            // the only durable record of that refusal once the in-RAM frame set expires.
+            if (dao.getMessageDeletion(conv.chatId, packet.messageId) != null) return conv.chatId
         }
 
         val resolvedAttachmentUri = if (appContext != null && (packet.attachmentName != null || packet.attachmentType != null)) {
@@ -1502,8 +1911,16 @@ class YggRepository(
             packet.attachmentUri
         }
 
-        val merkleRoot = packet.attachmentName?.let {
-            YggCryptoEngine.computeFastCdcMerkleProfile(it, packet.attachmentSizeBytes).second
+        // For an inline payload this hashes the bytes this device just saved; for a streamed one
+        // the piece transport already verified the same tree piece by piece before the message
+        // was acknowledged, so the root it reports is this device's own measurement.
+        val receivedProfile = attachmentLocalFile(resolvedAttachmentUri)?.let {
+            YggCryptoEngine.pieceProfileOf(it)
+        }
+        val merkleRoot = if (packet.attachmentName != null) {
+            receivedProfile?.merkleRootHex ?: packet.streamedAttachmentRoot.takeIf { it.isNotBlank() }
+        } else {
+            null
         }
         val msg = MessageEntity(
             messageId = "msg_rx_${UUID.randomUUID()}",
@@ -1530,24 +1947,24 @@ class YggRepository(
             peerMessageId = packet.messageId,
             replyToMessageId = packet.replyToMessageId,
             forwardedFrom = packet.forwardedFrom,
-            envelopeVersion = resolvedEnvelopeVersion
+            envelopeVersion = resolvedEnvelopeVersion,
+            authorX25519PubHex = authenticatedSenderX25519Pub
         )
         dao.insertMessage(msg)
 
         if (packet.attachmentName != null && merkleRoot != null && packet.attachmentType != "VOICE") {
-            val (chunks, _) = YggCryptoEngine.computeFastCdcMerkleProfile(packet.attachmentName, packet.attachmentSizeBytes)
             val rxTransfer = P2PFileTransferEntity(
-                transferId = "tx_rx_${UUID.randomUUID()}",
+                transferId = "tx_in_${msg.messageId}",
                 chatId = conv.chatId,
                 peerName = packet.senderNodeLabel,
                 peerIpv6 = packet.senderIpv6,
                 fileName = packet.attachmentName,
-                fileSizeBytes = packet.attachmentSizeBytes,
-                chunkCount = chunks,
-                completedChunks = chunks,
+                fileSizeBytes = receivedProfile?.totalBytes ?: msg.attachmentSizeBytes,
+                chunkCount = receivedProfile?.pieceCount ?: 0,
+                completedChunks = receivedProfile?.pieceCount ?: 0,
                 merkleRootSha256 = merkleRoot,
-                speedKbps = 1850,
-                status = "VERIFIED_COMPLETE",
+                speedKbps = 0,
+                status = if (receivedProfile != null) "VERIFIED_COMPLETE" else "RECEIVED_UNVERIFIED",
                 isOutgoing = false,
                 protocol = "YGG_OVERLAY_STREAM",
                 timestamp = packet.timestamp

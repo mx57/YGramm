@@ -207,6 +207,12 @@ interface YggDao {
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT 1")
     suspend fun getNewestMessage(chatId: String): MessageEntity?
 
+    @Query(
+        "SELECT * FROM messages WHERE chatId = :chatId AND isOutgoing = 0 AND authorX25519PubHex <> '' " +
+            "ORDER BY timestamp DESC LIMIT 1"
+    )
+    suspend fun getNewestAuthenticatedIncoming(chatId: String): MessageEntity?
+
     @Query("DELETE FROM messages WHERE messageId IN (:messageIds)")
     suspend fun deleteMessagesByIds(messageIds: List<String>)
 
@@ -255,6 +261,53 @@ interface YggDao {
     @Query("DELETE FROM messages WHERE chatId = :chatId")
     suspend fun clearMessagesInChat(chatId: String)
 
+    /**
+     * Message deletion and chat clearing. A tombstone row is what keeps a retransmitted
+     * copy of a deleted message from coming back: the overlay can hand the same frame over
+     * again after a lost ACK, and only this table remembers that we already refused it.
+     */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertMessageDeletion(entry: MessageDeletionEntity)
+
+    @Query(
+        "SELECT * FROM message_deletions WHERE chatId = :chatId AND wireMessageId = :wireMessageId LIMIT 1"
+    )
+    suspend fun getMessageDeletion(chatId: String, wireMessageId: String): MessageDeletionEntity?
+
+    @Query("SELECT * FROM message_deletions WHERE confirmedAt = 0 AND localOnly = 0 ORDER BY requestedAt ASC")
+    suspend fun getPendingDeletions(): List<MessageDeletionEntity>
+
+    @Query(
+        "UPDATE message_deletions SET confirmedAt = :confirmedAt, attempts = attempts + 1 " +
+            "WHERE chatId = :chatId AND wireMessageId = :wireMessageId"
+    )
+    suspend fun markDeletionConfirmed(chatId: String, wireMessageId: String, confirmedAt: Long)
+
+    @Query(
+        "UPDATE message_deletions SET attempts = attempts + 1 " +
+            "WHERE chatId = :chatId AND wireMessageId = :wireMessageId"
+    )
+    suspend fun bumpDeletionAttempts(chatId: String, wireMessageId: String)
+
+    @Query("DELETE FROM message_deletions WHERE chatId = :chatId")
+    suspend fun clearDeletionsForChat(chatId: String)
+
+    // The row count is what the UI reports as «очистено N сообщений», so the delete has to
+    // answer how many rows it actually took rather than assume the list was unchanged.
+    @Query("DELETE FROM messages WHERE chatId = :chatId")
+    suspend fun clearMessagesAndGetCount(chatId: String): Int
+
+    @Query("DELETE FROM p2p_file_transfers WHERE chatId = :chatId")
+    suspend fun clearFileTransfersInChat(chatId: String)
+
+    @Query("SELECT attachmentUri FROM messages WHERE attachmentUri IS NOT NULL AND attachmentUri <> ''")
+    suspend fun getAllAttachmentUris(): List<String>
+
+    @Query(
+        "SELECT * FROM messages WHERE chatId = :chatId AND attachmentUri IS NOT NULL AND attachmentUri <> ''"
+    )
+    suspend fun getChatMessagesWithFiles(chatId: String): List<MessageEntity>
+
     @Query("DELETE FROM conversations WHERE chatId = :chatId")
     suspend fun deleteConversation(chatId: String)
 
@@ -266,6 +319,12 @@ interface YggDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertFileTransfer(transfer: P2PFileTransferEntity)
+
+    @Query("SELECT * FROM p2p_file_transfers WHERE transferId = :transferId")
+    suspend fun getFileTransferById(transferId: String): P2PFileTransferEntity?
+
+    @Query("UPDATE messages SET transferProgress = :fraction WHERE messageId = :messageId")
+    suspend fun updateMessageTransferProgress(messageId: String, fraction: Float)
 
     @Query("SELECT * FROM ygg_peers ORDER BY isConnected DESC, latencyMs ASC")
     fun observePeers(): Flow<List<YggPeerEntity>>

@@ -22,11 +22,36 @@ data class DiscoveredYggPeer(
     val transportType: String, // "TLS_YGGDRASIL", "TCP_YGGDRASIL", "WSS_CDN_WHITELIST", "QUIC_UDP_PADDING"
     val sniDomain: String,
     val utlsFingerprint: String,
-    val latencyMs: Int, // -1 = not probed / unreachable
-    val uptimePercent: Double,
+    val latencyMs: Int, // -1 = this device has not measured it
     val whitelistCompatible: Boolean,
     val ed25519PubKeyShort: String,
-    val bandwidthMbps: Int
+    // When the public directory last saw this endpoint answer. This is the node's freshness
+    // as someone else reported it: it decides what the scanner probes first, it is never
+    // shown as a reachability claim about this device's own network.
+    val lastSeenAtMs: Long = 0L,
+    // The directory's own measured response time in ms (-1 = not reported). A hint for
+    // ranking only; the number the UI shows as ping is always the local socket measurement.
+    val directoryRttMs: Int = -1
+) {
+    /** Only a node the directory saw inside [windowMs] counts as fresh. */
+    fun freshWithin(windowMs: Long, nowMs: Long): Boolean =
+        lastSeenAtMs > 0L && nowMs - lastSeenAtMs <= windowMs
+}
+
+/**
+ * What one read of the public directory cost and yielded, so the scan summary can name the
+ * numbers instead of inventing them: how many entries were published, how many were still
+ * reported up and fresh, how many were dropped, and why the read itself failed if it did.
+ */
+data class DirectoryFetch(
+    val peers: List<DiscoveredYggPeer>,
+    val reportedTotal: Int,
+    val usableCount: Int,
+    val skippedDown: Int,
+    val skippedStale: Int,
+    val skippedOldProtocol: Int,
+    val fetchedAtMs: Long,
+    val errorDetail: String? = null
 )
 
 object YggPeerScannerCatalog {
@@ -79,10 +104,8 @@ object YggPeerScannerCatalog {
             sniDomain = "nl1.route172.de",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/netherlands.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_de_mkg20001",
@@ -95,10 +118,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg.mkg20001.io",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/germany.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_donotclickthis_wss",
@@ -111,10 +132,8 @@ object YggPeerScannerCatalog {
             sniDomain = "donotclickthis.link",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_itrus_ekb",
@@ -127,10 +146,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ekb.itrus.su",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_nl_itrus_vpn",
@@ -143,10 +160,8 @@ object YggPeerScannerCatalog {
             sniDomain = "vpn.itrus.su",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/netherlands.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_cleverfox_kursk",
@@ -159,10 +174,8 @@ object YggPeerScannerCatalog {
             sniDomain = "kursk.cleverfox.org",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_i113d_msk_aeza",
@@ -175,10 +188,8 @@ object YggPeerScannerCatalog {
             sniDomain = "mskaeza.i113d.ru",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_i113d_server",
@@ -191,10 +202,8 @@ object YggPeerScannerCatalog {
             sniDomain = "server.i113d.ru",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_averyan_msk",
@@ -207,10 +216,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg-msk-1.averyan.ru",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_meddevsystems",
@@ -223,10 +230,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg.med-dev-systems.ru",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_magicum_vvo",
@@ -239,10 +244,8 @@ object YggPeerScannerCatalog {
             sniDomain = "yg-vvo.magicum.net",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_paulll_box",
@@ -255,10 +258,8 @@ object YggPeerScannerCatalog {
             sniDomain = "box.paulll.cc",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_ru_duckdns_vix",
@@ -271,10 +272,8 @@ object YggPeerScannerCatalog {
             sniDomain = "vix.duckdns.org",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "verified_fr_i2pd_s2",
@@ -287,10 +286,8 @@ object YggPeerScannerCatalog {
             sniDomain = "s2.i2pd.xyz",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/france.md",
-            bandwidthMbps = 1000
         )
     )
 
@@ -313,10 +310,8 @@ object YggPeerScannerCatalog {
             sniDomain = "51.15.204.214",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:48c2f901a6...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         // --- RUSSIA (RU) ---
         DiscoveredYggPeer(
@@ -330,10 +325,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg.zbin.eu",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:0185f5d2c9...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ru_spb_mimir_tls",
@@ -346,10 +339,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ru.ygg.mimir.im",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
             ed25519PubKeyShort = "mimir-mesh-ru",
-            bandwidthMbps = 1000
         ),
         DiscoveredYggPeer(
             id = "real_ru_msk_it4_tls",
@@ -362,10 +353,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg.it4.org",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.3,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:9a4e17c2f0...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ru_msk_backbone_tcp",
@@ -378,10 +367,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.22.172.110",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.1,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:4410d92bc8...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ru_spb_neva_tls",
@@ -394,10 +381,8 @@ object YggPeerScannerCatalog {
             sniDomain = "94.198.51.149",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 98.9,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:77b2a109e1...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ru_ekb_ural_tls",
@@ -410,10 +395,8 @@ object YggPeerScannerCatalog {
             sniDomain = "176.53.160.19",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 98.8,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:3c8f11e5a4...",
-            bandwidthMbps = 800
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ru_nsk_siberia_tls",
@@ -426,10 +409,8 @@ object YggPeerScannerCatalog {
             sniDomain = "82.146.43.201",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 98.7,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:5e90a1b4d3...",
-            bandwidthMbps = 800
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- GERMANY (DE) ---
@@ -444,10 +425,8 @@ object YggPeerScannerCatalog {
             sniDomain = "publicpeers.neilalexander.dev",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.9,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ygg-core-directory",
-            bandwidthMbps = 2500
         ),
         DiscoveredYggPeer(
             id = "real_de_fsn_uplink",
@@ -460,10 +439,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg-uplink.de",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.7,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:8b3f20c4e9...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_de_nue_hetzner",
@@ -476,10 +453,8 @@ object YggPeerScannerCatalog {
             sniDomain = "88.99.219.42",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:1a7c45e8d2...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_de_fra_mimir",
@@ -492,10 +467,8 @@ object YggPeerScannerCatalog {
             sniDomain = "de.ygg.mimir.im",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
             ed25519PubKeyShort = "mimir-mesh-de",
-            bandwidthMbps = 1500
         ),
         DiscoveredYggPeer(
             id = "real_de_ber_wss",
@@ -508,10 +481,8 @@ object YggPeerScannerCatalog {
             sniDomain = "138.201.92.114",
             utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
-            uptimePercent = 99.3,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:6f20a8c1e7...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_de_fsn_quic",
@@ -524,10 +495,8 @@ object YggPeerScannerCatalog {
             sniDomain = "168.119.153.26",
             utlsFingerprint = "QUIC_v1_Padded_Jitter",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:0d92f3b5c1...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- FINLAND (FI) ---
@@ -542,10 +511,8 @@ object YggPeerScannerCatalog {
             sniDomain = "65.21.57.125",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.8,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:29d29258a0...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_fi_hel_2",
@@ -558,10 +525,8 @@ object YggPeerScannerCatalog {
             sniDomain = "95.217.35.148",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:71a9c408e2...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_fi_tuu_3",
@@ -574,10 +539,8 @@ object YggPeerScannerCatalog {
             sniDomain = "135.181.141.72",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:88e1b092f4...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- NETHERLANDS (NL) ---
@@ -592,10 +555,8 @@ object YggPeerScannerCatalog {
             sniDomain = "45.147.198.155",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.7,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:51b0e7d4a2...",
-            bandwidthMbps = 2500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_nl_ams_443",
@@ -608,10 +569,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.107.56.142",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:92f4c108b7...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_nl_naa_worldstream",
@@ -624,10 +583,8 @@ object YggPeerScannerCatalog {
             sniDomain = "194.5.78.29",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:34a8d219e0...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_nl_rot_tcp",
@@ -640,10 +597,8 @@ object YggPeerScannerCatalog {
             sniDomain = "91.92.109.41",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.2,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:60e3b7a1c9...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- FRANCE (FR) ---
@@ -658,10 +613,8 @@ object YggPeerScannerCatalog {
             sniDomain = "51.210.104.88",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:19e4a7c3d8...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_fr_sbg_2",
@@ -674,10 +627,8 @@ object YggPeerScannerCatalog {
             sniDomain = "163.172.149.60",
             utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
-            uptimePercent = 99.3,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:7c01d5e9b2...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_fr_gra_wss",
@@ -690,10 +641,8 @@ object YggPeerScannerCatalog {
             sniDomain = "54.37.204.19",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.2,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:a4b9e201f7...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- POLAND (PL) ---
@@ -708,10 +657,8 @@ object YggPeerScannerCatalog {
             sniDomain = "193.93.119.42",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:2f8a19c4e0...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_pl_waw_443",
@@ -724,10 +671,8 @@ object YggPeerScannerCatalog {
             sniDomain = "51.83.236.115",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:99d0e4b2a1...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_pl_gda_2",
@@ -740,10 +685,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.238.72.18",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.1,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:41c7f803d6...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- SWEDEN (SE) ---
@@ -758,10 +701,8 @@ object YggPeerScannerCatalog {
             sniDomain = "ygg.ace.ctrl-c.liu.se",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.7,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ctrl-c-liu-se",
-            bandwidthMbps = 2000
         ),
         DiscoveredYggPeer(
             id = "real_se_sto_443",
@@ -774,10 +715,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.65.134.90",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:b8e204a9f1...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- SWITZERLAND (CH) ---
@@ -792,10 +731,8 @@ object YggPeerScannerCatalog {
             sniDomain = "179.43.148.92",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.8,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:c3a9f108d4...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ch_gva_2",
@@ -808,10 +745,8 @@ object YggPeerScannerCatalog {
             sniDomain = "83.166.152.34",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:77d1e5b8a0...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- UNITED KINGDOM (GB) ---
@@ -826,10 +761,8 @@ object YggPeerScannerCatalog {
             sniDomain = "51.89.172.104",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.7,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:09f4c2e1b8...",
-            bandwidthMbps = 2500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_gb_man_2",
@@ -842,10 +775,8 @@ object YggPeerScannerCatalog {
             sniDomain = "213.171.208.55",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:52a8d901c3...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- CZECHIA (CZ) ---
@@ -860,10 +791,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.8.165.72",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:e4b1c809a2...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- ESTONIA (EE) ---
@@ -878,10 +807,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.31.240.19",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:11c9e4f2b7...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- KAZAKHSTAN (KZ) ---
@@ -896,10 +823,8 @@ object YggPeerScannerCatalog {
             sniDomain = "185.98.5.140",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.3,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:6a30f8d1c2...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_kz_nqz_2",
@@ -912,10 +837,8 @@ object YggPeerScannerCatalog {
             sniDomain = "91.147.92.81",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.0,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:8d21b4a9e5...",
-            bandwidthMbps = 1000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- UNITED STATES (US) ---
@@ -930,10 +853,8 @@ object YggPeerScannerCatalog {
             sniDomain = "45.76.166.128",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:3f7a19e2c4...",
-            bandwidthMbps = 2500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_us_mia_443",
@@ -946,10 +867,8 @@ object YggPeerScannerCatalog {
             sniDomain = "198.251.89.114",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:90b4d2e8a1...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_us_dal_3",
@@ -962,10 +881,8 @@ object YggPeerScannerCatalog {
             sniDomain = "104.238.140.55",
             utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:5c18f3a9d0...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_us_lax_4",
@@ -978,10 +895,8 @@ object YggPeerScannerCatalog {
             sniDomain = "45.32.78.210",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:1e90b4c7a2...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_us_sea_5",
@@ -994,10 +909,8 @@ object YggPeerScannerCatalog {
             sniDomain = "137.220.41.88",
             utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
-            uptimePercent = 99.2,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:7a2f81d4e9...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- CANADA (CA) ---
@@ -1012,10 +925,8 @@ object YggPeerScannerCatalog {
             sniDomain = "158.69.198.44",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:4d82e1a9c0...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
         DiscoveredYggPeer(
             id = "real_ca_yyz_2",
@@ -1028,10 +939,8 @@ object YggPeerScannerCatalog {
             sniDomain = "149.248.56.92",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.4,
             whitelistCompatible = false,
-            ed25519PubKeyShort = "key:83f0a4b2d7...",
-            bandwidthMbps = 1500
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- SINGAPORE (SG) ---
@@ -1046,10 +955,8 @@ object YggPeerScannerCatalog {
             sniDomain = "139.180.132.75",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.5,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:20c9e7b1f4...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         ),
 
         // --- JAPAN (JP) ---
@@ -1064,88 +971,179 @@ object YggPeerScannerCatalog {
             sniDomain = "45.32.24.160",
             utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
-            uptimePercent = 99.6,
             whitelistCompatible = true,
-            ed25519PubKeyShort = "key:6f19a8d3c2...",
-            bandwidthMbps = 2000
+            ed25519PubKeyShort = "ключ не проверялся",
         )
     ) + verifiedPublicPeers
 
+    /** A node the directory saw answering no longer than this ago is a scan candidate. */
+    val freshWindowMs: Long = 15 * 60 * 1000L
+
     /**
-     * Fetches the live public Yggdrasil peers JSON from publicpeers.neilalexander.dev/publicnodes.json
-     * over a real HTTPS connection and parses ALL active nodes by country without artificial limits.
+     * Reads the live public-peer directory (publicpeers.neilalexander.dev/publicnodes.json)
+     * over a real HTTPS connection. Only the transport lives here; every judgement about which
+     * node is worth a socket is in [parseDirectorySnapshot].
      */
-    fun fetchLivePublicPeersFromDirectory(timeoutMs: Int = 5000): List<DiscoveredYggPeer> {
-        val discovered = mutableListOf<DiscoveredYggPeer>()
-        val connection = (URL("https://publicpeers.neilalexander.dev/publicnodes.json").openConnection() as HttpURLConnection).apply {
-            connectTimeout = timeoutMs
-            readTimeout = timeoutMs
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "YggGram-Android/1.2 (Yggdrasil-Mesh-Client)")
+    fun fetchLivePublicPeersFromDirectory(
+        timeoutMs: Int = 5000,
+        freshnessWindowMs: Long = freshWindowMs,
+        nowMs: Long = System.currentTimeMillis()
+    ): DirectoryFetch {
+        val failure = { reason: String ->
+            DirectoryFetch(
+                peers = emptyList(),
+                reportedTotal = 0,
+                usableCount = 0,
+                skippedDown = 0,
+                skippedStale = 0,
+                skippedOldProtocol = 0,
+                fetchedAtMs = nowMs,
+                errorDetail = reason
+            )
+        }
+        val connection = try {
+            (URL(DIRECTORY_URL).openConnection() as HttpURLConnection).apply {
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "Ygramm-Android/1.7 (Yggdrasil-Mesh-Client)")
+            }
+        } catch (e: Exception) {
+            return failure("${e.javaClass.simpleName}: ${e.message}")
         }
 
         try {
-            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                val rawJson = connection.inputStream.bufferedReader().use { it.readText() }
-                val root = JSONObject(rawJson)
-                val countryKeys = root.keys()
-                while (countryKeys.hasNext()) {
-                    val countryKey = countryKeys.next()
-                    val (code, flag, nameRu) = mapCountryKey(countryKey)
-                    val peersObj = root.optJSONObject(countryKey) ?: continue
-                    val uriKeys = peersObj.keys()
-                    while (uriKeys.hasNext()) {
-                        val endpointUri = uriKeys.next().trim()
-                        if (!endpointUri.startsWith("tls://") &&
-                            !endpointUri.startsWith("tcp://") &&
-                            !endpointUri.startsWith("wss://") &&
-                            !endpointUri.startsWith("quic://")
-                        ) continue
-
-                        val meta = peersObj.optJSONObject(endpointUri)
-                        val isUp = meta?.optBoolean("up", true) ?: true
-                        if (!isUp) continue
-
-                        val host = extractHostFromUri(endpointUri)
-                        val port = extractPortFromUri(endpointUri)
-                        val isPort443OrWss = endpointUri.startsWith("wss://") || port == 443
-                        val transportType = when {
-                            endpointUri.startsWith("wss://") -> "WSS_CDN_WHITELIST"
-                            endpointUri.startsWith("tls://") && port == 443 -> "WSS_CDN_WHITELIST"
-                            endpointUri.startsWith("tls://") -> "TLS_YGGDRASIL"
-                            endpointUri.startsWith("quic://") -> "QUIC_UDP_PADDING"
-                            else -> "TCP_YGGDRASIL"
-                        }
-                        val peerKey = meta?.optString("key", "")?.takeIf { it.isNotBlank() }?.let {
-                            "key:${it.take(12)}..."
-                        } ?: "yggdrasil-public-node"
-
-                        discovered.add(
-                            DiscoveredYggPeer(
-                                id = "live_${code.lowercase()}_${endpointUri.hashCode().toUInt()}",
-                                countryCode = code,
-                                countryFlag = flag,
-                                countryNameRu = nameRu,
-                                cityRu = "$host:$port",
-                                endpointUri = endpointUri,
-                                transportType = transportType,
-                                sniDomain = host,
-                                utlsFingerprint = "HelloChrome_128_Auto",
-                                latencyMs = -1,
-                                uptimePercent = 99.5,
-                                whitelistCompatible = isPort443OrWss,
-                                ed25519PubKeyShort = peerKey,
-                                bandwidthMbps = 1000
-                            )
-                        )
-                    }
-                }
-            }
+            val status = connection.responseCode
+            if (status != HttpURLConnection.HTTP_OK) return failure("HTTP $status")
+            val rawJson = connection.inputStream.bufferedReader().use { it.readText() }
+            return parseDirectorySnapshot(rawJson, nowMs, freshnessWindowMs)
+        } catch (e: Exception) {
+            return failure("${e.javaClass.simpleName}: ${e.message}")
         } finally {
             connection.disconnect()
         }
-        return discovered
     }
+
+    /**
+     * Keeps the endpoints a public directory still reports as up, on the current wire protocol,
+     * and seen inside [freshnessWindowMs], ordered freshest-first.
+     *
+     * That is what makes a scan find nodes that are actually reachable: the directory publishes
+     * `up`, `last_seen`, `proto_minor` and its own `response_ms` per entry, so a node three
+     * weeks stale or still speaking an older protocol is dropped before any socket is opened.
+     * None of it is a claim that "this" device reached the node — the result only ranks probe
+     * candidates, and the ping shown in the UI always comes from the local probe.
+     */
+    fun parseDirectorySnapshot(
+        rawJson: String,
+        nowMs: Long = System.currentTimeMillis(),
+        freshnessWindowMs: Long = freshWindowMs
+    ): DirectoryFetch {
+        var reportedTotal = 0
+        var skippedDown = 0
+        var skippedOldProtocol = 0
+        var skippedStale = 0
+        val discovered = mutableListOf<DiscoveredYggPeer>()
+        val root = JSONObject(rawJson)
+        val countryKeys = root.keys()
+        while (countryKeys.hasNext()) {
+            val countryKey = countryKeys.next()
+            val (code, flag, nameRu) = mapCountryKey(countryKey)
+            val peersObj = root.optJSONObject(countryKey) ?: continue
+            val uriKeys = peersObj.keys()
+            while (uriKeys.hasNext()) {
+                val endpointUri = uriKeys.next().trim()
+                if (!endpointUri.startsWith("tls://") &&
+                    !endpointUri.startsWith("tcp://") &&
+                    !endpointUri.startsWith("wss://") &&
+                    !endpointUri.startsWith("quic://")
+                ) continue
+                reportedTotal++
+
+                val meta = peersObj.optJSONObject(endpointUri) ?: continue
+                if (!meta.optBoolean("up", false)) {
+                    skippedDown++
+                    continue
+                }
+                // minor 5 is what the bundled core speaks; an older node answers the probe and
+                // then refuses the tree handshake, so it is not worth a socket.
+                if (meta.optInt("proto_minor", 5) < 5) {
+                    skippedOldProtocol++
+                    continue
+                }
+                val lastSeenMs = meta.optLong("last_seen", 0L) * 1000L
+                if (lastSeenMs <= 0L || nowMs - lastSeenMs > freshnessWindowMs) {
+                    skippedStale++
+                    continue
+                }
+
+                val host = extractHostFromUri(endpointUri)
+                val port = extractPortFromUri(endpointUri)
+                val transportType = when {
+                    endpointUri.startsWith("wss://") -> "WSS_CDN_WHITELIST"
+                    endpointUri.startsWith("tls://") && port == 443 -> "WSS_CDN_WHITELIST"
+                    endpointUri.startsWith("tls://") -> "TLS_YGGDRASIL"
+                    endpointUri.startsWith("quic://") -> "QUIC_UDP_PADDING"
+                    else -> "TCP_YGGDRASIL"
+                }
+                val nodeKey = meta.optString("key", "").trim().lowercase()
+
+                discovered.add(
+                    DiscoveredYggPeer(
+                        id = "live_${code.lowercase()}_${endpointUri.hashCode().toUInt()}",
+                        countryCode = code,
+                        countryFlag = flag,
+                        countryNameRu = nameRu,
+                        cityRu = "$host:$port",
+                        endpointUri = endpointUri,
+                        transportType = transportType,
+                        sniDomain = host,
+                        utlsFingerprint = "HelloChrome_128_Auto",
+                        latencyMs = -1,
+                        whitelistCompatible = endpointUri.startsWith("wss://") || port == 443,
+                        ed25519PubKeyShort =
+                            if (nodeKey.length == 64) "key:${nodeKey.take(12)}…" else "ключ неизвестен",
+                        lastSeenAtMs = lastSeenMs,
+                        directoryRttMs = meta.optInt("response_ms", -1)
+                    )
+                )
+            }
+        }
+
+        val ordered = discovered
+            .distinctBy { it.endpointUri.lowercase() }
+            .sortedWith(
+                // Freshest first; within one sighting, the directory's own RTT as the tie-break.
+                compareByDescending<DiscoveredYggPeer> { it.lastSeenAtMs }
+                    .thenBy { if (it.directoryRttMs >= 0) it.directoryRttMs else Int.MAX_VALUE }
+            )
+        return DirectoryFetch(
+            peers = ordered,
+            reportedTotal = reportedTotal,
+            usableCount = ordered.size,
+            skippedDown = skippedDown,
+            skippedStale = skippedStale,
+            skippedOldProtocol = skippedOldProtocol,
+            fetchedAtMs = nowMs
+        )
+    }
+
+    /**
+     * Human-readable age of the directory's last sighting, in Russian and without pretending
+     * more precision than the data has: anything older than a day is reported as days.
+     */
+    fun formatFreshness(lastSeenAtMs: Long, nowMs: Long = System.currentTimeMillis()): String {
+        if (lastSeenAtMs <= 0L) return "свежесть неизвестна"
+        val ageSeconds = ((nowMs - lastSeenAtMs) / 1000L).coerceAtLeast(0L)
+        return when {
+            ageSeconds < 60 -> "виден $ageSeconds с назад"
+            ageSeconds < 3600 -> "виден ${(ageSeconds / 60)} мин назад"
+            ageSeconds < 86400 -> "виден ${(ageSeconds / 3600)} ч назад"
+            else -> "виден ${(ageSeconds / 86400)} сут назад"
+        }
+    }
+
+    private const val DIRECTORY_URL = "https://publicpeers.neilalexander.dev/publicnodes.json"
 
     /**
      * Parses a multi-line or space-separated block of peer URIs (`tls://...`, `tcp://...`, `wss://...`, `quic://...`)
@@ -1180,10 +1178,8 @@ object YggPeerScannerCatalog {
                 sniDomain = host.ifBlank { defaultSni },
                 utlsFingerprint = defaultUtls,
                 latencyMs = -1,
-                uptimePercent = 99.0,
                 whitelistCompatible = isWhitelist,
-                ed25519PubKeyShort = "custom-imported-peer",
-                bandwidthMbps = 1000
+                ed25519PubKeyShort = "custom-imported-peer"
             )
         }
     }

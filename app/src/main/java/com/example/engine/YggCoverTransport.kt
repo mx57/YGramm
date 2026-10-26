@@ -41,9 +41,14 @@ object YggCoverTransport {
     @Volatile
     var enabled: Boolean = true
 
-    /** The whitelist profile from the network screen: it decides whether tcp:// is retried on 443. */
+    /**
+     * The whitelist profile from the network screen: it decides whether tcp:// is retried on 443
+     * and whether a peer outside 443 is dialled at all. It starts matching the screen's default
+     * on purpose — a node that booted before the first sync used to dial every port the profile
+     * is supposed to hold back.
+     */
     @Volatile
-    var whitelistMode: Boolean = false
+    var whitelistMode: Boolean = true
 
     /** The allowed domain the whitelist profile puts into ClientHello. */
     @Volatile
@@ -68,12 +73,38 @@ object YggCoverTransport {
     private class Session(val plan: CoverPlan, val listener: ServerSocket, val thread: Thread)
 
     /**
+     * Whether the node may dial this peer at all while the whitelist profile is on.
+     *
+     * A peer survives an allow-list one of two ways: its endpoint already sits on the port the
+     * list forwards, or the mask can move the handshake onto it. A dial with neither is traffic
+     * the provider drops, and repeating a dropped handshake is what this profile exists to stop
+     * producing, so the mode withholds the dial instead of only preferring 443.
+     */
+    fun dialsPeer(dialUri: String): Boolean {
+        if (!whitelistMode) return true
+        if (YggNativeCoreBridge.isWhitelistEndpoint(dialUri)) return true
+        return planFor(dialUri)?.port == 443
+    }
+
+    /**
+     * Whether the masked endpoint has to replace this dial instead of supplementing it.
+     *
+     * The replace case is a `tcp://` peer on a port the allow-list does not forward: the raw dial
+     * and the mask address the same peer, and only the mask puts the handshake on 443. Offering
+     * both means the node keeps producing the cleartext handshake the provider drops, which is the
+     * exact traffic this profile exists to stop. A `tls://` peer is different - its own dial is
+     * already 443/TLS, so the mask is a second chance at it rather than the only route.
+     */
+    fun maskReplacesRawDial(dialUri: String): Boolean =
+        whitelistMode && planFor(dialUri)?.upgradedFromTcp == true
+
+    /**
      * The dial the core should use for this peer, or null when the peer cannot be covered.
      *
      * `tls://` keeps its own host and port, so only the handshake moves. A plain `tcp://`
      * peer is retried as TLS on 443 only while the whitelist profile is on, because that is
-     * the port an allow-list lets through; the caller keeps the cleartext dial too, so a node
-     * without a TLS listener is not lost.
+     * the port an allow-list lets through; outside the profile the cleartext dial is all it
+     * has and stays the dial the core gets.
      */
     fun planFor(dialUri: String): CoverPlan? {
         if (!enabled) return null

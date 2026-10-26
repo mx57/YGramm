@@ -242,12 +242,17 @@ data class YggGramUiState(
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
     val privacyMatrix: PrivacyMatrixState = PrivacyMatrixState(),
     val activeVoiceCall: ActiveVoiceCallState? = null,
+    // Measured from the files on disk, never from a counter in the database.
+    val storage: YggRepository.StorageBreakdown = YggRepository.StorageBreakdown(0L, 0L, 0L, 0L, 0L, 0L),
     val activePopupNotification: YggPopupNotificationItem? = null,
     val pendingProfileSwitchRequest: PendingProfileSwitchRequest? = null,
     val recentNotificationsHistory: List<YggPopupNotificationItem> = emptyList(),
     // chatId -> peer label; entries expire a few seconds after the last TYPING frame.
     val typingPeers: Map<String, String> = emptyMap(),
-    val statusBannerMessage: String? = null
+    val statusBannerMessage: String? = null,
+    // chatId to text: what the composer already cleared but that never became a message.
+    // Kept so a refused send cannot destroy what the user typed.
+    val rejectedDraft: Pair<String, String>? = null
 )
 
 class YggGramViewModel(application: Application) : AndroidViewModel(application) {
@@ -587,6 +592,37 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
+        onDeleteForEveryoneReceived = { packet ->
+            viewModelScope.launch {
+                // The frame's sender address is only a claim until the proof inside it opens
+                // under this device's key, which is exactly what the repository checks.
+                val applied = repository.applyPeerMessageDeletion(
+                    wireMessageId = packet.wireMessageId,
+                    senderIpv6 = packet.senderIpv6,
+                    deleteId = packet.deleteId,
+                    proofEnvelope = packet.proofEnvelope
+                )
+                // The banner disappears whether the copy was erased or the proof was rejected,
+                // and the sender cannot tell those apart from its own screen.
+                android.util.Log.w(
+                    "YGG-SEND",
+                    (if (applied != null) "RX <- DELETE • Копия стёрта на этом устройстве • "
+                    else "RX <- DELETE • Запрос отклонён: авторство не подтверждено • ") +
+                        "deleteId=${packet.deleteId.take(12)} • msg=${packet.wireMessageId.take(16)}" +
+                        (applied?.let { " • освобождено ${it.freedBytes} Б" } ?: "")
+                )
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = if (applied != null) {
+                            "Собеседник отозвал своё сообщение — копия удалена с этого устройства" +
+                                if (applied.freedBytes > 0) " • освобождено ${applied.freedBytes / 1024} КБ" else ""
+                        } else {
+                            "Запрос на удаление отклонён: авторство сообщения не подтверждено"
+                        }
+                    )
+                }
+            }
+        },
         onReadReceiptReceived = { chatId, ids ->
             viewModelScope.launch {
                 // A group has no reader-of-record: one member's receipt would mark the
@@ -630,6 +666,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             viewModelScope.launch {
                 repository.incrementProfileRelayedPackets(profileId, 1)
             }
+        },
+        // A streamed piece is only decryptable with the key derived from this conversation's
+        // pinned peer key, so the bridge asks the repository instead of guessing one.
+        resolveFileTransferKey = { profileId, chatId, transferId ->
+            repository.fileTransferKey(profileId, chatId, transferId)
+        },
+        // A stream arrives with the sender's own chatId, which is meaningless here; the local
+        // dialog is what holds the pinned peer key the pieces must be opened with.
+        resolveIncomingDialogChatId = { profileId, senderPubKeyHex, senderIpv6 ->
+            repository.incomingDialogChatId(profileId, senderPubKeyHex, senderIpv6)
+        },
+        onFileTransferProgress = { progress ->
+            repository.recordFileTransferProgress(progress)
         }
     )
 
@@ -1794,13 +1843,65 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun deleteChat(chatId: String) {
         viewModelScope.launch {
             val targetConv = conversations.value.find { it.chatId == chatId }
+            // The chat row alone is not the whole footprint: every file this app wrote for a
+            // message of this chat goes with it, and the freed bytes are what the user sees.
+            val cleared = repository.clearChat(chatId)
             repository.deleteConversation(chatId)
             if (_uiState.value.selectedChatId == chatId) {
                 _uiState.update { it.copy(selectedChatId = null) }
             }
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = "Чат «${targetConv?.title ?: "Диалог"}» и вся его история сообщений удалены"
+                    statusBannerMessage = "Чат «${targetConv?.title ?: "Диалог"}» удалён: ${cleared.messagesRemoved} сообщ. " +
+                        "и ${cleared.freedBytes / 1024} КБ файлов стёрто с устройства"
+                )
+            }
+        }
+    }
+
+    /** Empties one chat on this device — messages, the files written for them and the tombstones. */
+    fun clearChatHistory(chatId: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId }
+            val cleared = repository.clearChat(chatId)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (cleared.messagesRemoved > 0 || cleared.freedBytes > 0) {
+                        "Чат «${targetConv?.title ?: "Диалог"}» очищен: ${cleared.messagesRemoved} сообщ. • " +
+                            "освобождено ${cleared.freedBytes / 1024} КБ"
+                    } else {
+                        "Чат «${targetConv?.title ?: "Диалог"}» уже пуст"
+                    }
+                )
+            }
+        }
+    }
+
+    /** Measures what this app really holds on disk; the numbers come from the files themselves. */
+    fun refreshStorageBreakdown() {
+        viewModelScope.launch {
+            val breakdown = repository.storageBreakdown()
+            _uiState.update { it.copy(storage = breakdown) }
+        }
+    }
+
+    /**
+     * Deletes files this app wrote that no message row points at any more. Rows are the
+     * authority, so anything left behind by a cleared chat is garbage — and the banner reports
+     * the bytes actually removed, not the bytes a file once claimed.
+     */
+    fun purgeOrphanedFiles() {
+        viewModelScope.launch {
+            val freed = repository.purgeOrphanedAttachmentFiles()
+            val breakdown = repository.storageBreakdown()
+            _uiState.update {
+                it.copy(
+                    storage = breakdown,
+                    statusBannerMessage = if (freed > 0) {
+                        "Осиротевшие файлы удалены: освобождено ${freed / 1024} КБ"
+                    } else {
+                        "Осиротевших файлов нет: каждый файл привязан к сообщению"
+                    }
                 )
             }
         }
@@ -2083,7 +2184,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             for (msg in queued) {
                 val conv = repository.getConversation(msg.chatId) ?: continue
                 val wantsAttachment = msg.attachmentType != null || msg.attachmentName != null
-                val attachmentBase64 = if (wantsAttachment) {
+                val prepared = if (wantsAttachment) {
                     YggAudioMediaEngine.prepareAttachmentForP2P(
                         context = app,
                         attachmentName = msg.attachmentName,
@@ -2091,11 +2192,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentUri = msg.attachmentUri,
                         voiceDurationSec = msg.voiceDurationSec,
                         voiceWaveformCsv = msg.voiceWaveformCsv
-                    ).second.takeIf { it.isNotBlank() }
+                    )
                 } else {
                     null
                 }
-                if (wantsAttachment && attachmentBase64 == null) {
+                val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
+                // A content:// source has to travel as the app's own copy: a piece stream reads the
+                // file back from disk, and the picked Uri is not guaranteed to still resolve.
+                val attachmentUri = prepared?.first ?: msg.attachmentUri
+                if (wantsAttachment && attachmentBase64 == null &&
+                    attachmentRefusalReason(attachmentUri) != null
+                ) {
                     // Dispatching without the payload would mark the note delivered while the peer
                     // receives an empty attachment, so the message stays in the queue.
                     queueBlocked++
@@ -2147,7 +2254,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         candidatePeers = candidateExternalPeers,
                         allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery,
                         attachmentType = msg.attachmentType,
-                        attachmentUri = msg.attachmentUri,
+                        attachmentUri = attachmentUri,
                         attachmentBase64 = sealedAttachment,
                         voiceDurationSec = msg.voiceDurationSec,
                         voiceWaveformCsv = msg.voiceWaveformCsv,
@@ -2196,6 +2303,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     )
                 }
             }
+            flushPendingDeletions()
             syncForegroundServiceNotification()
         }
     }
@@ -2299,6 +2407,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         sendMessage(reply.chatId, reply.text)
     }
 
+    /** Called by the composer once it has put [YggGramUiState.rejectedDraft] back on screen. */
+    fun consumeRejectedDraft() {
+        _uiState.update { it.copy(rejectedDraft = null) }
+    }
+
     fun sendMessage(
         chatId: String,
         plainText: String,
@@ -2339,7 +2452,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 _uiState.update {
                     it.copy(
                         statusBannerMessage = "Сообщение не отправлено: для этого чата нет настоящего end-to-end ключа. " +
-                            "Импортируйте визитку собеседника заново — ключ X25519 берётся только из неё."
+                            "Импортируйте визитку собеседника заново — ключ X25519 берётся только из неё.",
+                        rejectedDraft = chatId to plainText
                     )
                 }
                 return@launch
@@ -2362,10 +2476,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 resolvedLocalUri = localSavedUri
                 attachmentBase64 = encodedB64.takeIf { it.isNotBlank() }
                 if (attachmentBase64 == null) {
-                    _uiState.update {
-                        it.copy(statusBannerMessage = attachmentRefusalReason(localSavedUri))
+                    // An empty payload means either an unreadable file or one above the inline
+                    // ceiling. The second kind still goes out, as separately encrypted pieces,
+                    // so only a real refusal stops the send here.
+                    val reason = attachmentRefusalReason(localSavedUri)
+                    if (reason != null) {
+                        _uiState.update { it.copy(statusBannerMessage = reason) }
+                        return@launch
                     }
-                    return@launch
                 }
                 if (resolvedSizeBytes <= 0L && !localSavedUri.isNullOrBlank()) {
                     try {
@@ -2407,7 +2525,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 voiceWaveformCsv = voiceWaveformCsv,
                 replyToMessageId = wireQuoteId,
                 forwardedFrom = forwardedFrom
-            ) ?: return@launch
+            )
+            if (savedMsg == null) {
+                // Sealing was refused inside the repository: no message row exists, so the only
+                // honest thing left is to say so and hand the typed text back to the composer.
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Сообщение не отправлено: ключ собеседника не найден, " +
+                            "конверт не создан и в чате ничего не появилось.",
+                        rejectedDraft = chatId to plainText
+                    )
+                }
+                return@launch
+            }
 
             if (offline) {
                 val reason = if (currentState.isAirplaneModeOn) "Авиарежим" else "Офлайн"
@@ -2712,6 +2842,198 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     }
                 )
             }
+        }
+    }
+
+    /**
+     * A node that holds a copy of the message, with the authorship proof sealed to that node's
+     * own X25519 key. A target without a key cannot be asked at all, so it never appears here.
+     */
+    private data class DeleteTarget(
+        val conversation: ConversationEntity,
+        val peerIpv6: String,
+        val proof: String
+    )
+
+    private suspend fun buildDeleteTargets(
+        conv: ConversationEntity,
+        wireMessageId: String,
+        deleteId: String
+    ): List<DeleteTarget> {
+        if (conv.chatType != "GROUP") {
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+            val proof = repository.sealDeleteProof(conv, deleteId, wireMessageId)
+            return if (peerIpv6.isBlank() || proof == null) emptyList() else listOf(DeleteTarget(conv, peerIpv6, proof))
+        }
+        // Each member gets its own proof: an envelope is keyed to one recipient, and one blob
+        // for the whole roster could only be sealed to a key everyone already knows.
+        return repository.getGroupMembers(conv.chatId).mapNotNull { member ->
+            val known = conversations.value.firstOrNull {
+                it.ownerProfileId == conv.ownerProfileId &&
+                    it.chatType != "GROUP" &&
+                    sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+            }
+            val memberConv = known
+                ?: conv.copy(
+                    yggIpv6Address = member.memberIpv6,
+                    publicKeyHex = member.memberPubKeyHex,
+                    peerX25519PublicKeyHex = ""
+                )
+            val peerIdentity = repository.resolvePeerNodeIdentity(memberConv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { member.memberIpv6 }
+            val proof = repository.sealDeleteProof(memberConv, deleteId, wireMessageId)
+            if (peerIpv6.isBlank() || proof == null) null else DeleteTarget(memberConv, peerIpv6, proof)
+        }
+    }
+
+    /**
+     * Removes one message from this device — the row and the file this app wrote for it — and,
+     * when [forEveryone], asks every node holding a copy to erase it too. The remote half only
+     * runs when this device can prove it authored the message; a proof that cannot be built
+     * stays a local deletion and the banner says exactly that.
+     */
+    fun deleteMessage(messageId: String, forEveryone: Boolean) {
+        viewModelScope.launch {
+            val msg = repository.getMessage(messageId) ?: return@launch
+            val conv = repository.getConversation(msg.chatId) ?: return@launch
+            val state = _uiState.value
+            // The peer knows this message by the id this device received it under.
+            val wireMessageId = if (msg.isOutgoing) msg.messageId else msg.peerMessageId
+            if (forEveryone && !msg.isOutgoing) {
+                // Only the author can erase somebody else's copy; that is what the proof is for.
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Это сообщение написал собеседник — у него его не удалить")
+                }
+                return@launch
+            }
+            val deleteId = "del_${java.util.UUID.randomUUID()}"
+            val targets = if (forEveryone && !YggRepository.isSelfChatId(conv.chatId) &&
+                wireMessageId.isNotBlank()
+            ) {
+                buildDeleteTargets(conv, wireMessageId, deleteId)
+            } else {
+                emptyList()
+            }
+            val local = repository.deleteMessageForMe(
+                messageId = msg.messageId,
+                wireMessageId = wireMessageId,
+                deleteId = deleteId,
+                peerIpv6 = targets.firstOrNull()?.peerIpv6 ?: conv.yggIpv6Address,
+                peerWasAsked = targets.isNotEmpty()
+            )
+            if (local == null) {
+                _uiState.update { it.copy(statusBannerMessage = "Сообщение уже удалено с этого устройства") }
+                return@launch
+            }
+            val freedPart = if (local.freedBytes > 0) " • освобождено ${local.freedBytes / 1024} КБ" else ""
+            if (!forEveryone) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Сообщение удалено только на этом устройстве$freedPart")
+                }
+                return@launch
+            }
+            if (targets.isEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Удалено на этом устройстве$freedPart: собеседнику не доказать авторство — " +
+                            "нет его ключа, копия у него осталась"
+                    )
+                }
+                return@launch
+            }
+            val ownerProfile = repository.getAllProfilesNow().find { it.profileId == conv.ownerProfileId }
+            val senderIpv6 = ownerProfile?.yggIpv6Address ?: state.identity.yggIpv6Address
+            val senderPubKeyHex = ownerProfile?.yggPublicKeyHex ?: state.identity.yggNodePublicKeyHex
+            val candidatePeers = buildCandidateExternalPeersList()
+            val results = withContext(Dispatchers.IO) {
+                targets.map { target ->
+                    async {
+                        val peerIdentity = repository.resolvePeerNodeIdentity(target.conversation)
+                        networkEngine.dispatchDeleteFrame(
+                            chatId = conv.chatId,
+                            messageId = wireMessageId,
+                            deleteId = deleteId,
+                            proofEnvelope = target.proof,
+                            peerIpv6 = target.peerIpv6,
+                            directEndpointHint = extractDirectEndpointHint(target.conversation),
+                            senderIpv6 = senderIpv6,
+                            senderPubKeyHex = senderPubKeyHex,
+                            recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                            candidatePeers = candidatePeers,
+                            allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery
+                        )
+                    }
+                }.awaitAll()
+            }
+            val acked = results.count { it.delivered }
+            if (acked > 0) repository.markDeletionConfirmed(conv.chatId, wireMessageId)
+            val failure = results.firstOrNull { !it.delivered }?.errorDetail
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = when {
+                        acked == targets.size ->
+                            "Собеседник принял запрос на удаление и подтвердил его (ACK) — копия стирается у него$freedPart"
+                        acked > 0 ->
+                            "Запрос приняли $acked из ${targets.size} собеседников; остальные подтверждения не прислали"
+                        else ->
+                            "Удалено на этом устройстве$freedPart, но собеседник не подтвердил: " +
+                                (failure ?: "нет подтвержденного маршрута") +
+                                " — запрос останется в очереди и уйдёт, когда связь появится"
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * Retries delete requests whose peer was offline when the message was removed. A request
+     * keeps its original delete id, so the peer's tombstone still recognises it as the same
+     * event and a duplicate ACK cannot delete anything twice.
+     */
+    private suspend fun flushPendingDeletions() {
+        val pending = repository.getPendingDeletions()
+        if (pending.isEmpty()) return
+        val state = _uiState.value
+        val candidatePeers = buildCandidateExternalPeersList()
+        var confirmed = 0
+        for (deletion in pending) {
+            val conv = repository.getConversation(deletion.chatId) ?: continue
+            val targets = buildDeleteTargets(conv, deletion.wireMessageId, deletion.deleteId)
+            if (targets.isEmpty()) continue
+            val ownerProfile = repository.getAllProfilesNow().find { it.profileId == conv.ownerProfileId }
+            val senderIpv6 = ownerProfile?.yggIpv6Address ?: state.identity.yggIpv6Address
+            val senderPubKeyHex = ownerProfile?.yggPublicKeyHex ?: state.identity.yggNodePublicKeyHex
+            val acked = withContext(Dispatchers.IO) {
+                targets.map { target ->
+                    async {
+                        val peerIdentity = repository.resolvePeerNodeIdentity(target.conversation)
+                        networkEngine.dispatchDeleteFrame(
+                            chatId = conv.chatId,
+                            messageId = deletion.wireMessageId,
+                            deleteId = deletion.deleteId,
+                            proofEnvelope = target.proof,
+                            peerIpv6 = target.peerIpv6,
+                            directEndpointHint = extractDirectEndpointHint(target.conversation),
+                            senderIpv6 = senderIpv6,
+                            senderPubKeyHex = senderPubKeyHex,
+                            recipientNodePubKeyHex = peerIdentity.publicKeyHex,
+                            candidatePeers = candidatePeers,
+                            allowLanFallback = state.privacyMatrix.allowDirectLanDiscovery
+                        ).delivered
+                    }
+                }.awaitAll().count { it }
+            }
+            repository.bumpDeletionAttempts(deletion.chatId, deletion.wireMessageId)
+            // A group row covers the whole roster, so it is only settled once every member
+            // that could be addressed has confirmed.
+            if (acked == targets.size) {
+                repository.markDeletionConfirmed(deletion.chatId, deletion.wireMessageId)
+                confirmed++
+            }
+        }
+        if (confirmed > 0) {
+            Log.d("YggDelete", "flush: подтверждено удалений: $confirmed из ${pending.size}")
         }
     }
 
@@ -3811,34 +4133,47 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Retries sending an offline/queued message over the real Yggdrasil network when tapped in chat.
+     * Bytes readable at the local copy of an attachment; 0 when the file is gone or unreadable.
      */
+    private fun localAttachmentBytes(localSavedUri: String?): Long {
+        val path = try {
+            localSavedUri?.let { android.net.Uri.parse(it).path }
+        } catch (_: Throwable) {
+            null
+        } ?: return 0L
+        return try {
+            val file = java.io.File(path)
+            if (file.isFile && file.canRead()) file.length() else 0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
     /**
      * `prepareAttachmentForP2P` returns an empty payload for both an unreadable file and one over
-     * the inline ceiling, and it keeps the local copy either way - so the size on disk says which
-     * of the two warnings is the true one.
+     * the inline ceiling, and it keeps the local copy either way. The second case is no longer a
+     * refusal: the bridge carries those bytes as separately encrypted pieces, so this only reports
+     * a reason for what a piece stream could never deliver.
      */
-    private fun attachmentRefusalReason(localSavedUri: String?): String {
-        val onDiskBytes = localSavedUri?.let { raw ->
-            try {
-                java.io.File(android.net.Uri.parse(raw).path ?: "").let { f ->
-                    if (f.exists()) f.length() else 0L
-                }
-            } catch (_: Throwable) {
-                0L
-            }
-        } ?: 0L
-        val limit = YggAudioMediaEngine.MAX_P2P_INLINE_BYTES
-        val limitMb = limit / (1024 * 1024)
-        return if (onDiskBytes > limit) {
-            "Вложение не отправлено: файл ${(onDiskBytes / (1024 * 1024))} МБ не " +
-                "проходит по оверлею (предел $limitMb МБ). Обрезанную копию " +
-                "собеседник бы не открыл."
+    private fun attachmentRefusalReason(localSavedUri: String?): String? {
+        val onDiskBytes = localAttachmentBytes(localSavedUri)
+        if (onDiskBytes > YggAudioMediaEngine.MAX_P2P_INLINE_BYTES &&
+            onDiskBytes <= YggCryptoEngine.MAX_P2P_STREAM_BYTES
+        ) {
+            return null
+        }
+        val streamMb = YggCryptoEngine.MAX_P2P_STREAM_BYTES / (1024 * 1024)
+        return if (onDiskBytes > YggCryptoEngine.MAX_P2P_STREAM_BYTES) {
+            "Вложение не отправлено: файл ${(onDiskBytes / (1024 * 1024))} МБ не проходит " +
+                "по потоку кусков (предел $streamMb МБ). Обрезанную копию собеседник бы не открыл."
         } else {
             "Вложение не отправлено: файл не читается. Выберите его заново."
         }
     }
 
+    /**
+     * Retries sending an offline/queued message over the real Yggdrasil network when tapped in chat.
+     */
     fun retrySendMessage(message: MessageEntity) {
         viewModelScope.launch {
             updateConnectivitySnapshot()
@@ -3857,7 +4192,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             }
 
             val wantsAttachment = message.attachmentType != null || message.attachmentName != null
-            val attachmentBase64 = if (wantsAttachment) {
+            val prepared = if (wantsAttachment) {
                 YggAudioMediaEngine.prepareAttachmentForP2P(
                     context = app,
                     attachmentName = message.attachmentName,
@@ -3865,14 +4200,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     attachmentUri = message.attachmentUri,
                     voiceDurationSec = message.voiceDurationSec,
                     voiceWaveformCsv = message.voiceWaveformCsv
-                ).second.takeIf { it.isNotBlank() }
+                )
             } else {
                 null
             }
-            if (wantsAttachment && attachmentBase64 == null) {
-                _uiState.update {
-                    it.copy(statusBannerMessage = attachmentRefusalReason(message.attachmentUri))
-                }
+            val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
+            val attachmentUri = prepared?.first ?: message.attachmentUri
+            val refusal = if (attachmentBase64 == null) attachmentRefusalReason(attachmentUri) else null
+            if (wantsAttachment && refusal != null) {
+                _uiState.update { it.copy(statusBannerMessage = refusal) }
                 return@launch
             }
 
@@ -3929,7 +4265,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     candidatePeers = candidatePeers,
                     allowLanFallback = allowManualLan,
                     attachmentType = message.attachmentType,
-                    attachmentUri = message.attachmentUri,
+                    attachmentUri = attachmentUri,
                     attachmentBase64 = sealedAttachment,
                     voiceDurationSec = message.voiceDurationSec,
                     voiceWaveformCsv = message.voiceWaveformCsv
