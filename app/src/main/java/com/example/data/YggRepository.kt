@@ -960,6 +960,25 @@ class YggRepository(
     )
 
     /**
+     * Heals a 1:1 chat whose pinned key disappeared (contact re-added, storage repaired) while
+     * its history still holds copies whose sender key was authenticated by the envelope itself.
+     * That stored key is the very value the receive path writes onto the conversation, so reusing
+     * it adds no trust the chat did not already have. Groups are excluded: a group row has no
+     * single peer key, and picking one member would seal everyone's copy to the wrong secret.
+     */
+    private suspend fun recoverPeerKeyFromHistory(conv: ConversationEntity): String? {
+        if (conv.chatType == "GROUP" || isSelfChatId(conv.chatId)) return null
+        val recovered = dao.getNewestAuthenticatedIncoming(conv.chatId)
+            ?.authorX25519PubHex
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
+            ?: return null
+        dao.upsertConversation(conv.copy(peerX25519PublicKeyHex = recovered))
+        return recovered
+    }
+
+    /**
      * Keys an outgoing envelope for this conversation would be built from, or null when the
      * peer X25519 key is unknown. Without that key there is no shared secret, and the only
      * alternative is a key anyone can recompute from the public values on the wire, so the
@@ -986,6 +1005,7 @@ class YggRepository(
                     peerProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
                 ).x25519IdentityPubHex.takeIf { YggCryptoEngine.isUsablePeerX25519PublicKey(it) }
             }
+            ?: recoverPeerKeyFromHistory(conv)
             ?: senderIdentity.x25519IdentityPubHex.takeIf {
                 // A group row has no single peer key: its stored envelope is only the local
                 // copy, addressed to ourselves. Every member gets a real envelope sealed to

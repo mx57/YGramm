@@ -195,7 +195,8 @@ fun ChatsScreen(
     onRetryMessage: (MessageEntity) -> Unit = {},
     onDeleteMessage: (String, Boolean) -> Unit = { _, _ -> },
     onPingChatRoute: (String) -> Unit = {},
-    onSetContactVerified: (String, Boolean) -> Unit = { _, _ -> }
+    onSetContactVerified: (String, Boolean) -> Unit = { _, _ -> },
+    onRestoreRejectedDraft: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showNewChatDialog by rememberSaveable { mutableStateOf(false) }
@@ -368,7 +369,10 @@ fun ChatsScreen(
                             onRemoveGroupMember = { ipv6 ->
                                 onRemoveGroupMember(activeConversation.chatId, ipv6)
                             },
-                            onLeaveGroup = { onLeaveGroup(activeConversation.chatId) }
+                            onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
+                            rejectedDraft = uiState.rejectedDraft
+                                ?.takeIf { it.first == activeConversation.chatId }?.second,
+                            onRejectedDraftRestored = onRestoreRejectedDraft
                         )
                     } else {
                         EmptyChatSelectionPlaceholder(
@@ -434,7 +438,10 @@ fun ChatsScreen(
                     },
                     onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
                     onRemoveGroupMember = { ipv6 -> onRemoveGroupMember(activeConversation.chatId, ipv6) },
-                    onLeaveGroup = { onLeaveGroup(activeConversation.chatId) }
+                    onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
+                    rejectedDraft = uiState.rejectedDraft
+                        ?.takeIf { it.first == activeConversation.chatId }?.second,
+                    onRejectedDraftRestored = onRestoreRejectedDraft
                 )
             } else {
                 ChatListPane(
@@ -1488,12 +1495,21 @@ private fun ChatDetailPane(
     onAddContactsToGroup: (List<String>) -> Unit = {},
     onRenameGroup: (String) -> Unit = {},
     onRemoveGroupMember: (String) -> Unit = {},
-    onLeaveGroup: () -> Unit = {}
+    onLeaveGroup: () -> Unit = {},
+    rejectedDraft: String? = null,
+    onRejectedDraftRestored: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
+    // A send that was refused never became a message, so its text goes back where it came from.
+    LaunchedEffect(rejectedDraft) {
+        if (!rejectedDraft.isNullOrBlank()) {
+            messageInput = rejectedDraft
+            onRejectedDraftRestored()
+        }
+    }
     var showCipherInspector by rememberSaveable { mutableStateOf(false) }
     var showAddMembersDialog by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
     var membersToAddCsv by rememberSaveable(conversation.chatId) { mutableStateOf("") }

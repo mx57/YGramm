@@ -249,7 +249,10 @@ data class YggGramUiState(
     val recentNotificationsHistory: List<YggPopupNotificationItem> = emptyList(),
     // chatId -> peer label; entries expire a few seconds after the last TYPING frame.
     val typingPeers: Map<String, String> = emptyMap(),
-    val statusBannerMessage: String? = null
+    val statusBannerMessage: String? = null,
+    // chatId to text: what the composer already cleared but that never became a message.
+    // Kept so a refused send cannot destroy what the user typed.
+    val rejectedDraft: Pair<String, String>? = null
 )
 
 class YggGramViewModel(application: Application) : AndroidViewModel(application) {
@@ -2404,6 +2407,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         sendMessage(reply.chatId, reply.text)
     }
 
+    /** Called by the composer once it has put [YggGramUiState.rejectedDraft] back on screen. */
+    fun consumeRejectedDraft() {
+        _uiState.update { it.copy(rejectedDraft = null) }
+    }
+
     fun sendMessage(
         chatId: String,
         plainText: String,
@@ -2444,7 +2452,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 _uiState.update {
                     it.copy(
                         statusBannerMessage = "Сообщение не отправлено: для этого чата нет настоящего end-to-end ключа. " +
-                            "Импортируйте визитку собеседника заново — ключ X25519 берётся только из неё."
+                            "Импортируйте визитку собеседника заново — ключ X25519 берётся только из неё.",
+                        rejectedDraft = chatId to plainText
                     )
                 }
                 return@launch
@@ -2516,7 +2525,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 voiceWaveformCsv = voiceWaveformCsv,
                 replyToMessageId = wireQuoteId,
                 forwardedFrom = forwardedFrom
-            ) ?: return@launch
+            )
+            if (savedMsg == null) {
+                // Sealing was refused inside the repository: no message row exists, so the only
+                // honest thing left is to say so and hand the typed text back to the composer.
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Сообщение не отправлено: ключ собеседника не найден, " +
+                            "конверт не создан и в чате ничего не появилось.",
+                        rejectedDraft = chatId to plainText
+                    )
+                }
+                return@launch
+            }
 
             if (offline) {
                 val reason = if (currentState.isAirplaneModeOn) "Авиарежим" else "Офлайн"

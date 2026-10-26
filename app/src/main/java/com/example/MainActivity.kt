@@ -763,7 +763,8 @@ fun YggGramRootApp(
                                 onRetryMessage = viewModel::retrySendMessage,
                                 onDeleteMessage = viewModel::deleteMessage,
                                 onPingChatRoute = viewModel::pingConversationRoute,
-                                onSetContactVerified = viewModel::setContactKeyVerified
+                                onSetContactVerified = viewModel::setContactKeyVerified,
+                                onRestoreRejectedDraft = viewModel::consumeRejectedDraft
                             )
 
                             YggNavTab.NETWORK_MAP -> NetworkMapScreen(

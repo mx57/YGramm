@@ -207,6 +207,12 @@ interface YggDao {
     @Query("SELECT * FROM messages WHERE chatId = :chatId ORDER BY timestamp DESC LIMIT 1")
     suspend fun getNewestMessage(chatId: String): MessageEntity?
 
+    @Query(
+        "SELECT * FROM messages WHERE chatId = :chatId AND isOutgoing = 0 AND authorX25519PubHex <> '' " +
+            "ORDER BY timestamp DESC LIMIT 1"
+    )
+    suspend fun getNewestAuthenticatedIncoming(chatId: String): MessageEntity?
+
     @Query("DELETE FROM messages WHERE messageId IN (:messageIds)")
     suspend fun deleteMessagesByIds(messageIds: List<String>)
 
