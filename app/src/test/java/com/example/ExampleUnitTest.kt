@@ -2,6 +2,7 @@
 package com.example
 
 import com.example.engine.IncomingTwinPacket
+import com.example.engine.YggCoverTransport
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
@@ -454,5 +455,109 @@ class ExampleUnitTest {
             .take(16)
         val naming = dialOrder.count { YggNativeCoreBridge.sendsHostnameSni(it.endpointUri, it.sniDomain) }
         assertEquals("the whole dial list must name a host", 16, naming)
+    }
+
+    @Test
+    fun the_whitelist_gate_leaves_only_endpoints_a_filtering_provider_forwards() {
+        assertTrue(YggNativeCoreBridge.isWhitelistEndpoint("tls://95.217.35.148:443"))
+        assertTrue(
+            "a query string does not move the port",
+            YggNativeCoreBridge.isWhitelistEndpoint("tls://95.217.35.148:443?sni=ya.ru")
+        )
+        assertTrue(
+            "a wss tunnel rides the allowed port wherever it is mounted",
+            YggNativeCoreBridge.isWhitelistEndpoint("wss://cdn.example/socket")
+        )
+        assertFalse("4433 is not 443", YggNativeCoreBridge.isWhitelistEndpoint("tls://95.217.35.148:4433"))
+        assertFalse("a cleartext dial on a high port is exactly what gets dropped",
+            YggNativeCoreBridge.isWhitelistEndpoint("tcp://95.217.35.148:9317"))
+        assertFalse("an IPv6 endpoint without a port has nothing to check",
+            YggNativeCoreBridge.isWhitelistEndpoint("tls://[2a00:1748:100:252::a]"))
+
+        // The gate runs before the core boots: were the first-run list emptied by it, every
+        // fresh node would come up with zero links under a profile nobody configured by hand.
+        val underGate = YggPeerScannerCatalog.initialCatalog
+            .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
+            .filter { YggNativeCoreBridge.isWhitelistEndpoint(it) }
+        assertTrue(
+            "the first-run dial list must survive the gate, got ${underGate.size}",
+            underGate.size >= 16
+        )
+    }
+
+    @Test
+    fun whitelist_mode_withholds_dials_but_keeps_the_peers_the_mask_can_carry_to_443() {
+        val previousMode = YggCoverTransport.whitelistMode
+        val previousEnabled = YggCoverTransport.enabled
+        val previousSni = YggCoverTransport.whitelistSni
+        try {
+            YggCoverTransport.enabled = true
+            YggCoverTransport.whitelistSni = "static-mon.yandex.net"
+
+            YggCoverTransport.whitelistMode = false
+            assertTrue(
+                "an unfiltered uplink dials what it is given",
+                YggCoverTransport.dialsPeer("tcp://95.217.35.148:9317")
+            )
+
+            YggCoverTransport.whitelistMode = true
+            assertTrue(YggCoverTransport.dialsPeer("tls://95.217.35.148:443?sni=ya.ru"))
+            assertTrue(
+                "a tcp peer is retried as TLS on 443, so the mask keeps it diallable",
+                YggCoverTransport.dialsPeer("tcp://ygg.zbin.eu:9317")
+            )
+            assertFalse(
+                "a TLS peer of a node that listens on 7743 cannot be moved to 443",
+                YggCoverTransport.dialsPeer("tls://ygg.zbin.eu:7743")
+            )
+
+            YggCoverTransport.enabled = false
+            assertFalse(
+                "with the mask off there is no route to 443 left for a cleartext peer",
+                YggCoverTransport.dialsPeer("tcp://ygg.zbin.eu:9317")
+            )
+        } finally {
+            YggCoverTransport.whitelistMode = previousMode
+            YggCoverTransport.enabled = previousEnabled
+            YggCoverTransport.whitelistSni = previousSni
+        }
+    }
+
+    @Test
+    fun under_the_profile_the_mask_replaces_the_cleartext_dial_of_a_tcp_peer() {
+        val previousMode = YggCoverTransport.whitelistMode
+        val previousEnabled = YggCoverTransport.enabled
+        val previousSni = YggCoverTransport.whitelistSni
+        try {
+            YggCoverTransport.enabled = true
+            YggCoverTransport.whitelistSni = "static-mon.yandex.net"
+
+            YggCoverTransport.whitelistMode = true
+            assertTrue(
+                "443 is the only port this peer is reachable through under the profile",
+                YggCoverTransport.maskReplacesRawDial("tcp://ygg.zbin.eu:9317")
+            )
+            assertFalse(
+                "a dial already on 443/TLS needs no replacement - the mask stays an extra chance",
+                YggCoverTransport.maskReplacesRawDial("tls://95.217.35.148:443?sni=ya.ru")
+            )
+
+            YggCoverTransport.whitelistMode = false
+            assertFalse(
+                "on an unfiltered uplink the cleartext dial is the route that works",
+                YggCoverTransport.maskReplacesRawDial("tcp://ygg.zbin.eu:9317")
+            )
+
+            YggCoverTransport.whitelistMode = true
+            YggCoverTransport.enabled = false
+            assertFalse(
+                "without the mask there is no 443 route to substitute for the dial",
+                YggCoverTransport.maskReplacesRawDial("tcp://ygg.zbin.eu:9317")
+            )
+        } finally {
+            YggCoverTransport.whitelistMode = previousMode
+            YggCoverTransport.enabled = previousEnabled
+            YggCoverTransport.whitelistSni = previousSni
+        }
     }
 }

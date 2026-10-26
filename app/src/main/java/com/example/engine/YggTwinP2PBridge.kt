@@ -706,7 +706,7 @@ class YggTwinP2PBridge(
             // a host go first — those are the links a filtering provider is least likely
             // to drop, and a fallback that reaches nothing is worth less than a slower
             // one that reaches the overlay at all.
-            val defaultPeerUris = persistedPeerUris.filter { it.isNotBlank() }
+            val dialCandidates = persistedPeerUris.filter { it.isNotBlank() }
                 .ifEmpty {
                     YggPeerScannerCatalog.initialCatalog
                         .sortedByDescending {
@@ -714,6 +714,24 @@ class YggTwinP2PBridge(
                         }
                         .map { YggNativeCoreBridge.corePeerUri(it.endpointUri, it.sniDomain) }
                 }
+            // Under the whitelist profile a peer outside 443 cannot be reached, and dialling it
+            // anyway is the traffic the profile exists to stop. The count is logged instead of
+            // guessed: an overlay that comes up with zero links has to say which rule emptied it.
+            val defaultPeerUris = if (YggCoverTransport.whitelistMode) {
+                val allowed = dialCandidates.filter { YggCoverTransport.dialsPeer(it) }
+                if (allowed.size < dialCandidates.size) {
+                    logPacket(
+                        direction = "SYS • WHITELIST",
+                        summary = "Режим белых списков: ${dialCandidates.size - allowed.size} пиров " +
+                            "не обзваниваются — до них нет пути через 443",
+                        details = "Линков под профиль осталось: ${allowed.size}",
+                        mirror = true
+                    )
+                }
+                allowed
+            } else {
+                dialCandidates
+            }
             val listedProfileIds = profiles.map { it.profileId }.toSet()
             for (prof in profiles) {
                 synchronized(nativeCoreStartLock) {
@@ -1061,18 +1079,24 @@ class YggTwinP2PBridge(
     }
 
     /**
-     * The dial list as the core receives it: the peer's own URI and, when the cover
-     * transport is on, a loopback endpoint whose TLS handshake comes from the phone's stack.
-     * The original URI stays on purpose - a node reachable only over cleartext tcp:// must
-     * keep working on an unfiltered uplink, so the covered link is an extra chance against
-     * an allow-list rather than a replacement.
+     * The dial list as the core receives it.
+     *
+     * Outside the whitelist profile a peer gets both its own URI and, when the mask is on, a
+     * loopback endpoint whose TLS handshake comes from the phone's stack: the covered link is an
+     * extra chance against an allow-list, not a replacement, so a node reachable only over
+     * cleartext tcp:// keeps working on an unfiltered uplink. Under the profile the two routes
+     * stop being the same offer - a tcp:// peer outside 443 has no path the filter forwards
+     * except the mask, so only the masked endpoint is dialled and the cleartext handshake that
+     * gets dropped is not produced at all. If even the local endpoint cannot be bound the raw
+     * dial is returned: a link that might work beats a dial list the node never tries.
      */
     private fun coreDialsFor(peerUri: String): List<String> {
         val dial = peerUri.trim()
         if (dial.isBlank()) return emptyList()
         val plan = YggCoverTransport.planFor(dial) ?: return listOf(dial)
         val endpoint = YggCoverTransport.coverEndpoint(plan) ?: return listOf(dial)
-        return listOf(dial, endpoint)
+        return if (YggCoverTransport.maskReplacesRawDial(dial)) listOf(endpoint)
+        else listOf(dial, endpoint)
     }
 
     private fun coverTransportSummary(): String {
@@ -1137,15 +1161,19 @@ class YggTwinP2PBridge(
         // ClientHello. Removing still matches without it: yggdrasil identifies a link by
         // scheme/host/port and ignores the query.
         val dialUri = YggNativeCoreBridge.corePeerUri(uri, sniDomain)
+        // Under the whitelist profile the first entry can be the masked endpoint rather than the
+        // peer's own URI - the cleartext dial is the one the filter drops, so it is not offered.
+        val dials = coreDialsFor(dialUri).ifEmpty { listOf(dialUri) }
+        val primaryDial = dials.first()
         var applied = 0
         var live = 0
         var total = 0
         var failure: String? = null
         for (profileId in profiles) {
             val res = if (enabled) {
-                YggNativeCoreBridge.addPeer(profileId, dialUri)
+                YggNativeCoreBridge.addPeer(profileId, primaryDial)
             } else {
-                YggNativeCoreBridge.removePeer(profileId, dialUri)
+                YggNativeCoreBridge.removePeer(profileId, primaryDial)
             }
             // "peer is already configured" is the state the caller asked for, not a
             // failure. The autopilot re-adds its best peer on every pass, so reporting
@@ -1157,14 +1185,18 @@ class YggTwinP2PBridge(
             } else {
                 failure = res.error.ifBlank { "ядро отклонило пир" }
             }
-            // The cover link is best-effort and never decides the outcome: the peer the
+            // The extra cover link is best-effort and never decides the outcome: the peer the
             // user toggled is the one reported, and a cover endpoint that was simply never
-            // added must not turn a successful removal into an error line.
+            // added must not turn a successful removal into an error line. Removal takes both
+            // spellings of the peer, including a raw dial the node added before the profile
+            // was switched on.
             if (enabled) {
-                coreDialsFor(dialUri)
-                    .filterNot { it == dialUri }
+                dials.filterNot { it == primaryDial }
                     .forEach { YggNativeCoreBridge.addPeer(profileId, it) }
             } else {
+                if (primaryDial != dialUri) {
+                    YggNativeCoreBridge.removePeer(profileId, dialUri)
+                }
                 YggCoverTransport.coveredUri(dialUri)
                     ?.let { YggNativeCoreBridge.removePeer(profileId, it) }
             }

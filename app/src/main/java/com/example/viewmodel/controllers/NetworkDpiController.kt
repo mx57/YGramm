@@ -341,7 +341,7 @@ class NetworkDpiController(
      * the app restarted — on a whitelist-only uplink the setting looked applied and changed
      * nothing. Dropping the link is what the node accepts as a re-dial instruction.
      */
-    private suspend fun applyWhitelistTransport() {
+    private suspend fun applyWhitelistTransport(justDisabledWhitelist: Boolean = false) {
         val cfg = _antiDpiConfig.value
         syncCoverTransport()
         val domain = cfg.whitelistSniDomain
@@ -349,7 +349,12 @@ class NetworkDpiController(
             whitelistMode = cfg.whitelistCdnWssEnabled,
             preferredSni = domain
         )
-        val peers = repository.getAllPeersNow().filter { it.isWhitelistCompatible }
+        val allPeers = repository.getAllPeersNow()
+        val peers = allPeers.filter { it.isWhitelistCompatible }
+        val dialUriOf = { peer: YggPeerEntity ->
+            YggNativeCoreBridge.corePeerUri(peer.endpointUri, peer.sniDomain)
+        }
+        val diallable = allPeers.count { YggCoverTransport.dialsPeer(dialUriOf(it)) }
         var applied = 0
         // The node's own reason is quoted, not paraphrased: «no running node» and «this peer
         // is not in the dial list» are different facts the user has to tell apart.
@@ -372,6 +377,38 @@ class NetworkDpiController(
                 coreReason = added.errorDetail.orEmpty()
             }
         }
+        // Switching the profile has to move the live dial list too, not only the next boot:
+        // a peer the node is already dialling stays reachable until it is dropped. Only rows the
+        // user switched on are touched, so this never enables a peer on its own.
+        var parked = 0
+        var restored = 0
+        var masked = 0
+        for (peer in allPeers.filter { it.isConnected }) {
+            val uri = peer.endpointUri.trim()
+            if (uri.isBlank()) continue
+            val dialUri = YggNativeCoreBridge.corePeerUri(uri, peer.sniDomain)
+            val allowed = YggCoverTransport.dialsPeer(dialUri)
+            // A peer the mask now carries onto 443 is not left on its old dial: the node would
+            // keep repeating the cleartext handshake the filter drops next to the covered one.
+            // Remove-then-add is what replaces it, and the core answers the new link alone.
+            val movedToMask = allowed && YggCoverTransport.maskReplacesRawDial(dialUri)
+            // A peer that stays diallable is either untouched or already re-dialled with the new
+            // SNI above; re-adding it here would only flap a working link.
+            if (allowed && !movedToMask && (peer.isWhitelistCompatible || !justDisabledWhitelist)) continue
+            val change = networkEngine.applyPeerChangeToCores(
+                uri,
+                enabled = allowed,
+                sniDomain = peer.sniDomain
+            )
+            if (change.applied > 0) {
+                when {
+                    !allowed -> parked++
+                    movedToMask -> masked++
+                    else -> restored++
+                }
+            }
+        }
+        val gateNote = whitelistGateNote(cfg.whitelistCdnWssEnabled, parked, restored, masked, diallable)
         _antiDpiConfig.update { state ->
             state.copy(
                 lastProbeReport = when {
@@ -379,14 +416,51 @@ class NetworkDpiController(
                     peers.isEmpty() -> "SNI: $domain • в базе нет пиров с поддержкой белых списков"
                     else -> "SNI: $domain • живой линк с новым SNI не поднят" +
                         if (coreReason.isBlank()) "" else ": $coreReason"
-                }
+                } + gateNote
             )
         }
-        if (applied > 0) {
+        // The profile pass has to be visible even when no SNI re-dial happened: peers taken off
+        // the dial list change what the node can reach, and silence there reads as «ничего не
+        // поменялось».
+        if (applied > 0 || gateNote.isNotBlank()) {
             withContext(Dispatchers.Main) {
-                onBannerMessage("Ядро переподключает $applied пиров с SNI $domain")
+                onBannerMessage(
+                    when {
+                        applied > 0 -> "Ядро переподключает $applied пиров с SNI $domain" + gateNote
+                        else -> "Режим белых списков: список обзвона ядра обновлён" + gateNote
+                    }
+                )
             }
         }
+    }
+
+    /**
+     * How the whitelist profile changed the dial list, in the node's own numbers. When nothing
+     * survives the profile the user has to see that before the overlay silently stops routing.
+     */
+    private fun whitelistGateNote(
+        whitelistMode: Boolean,
+        parked: Int,
+        restored: Int,
+        masked: Int,
+        diallablePeers: Int
+    ): String {
+        // Every number the pass changed is quoted: a profile switch that parked peers and moved
+        // others onto the mask is two facts, and showing only the first hid half of the dial list.
+        val parts = buildList {
+            if (whitelistMode && parked > 0) {
+                add("$parked пиров сняты с обзвона: до них нет пути через 443" +
+                    if (diallablePeers == 0) "; не осталось ни одного — оверлей поднимется без линков" else "")
+            }
+            if (whitelistMode && diallablePeers == 0 && parked == 0) {
+                add("ни один сохранённый пир не проходит под белые списки: обзванивать нечего")
+            }
+            if (whitelistMode && masked > 0) {
+                add("$masked пиров переведены на 443: их открытый диал ядро больше не набирает")
+            }
+            if (!whitelistMode && restored > 0) add("$restored пиров возвращены в список обзвона")
+        }
+        return if (parts.isEmpty()) "" else " • " + parts.joinToString(" • ")
     }
 
     fun selectUtlsFingerprint(fingerprint: String) {
@@ -409,6 +483,13 @@ class NetworkDpiController(
         if (flagName == "COVER_TLS" || flagName == "WHITELIST_WSS") {
             syncCoverTransport()
             scope.launch {
+                // The whitelist profile also decides which peers may be dialled at all, so
+                // switching it has to reach the live dial list, not only the cover links.
+                if (flagName == "WHITELIST_WSS") {
+                    applyWhitelistTransport(
+                        justDisabledWhitelist = !_antiDpiConfig.value.whitelistCdnWssEnabled
+                    )
+                }
                 val report = reDialCoverLinks()
                 _antiDpiConfig.update { it.copy(lastProbeReport = report) }
                 withContext(Dispatchers.Main) { onBannerMessage(report) }
