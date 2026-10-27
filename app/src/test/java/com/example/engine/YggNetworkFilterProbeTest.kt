@@ -10,18 +10,24 @@ import org.junit.Test
 /**
  * The verdict has to come from the pattern of answers, because a single failure means nothing:
  * a peer can be down, a port can be filtered, and the whole link can be dead. These cases are
- * the ones measured on a real phone on an allow-listed uplink, where two of eight reference
+ * The ones measured on a real phone on an allow-listed uplink, where three of eight reference
  * addresses answered and the rest were refused in tens of milliseconds.
  */
 class YggNetworkFilterProbeTest {
 
-    private fun probe(label: String, byName: Boolean, connected: Boolean, detail: String) =
-        YggNetworkFilterProbe.Probe(
-            YggNetworkFilterProbe.Reference(label, "10.0.0.1", 443, byName),
-            connected,
-            elapsedMs = 40,
-            detail = detail
-        )
+    private fun probe(
+        label: String,
+        byName: Boolean,
+        connected: Boolean,
+        detail: String,
+        stage: YggNetworkFilterProbe.FailureStage? = null
+    ) = YggNetworkFilterProbe.Probe(
+        YggNetworkFilterProbe.Reference(label, "10.0.0.1", 443, byName),
+        connected,
+        elapsedMs = 40,
+        detail = detail,
+        stage = stage
+    )
 
     @Test
     fun `every reference answering is an open network`() {
@@ -105,11 +111,54 @@ class YggNetworkFilterProbeTest {
                 "A partly-permitted link is an address filter, whatever the app would like to believe",
                 report.verdict == YggNetworkFilterProbe.Verdict.ADDRESS_FILTERED
             )
+            assertTrue(
+                "A refused connect is recorded as a connect-stage failure, not a payload one",
+                report.probes.filterNot { it.connected }
+                    .all { it.stage == YggNetworkFilterProbe.FailureStage.CONNECT }
+            )
         } finally {
             YggNetworkFilterProbe.connector = { host, port, timeoutMs ->
                 java.net.Socket().use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
             }
         }
+    }
+
+    @Test
+    fun `a refusal during connect says no payload was ever sent`() {
+        val probes = YggNetworkFilterProbe.references.map { ref ->
+            if (ref.host == "1.1.1.1" || ref.host == "8.8.8.8") {
+                probe(ref.label, ref.byName, true, "порт открыт")
+            } else {
+                probe(
+                    ref.label, ref.byName, false, "ConnectException • Connection refused",
+                    stage = YggNetworkFilterProbe.FailureStage.CONNECT
+                )
+            }
+        }
+        val summary = YggNetworkFilterProbe.summary(YggNetworkFilterProbe.Verdict.ADDRESS_FILTERED, probes)
+        assertTrue(
+            "Must say the refusal came before any byte left: $summary",
+            summary.contains("ни байта")
+        )
+    }
+
+    @Test
+    fun `connections that break after the first bytes are not reported as pre-payload refusals`() {
+        // The other shape of filtering: the session is established and then reset. There masking
+        // is a real question, and the app must not claim the network refused before payload.
+        val probes = YggNetworkFilterProbe.references.map { ref ->
+            if (ref.host == "1.1.1.1") {
+                probe(ref.label, ref.byName, true, "порт открыт")
+            } else {
+                probe(
+                    ref.label, ref.byName, false, "SSLHandshakeException • connection reset",
+                    stage = YggNetworkFilterProbe.FailureStage.AFTER_CONNECT
+                )
+            }
+        }
+        val summary = YggNetworkFilterProbe.summary(YggNetworkFilterProbe.Verdict.ADDRESS_FILTERED, probes)
+        assertTrue("Must name the post-connect stage: $summary", summary.contains("после первых байт"))
+        assertTrue("Must not claim bytes stayed unsent: $summary", !summary.contains("ни байта"))
     }
 
     @Test

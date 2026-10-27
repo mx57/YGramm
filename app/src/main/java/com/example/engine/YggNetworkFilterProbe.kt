@@ -2,6 +2,8 @@ package com.example.engine
 
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.util.concurrent.Executors
 
@@ -40,8 +42,29 @@ object YggNetworkFilterProbe {
     /** One reference destination. [byName] marks whether the host has to be resolved first. */
     data class Reference(val label: String, val host: String, val port: Int, val byName: Boolean)
 
+    /**
+     * When a reference failed.
+     *
+     * The difference decides whether masking is a question at all on this link: a refusal that
+     * arrives while the connection is still being set up means the app never put a single byte of
+     * ClientHello on the wire, so there is no payload for a filter to have looked at.
+     */
+    enum class FailureStage {
+        /** Rejected while connecting: refused, dropped, unreachable or unresolvable. */
+        CONNECT,
+
+        /** The connection was established and failed afterwards - only then is there payload. */
+        AFTER_CONNECT
+    }
+
     /** What one reference did: connected, refused, timed out, or would not resolve. */
-    data class Probe(val reference: Reference, val connected: Boolean, val elapsedMs: Long, val detail: String)
+    data class Probe(
+        val reference: Reference,
+        val connected: Boolean,
+        val elapsedMs: Long,
+        val detail: String,
+        val stage: FailureStage? = null
+    )
 
     data class Report(
         val verdict: Verdict,
@@ -107,8 +130,18 @@ object YggNetworkFilterProbe {
                 is UnknownHostException -> "имя не разрешилось (${e.message ?: "нет ответа DNS"})"
                 else -> e.javaClass.simpleName + (e.message?.let { " • $it" } ?: "")
             }
-            Probe(reference, false, elapsed(startedAt), detail)
+            Probe(reference, false, elapsed(startedAt), detail, stageOf(e))
         }
+    }
+
+    /**
+     * A probe only ever connects, never writes, so anything the socket layer reports here arrived
+     * before there was payload to inspect. A timeout counts as the same kind of answer: the SYN
+     * went out, nothing came back, no byte of a handshake was ever acknowledged.
+     */
+    private fun stageOf(e: Throwable): FailureStage = when (e) {
+        is UnknownHostException, is SocketException, is SocketTimeoutException -> FailureStage.CONNECT
+        else -> FailureStage.AFTER_CONNECT
     }
 
     private fun elapsed(startedAtNs: Long): Long = (System.nanoTime() - startedAtNs) / 1_000_000L
@@ -158,10 +191,10 @@ object YggNetworkFilterProbe {
             }
             Verdict.ADDRESS_FILTERED ->
                 "Сеть фильтрует по адресу назначения: $up из $total контрольных адресов проходят, " +
-                    "остальные отклоняются сетью (быстрее всех за ${fastestRefusal} мс). " +
-                    "SNI, ALPN и WebSocket тут ничего не меняют: решение принимается по адресу, " +
-                    "до того как посмотрели на содержимое. Обход возможен только узлом по адресу " +
-                    "из списка этой сети либо через сеть без фильтра."
+                    "остальные отклоняются сетью (${refusalStageNote(refused)}; быстрее всех за " +
+                    "${fastestRefusal} мс). SNI, ALPN и WebSocket тут ничего не меняют: решение " +
+                    "принимается по адресу, до того как посмотрели на содержимое. Обход возможен " +
+                    "только узлом по адресу из списка этой сети либо через сеть без фильтра."
             Verdict.DNS_FILTERED ->
                 "Сеть фильтрует DNS: имена вне списка не разрешаются ($up из $total проходят по " +
                     "адресу). Узел должен быть доступен адресом из белого списка, а не доменом."
@@ -175,5 +208,24 @@ object YggNetworkFilterProbe {
     fun evidenceLines(report: Report): List<String> = report.probes.map {
         "${if (it.connected) "проходит" else "не проходит"} • ${it.reference.label} " +
             "${it.reference.host}:${it.reference.port} • ${it.detail} • ${it.elapsedMs} мс"
+    }
+
+    /**
+     * Where the refusals landed, in one clause.
+     *
+     * Naming the stage is the whole point of the measurement: a refusal that arrives while the
+     * connection is still being set up is the network saying no to an address, and no reshaping of
+     * a ClientHello can be relevant to bytes that were never sent.
+     */
+    private fun refusalStageNote(refused: List<Probe>): String {
+        val stages = refused.map { it.stage ?: FailureStage.CONNECT }.distinct()
+        return when (stages.size) {
+            1 -> if (stages.first() == FailureStage.CONNECT) {
+                "отказ приходит на установлении соединения, в сеть не ушло ни байта"
+            } else {
+                "соединения устанавливаются и рвутся уже после первых байт"
+            }
+            else -> "часть адресов отклоняется при установлении соединения, часть рвётся после первых байт"
+        }
     }
 }
