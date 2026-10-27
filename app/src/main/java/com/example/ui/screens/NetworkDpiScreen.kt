@@ -129,6 +129,7 @@ fun NetworkDpiScreen(
     onUpdateScannerSort: (String) -> Unit = {},
     onImportCustomPeers: (String) -> Unit = {},
     onProbeCoverMask: () -> Unit = {},
+    onProbeNetworkFilter: () -> Unit = {},
     onClearPacketLogs: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -273,6 +274,7 @@ fun NetworkDpiScreen(
                 onToggleAntiDpiFlag = onToggleAntiDpiFlag,
                 onSelectPreset = onSelectPreset,
                 onProbeCoverMask = onProbeCoverMask,
+                onProbeNetworkFilter = onProbeNetworkFilter,
                 onSwitchToExpertMode = { viewMode = NetworkViewMode.EXPERT }
             )
         } else {
@@ -1720,6 +1722,7 @@ private fun SimpleNetworkShieldContent(
     onToggleAntiDpiFlag: (String) -> Unit,
     onSelectPreset: (CensorshipPreset) -> Unit,
     onProbeCoverMask: () -> Unit,
+    onProbeNetworkFilter: () -> Unit,
     onSwitchToExpertMode: () -> Unit
 ) {
     val cfg = uiState.antiDpiConfig
@@ -2123,6 +2126,32 @@ private fun SimpleNetworkShieldContent(
                     // the switch that turns the mask on.
                     if (cfg.coverProbeResults.isNotEmpty()) {
                         cfg.coverProbeResults.take(12).forEach { line ->
+                            Text(
+                                text = line,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = onProbeNetworkFilter,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Что пропускает моя сеть: проверить адреса")
+                    }
+
+                    // The mask question and the network question are different measurements, and
+                    // only the second one explains a node with zero links on an allow-listed
+                    // uplink. Kept apart so a refused address is never read as a broken mask.
+                    if (cfg.networkFilterSummary.isNotBlank()) {
+                        Text(
+                            text = cfg.networkFilterSummary,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        cfg.networkFilterEvidence.forEach { line ->
                             Text(
                                 text = line,
                                 style = MaterialTheme.typography.bodySmall,

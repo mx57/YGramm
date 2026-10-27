@@ -151,7 +151,13 @@ data class AntiDpiConfigState(
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
     val lastProbeReport: String = "Ожидание реальной проверки соединения с публичными пирами Yggdrasil...",
-    val coverProbeResults: List<String> = emptyList()
+    val coverProbeResults: List<String> = emptyList(),
+    // What the current network permits, measured by this app's own sockets. Kept apart from the
+    // mask results on purpose: a refused address says something about the network, while a
+    // refused handshake says something about the peer, and reading one as the other is how the
+    // user ends up blaming the app for the carrier's filter.
+    val networkFilterSummary: String = "",
+    val networkFilterEvidence: List<String> = emptyList()
 )
 
 data class DecentralizedUserProfile(
@@ -4739,6 +4745,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun probeCoverMask() {
         networkDpiController.probeCoverMask()
+    }
+
+    fun probeNetworkFilter() {
+        networkDpiController.probeNetworkFilter()
     }
 
     fun addCustomPeer(

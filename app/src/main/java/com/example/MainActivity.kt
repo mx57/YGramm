@@ -800,6 +800,7 @@ fun YggGramRootApp(
                                 onUpdateScannerSort = viewModel::updateScannerSortMode,
                                 onImportCustomPeers = viewModel::importCustomPeersFromText,
                                 onProbeCoverMask = viewModel::probeCoverMask,
+                                onProbeNetworkFilter = viewModel::probeNetworkFilter,
                                 onClearPacketLogs = viewModel::clearPacketLogs
                             )
 

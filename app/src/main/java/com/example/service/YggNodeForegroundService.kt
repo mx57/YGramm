@@ -103,10 +103,14 @@ class YggNodeForegroundService : Service() {
         val notification = buildStatusNotification(_serviceState.value)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // specialUse only. Android 14+ puts a dataSync service under a time budget it
+                // enforces by killing the process - measured on a Redmi Note 12 Turbo:
+                // ForegroundServiceDidNotStopInTimeException took the whole node down. A mesh
+                // node has no deadline to finish by, so it must not claim a type that has one.
                 startForeground(
                     NOTIFICATION_ID,
                     notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 )
             } else {
                 startForeground(NOTIFICATION_ID, notification)

@@ -10,6 +10,7 @@ import com.example.engine.YggCoverTransport
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
+import com.example.engine.YggNetworkFilterProbe
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
 import com.example.viewmodel.AntiDpiConfigState
@@ -29,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 
 /**
@@ -62,6 +64,14 @@ class NetworkDpiController(
     private var watchdogJob: Job? = null
     private var peerScanJob: Job? = null
     private var lastWatchdogFailoverAt = 0L
+
+    // What the current network permits, measured from this app's own sockets. Cached because
+    // the answer belongs to the link, not to a dial: re-running it every 30 seconds would buy
+    // nothing and would put eight more probes on a metered uplink each time.
+    private var lastFilterProbeAt = 0L
+    private var lastFilterReport: YggNetworkFilterProbe.Report? = null
+    private var filterProbeJob: Job? = null
+    private val filterProbeLock = Mutex()
 
     init {
         syncCoverTransport()
@@ -142,6 +152,46 @@ class NetworkDpiController(
     }
 
     /**
+     * Re-measures what this network permits and puts the answer on the screen.
+     *
+     * The button exists because the alternative is the user guessing. Without it an allow-listed
+     * uplink and a night when every public node happens to be down look identical from inside the
+     * app: zero links either way. With it the difference is a sentence and eight measured lines.
+     */
+    fun probeNetworkFilter() {
+        // One measurement at a time: the watchdog can reach the same probe on its own schedule.
+        if (filterProbeJob?.isActive == true) return
+        filterProbeJob = scope.launch(Dispatchers.IO) {
+            val report = networkFilterReport(force = true) ?: return@launch
+            withContext(Dispatchers.Main) { onBannerMessage(report.summary) }
+        }
+    }
+
+    /** Cached answer for the autopilot: the filter belongs to the link, not to a single dial. */
+    private suspend fun networkFilterReport(force: Boolean): YggNetworkFilterProbe.Report? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cached = lastFilterReport
+        if (!force && cached != null && now - lastFilterProbeAt < FILTER_PROBE_TTL_MS) return cached
+        // Whoever is already measuring keeps measuring; a second set of reference connects
+        // bought nothing and would sit on the same metered uplink twice.
+        if (!filterProbeLock.tryLock()) return cached
+        val report = try {
+            withContext(Dispatchers.IO) { YggNetworkFilterProbe.probe() }
+        } finally {
+            filterProbeLock.unlock()
+        }
+        lastFilterProbeAt = android.os.SystemClock.elapsedRealtime()
+        lastFilterReport = report
+        _antiDpiConfig.update {
+            it.copy(
+                networkFilterSummary = report.summary,
+                networkFilterEvidence = YggNetworkFilterProbe.evidenceLines(report)
+            )
+        }
+        return report
+    }
+
+    /**
      * Starts background watchdog that periodically checks connected peer health
      * and triggers automatic cascade failover if active peers are blocked by TSPU/DPI.
      */
@@ -162,10 +212,24 @@ class NetworkDpiController(
                     // node holding a dozen dead sockets and shaking hands on none is finally
                     // seen as isolated - and needs a pause between spare-node hunts, otherwise
                     // this branch would hit the peer directory every 30 seconds.
+                    //
+                    // The pause grows when the network itself is the reason. Measured on an
+                    // allow-listed uplink, none of the 28 directory nodes answering port 443
+                    // could be reached at all, because the filter decides by destination
+                    // address: hunting a spare there only spends the user's metered data.
+                    val filter = networkFilterReport(force = false)
+                    val cooldown = if (filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN) {
+                        WATCHDOG_FAILOVER_COOLDOWN_MS
+                    } else {
+                        FILTERED_FAILOVER_COOLDOWN_MS
+                    }
                     val now = android.os.SystemClock.elapsedRealtime()
-                    if (now - lastWatchdogFailoverAt < WATCHDOG_FAILOVER_COOLDOWN_MS) continue
+                    if (now - lastWatchdogFailoverAt < cooldown) continue
                     lastWatchdogFailoverAt = now
-                    autoCascadeFailover("Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы...")
+                    autoCascadeFailover(
+                        "Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы" +
+                            (if (filter == null) "" else " • ${filter.verdict.labelRu}")
+                    )
                     continue
                 }
                 val connectedPeers = repository.getAllPeersNow().filter { it.isConnected }
@@ -296,6 +360,21 @@ class NetworkDpiController(
                 }
             }
         }
+        // The hunt failed, so it says so. Silence here is what made an allow-listed uplink look
+        // like an app that had not tried: the banner promised spare nodes and nothing followed.
+        val filter = networkFilterReport(force = false)
+        val why = when {
+            validCandidates.isEmpty() ->
+                "каталог публичных узлов не дал ни одного кандидата (его адрес эта сеть не пропускает)"
+            filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN ->
+                "ни один из проверенных узлов не ответил на рукопожатие Yggdrasil"
+            else -> filter.summary
+        }
+        withContext(Dispatchers.Main) {
+            onBannerMessage(
+                "Автопилот: резервный узел не добавлен • проверено ${validCandidates.size} • $why"
+            )
+        }
     }
 
     private companion object {
@@ -304,6 +383,13 @@ class NetworkDpiController(
         // How often the watchdog is allowed to hunt for a spare node while the core reports
         // fewer than two handshaked links.
         const val WATCHDOG_FAILOVER_COOLDOWN_MS = 300_000L
+
+        // How long the autopilot waits between spare-node hunts once the network has been
+        // measured as the thing refusing addresses.
+        const val FILTERED_FAILOVER_COOLDOWN_MS = 1_800_000L
+
+        // A cached filter measurement stays believable while the same link is up.
+        const val FILTER_PROBE_TTL_MS = 900_000L
 
         // A scan has to finish while the user is watching the screen. The freshest nodes are
         // probed first, so the budget cuts the stale tail of the catalog rather than the live
