@@ -10,6 +10,7 @@ import com.example.engine.YggCoverTransport
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
+import com.example.engine.YggNetworkFilterProbe
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
 import com.example.viewmodel.AntiDpiConfigState
@@ -29,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 
 /**
@@ -62,6 +64,14 @@ class NetworkDpiController(
     private var watchdogJob: Job? = null
     private var peerScanJob: Job? = null
     private var lastWatchdogFailoverAt = 0L
+
+    // What the current network permits, measured from this app's own sockets. Cached because
+    // the answer belongs to the link, not to a dial: re-running it every 30 seconds would buy
+    // nothing and would put eight more probes on a metered uplink each time.
+    private var lastFilterProbeAt = 0L
+    private var lastFilterReport: YggNetworkFilterProbe.Report? = null
+    private var filterProbeJob: Job? = null
+    private val filterProbeLock = Mutex()
 
     init {
         syncCoverTransport()
@@ -142,6 +152,46 @@ class NetworkDpiController(
     }
 
     /**
+     * Re-measures what this network permits and puts the answer on the screen.
+     *
+     * The button exists because the alternative is the user guessing. Without it an allow-listed
+     * uplink and a night when every public node happens to be down look identical from inside the
+     * app: zero links either way. With it the difference is a sentence and eight measured lines.
+     */
+    fun probeNetworkFilter() {
+        // One measurement at a time: the watchdog can reach the same probe on its own schedule.
+        if (filterProbeJob?.isActive == true) return
+        filterProbeJob = scope.launch(Dispatchers.IO) {
+            val report = networkFilterReport(force = true) ?: return@launch
+            withContext(Dispatchers.Main) { onBannerMessage(report.summary) }
+        }
+    }
+
+    /** Cached answer for the autopilot: the filter belongs to the link, not to a single dial. */
+    private suspend fun networkFilterReport(force: Boolean): YggNetworkFilterProbe.Report? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cached = lastFilterReport
+        if (!force && cached != null && now - lastFilterProbeAt < FILTER_PROBE_TTL_MS) return cached
+        // Whoever is already measuring keeps measuring; a second set of reference connects
+        // bought nothing and would sit on the same metered uplink twice.
+        if (!filterProbeLock.tryLock()) return cached
+        val report = try {
+            withContext(Dispatchers.IO) { YggNetworkFilterProbe.probe() }
+        } finally {
+            filterProbeLock.unlock()
+        }
+        lastFilterProbeAt = android.os.SystemClock.elapsedRealtime()
+        lastFilterReport = report
+        _antiDpiConfig.update {
+            it.copy(
+                networkFilterSummary = report.summary,
+                networkFilterEvidence = YggNetworkFilterProbe.evidenceLines(report)
+            )
+        }
+        return report
+    }
+
+    /**
      * Starts background watchdog that periodically checks connected peer health
      * and triggers automatic cascade failover if active peers are blocked by TSPU/DPI.
      */
@@ -162,10 +212,24 @@ class NetworkDpiController(
                     // node holding a dozen dead sockets and shaking hands on none is finally
                     // seen as isolated - and needs a pause between spare-node hunts, otherwise
                     // this branch would hit the peer directory every 30 seconds.
+                    //
+                    // The pause grows when the network itself is the reason. Measured on an
+                    // allow-listed uplink, none of the 28 directory nodes answering port 443
+                    // could be reached at all, because the filter decides by destination
+                    // address: hunting a spare there only spends the user's metered data.
+                    val filter = networkFilterReport(force = false)
+                    val cooldown = if (filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN) {
+                        WATCHDOG_FAILOVER_COOLDOWN_MS
+                    } else {
+                        FILTERED_FAILOVER_COOLDOWN_MS
+                    }
                     val now = android.os.SystemClock.elapsedRealtime()
-                    if (now - lastWatchdogFailoverAt < WATCHDOG_FAILOVER_COOLDOWN_MS) continue
+                    if (now - lastWatchdogFailoverAt < cooldown) continue
                     lastWatchdogFailoverAt = now
-                    autoCascadeFailover("Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы...")
+                    autoCascadeFailover(
+                        "Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы" +
+                            (if (filter == null) "" else " • ${filter.verdict.labelRu}")
+                    )
                     continue
                 }
                 val connectedPeers = repository.getAllPeersNow().filter { it.isConnected }
@@ -296,6 +360,21 @@ class NetworkDpiController(
                 }
             }
         }
+        // The hunt failed, so it says so. Silence here is what made an allow-listed uplink look
+        // like an app that had not tried: the banner promised spare nodes and nothing followed.
+        val filter = networkFilterReport(force = false)
+        val why = when {
+            validCandidates.isEmpty() ->
+                "каталог публичных узлов не дал ни одного кандидата (его адрес эта сеть не пропускает)"
+            filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN ->
+                "ни один из проверенных узлов не ответил на рукопожатие Yggdrasil"
+            else -> filter.summary
+        }
+        withContext(Dispatchers.Main) {
+            onBannerMessage(
+                "Автопилот: резервный узел не добавлен • проверено ${validCandidates.size} • $why"
+            )
+        }
     }
 
     private companion object {
@@ -304,6 +383,13 @@ class NetworkDpiController(
         // How often the watchdog is allowed to hunt for a spare node while the core reports
         // fewer than two handshaked links.
         const val WATCHDOG_FAILOVER_COOLDOWN_MS = 300_000L
+
+        // How long the autopilot waits between spare-node hunts once the network has been
+        // measured as the thing refusing addresses.
+        const val FILTERED_FAILOVER_COOLDOWN_MS = 1_800_000L
+
+        // A cached filter measurement stays believable while the same link is up.
+        const val FILTER_PROBE_TTL_MS = 900_000L
 
         // A scan has to finish while the user is watching the screen. The freshest nodes are
         // probed first, so the budget cuts the stale tail of the catalog rather than the live
@@ -351,8 +437,12 @@ class NetworkDpiController(
      * domain into the Room rows alone left the live core sending the old ClientHello until
      * the app restarted — on a whitelist-only uplink the setting looked applied and changed
      * nothing. Dropping the link is what the node accepts as a re-dial instruction.
+     *
+     * Returns the gate note so the caller can keep it visible: the cover-mask line written right
+     * after this pass used to replace it, and the user saw a mask report for a switch that had
+     * just rewritten the dial list.
      */
-    private suspend fun applyWhitelistTransport(justDisabledWhitelist: Boolean = false) {
+    private suspend fun applyWhitelistTransport(): String {
         val cfg = _antiDpiConfig.value
         syncCoverTransport()
         val domain = cfg.whitelistSniDomain
@@ -388,35 +478,49 @@ class NetworkDpiController(
                 coreReason = added.errorDetail.orEmpty()
             }
         }
-        // Switching the profile has to move the live dial list too, not only the next boot:
-        // a peer the node is already dialling stays reachable until it is dropped. Only rows the
-        // user switched on are touched, so this never enables a peer on its own.
+        // Switching the profile has to move the live dial list too, not only the next boot.
+        // The node's own dial list is the source of truth here: the probe flag in the database
+        // says which peers answered a TCP scan, and on an allow-listed uplink that is nobody -
+        // a pass keyed on it parked and restored zero peers while the node kept dialling the
+        // cleartext endpoints the profile was switched on to stop.
         var parked = 0
         var restored = 0
         var masked = 0
-        for (peer in allPeers.filter { it.isConnected }) {
+        val dialled = networkEngine.configuredPeerDials()
+        for (peer in allPeers) {
             val uri = peer.endpointUri.trim()
             if (uri.isBlank()) continue
             val dialUri = YggNativeCoreBridge.corePeerUri(uri, peer.sniDomain)
+            val rawKey = dialUri.substringBefore("?").trim().lowercase()
+            val coverKey = YggCoverTransport.coveredUri(dialUri)
+                ?.substringBefore("?")?.trim()?.lowercase()
+            val heldByCore = dialled.contains(rawKey) || (coverKey != null && dialled.contains(coverKey))
             val allowed = YggCoverTransport.dialsPeer(dialUri)
             // A peer the mask now carries onto 443 is not left on its old dial: the node would
             // keep repeating the cleartext handshake the filter drops next to the covered one.
-            // Remove-then-add is what replaces it, and the core answers the new link alone.
-            val movedToMask = allowed && YggCoverTransport.maskReplacesRawDial(dialUri)
-            // A peer that stays diallable is either untouched or already re-dialled with the new
-            // SNI above; re-adding it here would only flap a working link.
-            if (allowed && !movedToMask && (peer.isWhitelistCompatible || !justDisabledWhitelist)) continue
-            val change = networkEngine.applyPeerChangeToCores(
-                uri,
-                enabled = allowed,
-                sniDomain = peer.sniDomain
-            )
-            if (change.applied > 0) {
-                when {
-                    !allowed -> parked++
-                    movedToMask -> masked++
-                    else -> restored++
+            val rawDialLeft = allowed && YggCoverTransport.maskReplacesRawDial(dialUri) &&
+                dialled.contains(rawKey)
+            when {
+                !allowed && heldByCore -> {
+                    if (networkEngine.applyPeerChangeToCores(uri, enabled = false).applied > 0) parked++
                 }
+                allowed && !heldByCore -> {
+                    if (networkEngine.applyPeerChangeToCores(
+                            uri, enabled = true, sniDomain = peer.sniDomain
+                        ).applied > 0
+                    ) restored++
+                }
+                rawDialLeft -> {
+                    // Remove-then-add is what replaces the dial; the core answers the new link alone.
+                    networkEngine.applyPeerChangeToCores(uri, enabled = false)
+                    if (networkEngine.applyPeerChangeToCores(
+                            uri, enabled = true, sniDomain = peer.sniDomain
+                        ).applied > 0
+                    ) masked++
+                }
+                // A peer that stays diallable and is already dialled is untouched: re-adding it
+                // here would only flap a working link.
+                else -> continue
             }
         }
         val gateNote = whitelistGateNote(cfg.whitelistCdnWssEnabled, parked, restored, masked, diallable)
@@ -443,6 +547,7 @@ class NetworkDpiController(
                 )
             }
         }
+        return gateNote
     }
 
     /**
@@ -496,12 +601,10 @@ class NetworkDpiController(
             scope.launch {
                 // The whitelist profile also decides which peers may be dialled at all, so
                 // switching it has to reach the live dial list, not only the cover links.
-                if (flagName == "WHITELIST_WSS") {
-                    applyWhitelistTransport(
-                        justDisabledWhitelist = !_antiDpiConfig.value.whitelistCdnWssEnabled
-                    )
-                }
-                val report = reDialCoverLinks()
+                val gateNote = if (flagName == "WHITELIST_WSS") {
+                    applyWhitelistTransport()
+                } else ""
+                val report = reDialCoverLinks() + gateNote
                 _antiDpiConfig.update { it.copy(lastProbeReport = report) }
                 withContext(Dispatchers.Main) { onBannerMessage(report) }
             }

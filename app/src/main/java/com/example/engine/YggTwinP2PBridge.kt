@@ -1139,6 +1139,19 @@ class YggTwinP2PBridge(
     }
 
     /**
+     * The dial list the running nodes actually hold, as `scheme://host:port` without the SNI
+     * query. The whitelist profile switch needs this and nothing else: it has to take down the
+     * dials the network refuses and put back the ones it withheld, and both facts live in the
+     * core, not in the probe flag of a Room row.
+     */
+    suspend fun configuredPeerDials(): Set<String> = withContext(Dispatchers.IO) {
+        initializedNativeProfiles.toList().flatMap { profileId ->
+            val res = YggNativeCoreBridge.getPeersJson(profileId)
+            if (!res.ok) emptySet() else YggNativeCoreBridge.readConfiguredPeerUris(res.rawJson)
+        }.toSet()
+    }
+
+    /**
      * Applies a peer add/remove to every running node. Persisting the Room row alone
      * leaves the live node dialling its old list until the app restarts, so «подключить
      * пир» used to claim success while no new link ever appeared and calls had no route.

@@ -27,3 +27,6 @@ debug.keystore
 
 # Rebuilt by CI from core/ with Go+NDK; committing them would ship stale cores
 app/src/main/jniLibs/**/*.so
+
+# Ad-hoc on-device probe scripts, not part of the app
+logs/
