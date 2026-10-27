@@ -437,8 +437,12 @@ class NetworkDpiController(
      * domain into the Room rows alone left the live core sending the old ClientHello until
      * the app restarted — on a whitelist-only uplink the setting looked applied and changed
      * nothing. Dropping the link is what the node accepts as a re-dial instruction.
+     *
+     * Returns the gate note so the caller can keep it visible: the cover-mask line written right
+     * after this pass used to replace it, and the user saw a mask report for a switch that had
+     * just rewritten the dial list.
      */
-    private suspend fun applyWhitelistTransport(justDisabledWhitelist: Boolean = false) {
+    private suspend fun applyWhitelistTransport(): String {
         val cfg = _antiDpiConfig.value
         syncCoverTransport()
         val domain = cfg.whitelistSniDomain
@@ -474,35 +478,49 @@ class NetworkDpiController(
                 coreReason = added.errorDetail.orEmpty()
             }
         }
-        // Switching the profile has to move the live dial list too, not only the next boot:
-        // a peer the node is already dialling stays reachable until it is dropped. Only rows the
-        // user switched on are touched, so this never enables a peer on its own.
+        // Switching the profile has to move the live dial list too, not only the next boot.
+        // The node's own dial list is the source of truth here: the probe flag in the database
+        // says which peers answered a TCP scan, and on an allow-listed uplink that is nobody -
+        // a pass keyed on it parked and restored zero peers while the node kept dialling the
+        // cleartext endpoints the profile was switched on to stop.
         var parked = 0
         var restored = 0
         var masked = 0
-        for (peer in allPeers.filter { it.isConnected }) {
+        val dialled = networkEngine.configuredPeerDials()
+        for (peer in allPeers) {
             val uri = peer.endpointUri.trim()
             if (uri.isBlank()) continue
             val dialUri = YggNativeCoreBridge.corePeerUri(uri, peer.sniDomain)
+            val rawKey = dialUri.substringBefore("?").trim().lowercase()
+            val coverKey = YggCoverTransport.coveredUri(dialUri)
+                ?.substringBefore("?")?.trim()?.lowercase()
+            val heldByCore = dialled.contains(rawKey) || (coverKey != null && dialled.contains(coverKey))
             val allowed = YggCoverTransport.dialsPeer(dialUri)
             // A peer the mask now carries onto 443 is not left on its old dial: the node would
             // keep repeating the cleartext handshake the filter drops next to the covered one.
-            // Remove-then-add is what replaces it, and the core answers the new link alone.
-            val movedToMask = allowed && YggCoverTransport.maskReplacesRawDial(dialUri)
-            // A peer that stays diallable is either untouched or already re-dialled with the new
-            // SNI above; re-adding it here would only flap a working link.
-            if (allowed && !movedToMask && (peer.isWhitelistCompatible || !justDisabledWhitelist)) continue
-            val change = networkEngine.applyPeerChangeToCores(
-                uri,
-                enabled = allowed,
-                sniDomain = peer.sniDomain
-            )
-            if (change.applied > 0) {
-                when {
-                    !allowed -> parked++
-                    movedToMask -> masked++
-                    else -> restored++
+            val rawDialLeft = allowed && YggCoverTransport.maskReplacesRawDial(dialUri) &&
+                dialled.contains(rawKey)
+            when {
+                !allowed && heldByCore -> {
+                    if (networkEngine.applyPeerChangeToCores(uri, enabled = false).applied > 0) parked++
                 }
+                allowed && !heldByCore -> {
+                    if (networkEngine.applyPeerChangeToCores(
+                            uri, enabled = true, sniDomain = peer.sniDomain
+                        ).applied > 0
+                    ) restored++
+                }
+                rawDialLeft -> {
+                    // Remove-then-add is what replaces the dial; the core answers the new link alone.
+                    networkEngine.applyPeerChangeToCores(uri, enabled = false)
+                    if (networkEngine.applyPeerChangeToCores(
+                            uri, enabled = true, sniDomain = peer.sniDomain
+                        ).applied > 0
+                    ) masked++
+                }
+                // A peer that stays diallable and is already dialled is untouched: re-adding it
+                // here would only flap a working link.
+                else -> continue
             }
         }
         val gateNote = whitelistGateNote(cfg.whitelistCdnWssEnabled, parked, restored, masked, diallable)
@@ -529,6 +547,7 @@ class NetworkDpiController(
                 )
             }
         }
+        return gateNote
     }
 
     /**
@@ -582,12 +601,10 @@ class NetworkDpiController(
             scope.launch {
                 // The whitelist profile also decides which peers may be dialled at all, so
                 // switching it has to reach the live dial list, not only the cover links.
-                if (flagName == "WHITELIST_WSS") {
-                    applyWhitelistTransport(
-                        justDisabledWhitelist = !_antiDpiConfig.value.whitelistCdnWssEnabled
-                    )
-                }
-                val report = reDialCoverLinks()
+                val gateNote = if (flagName == "WHITELIST_WSS") {
+                    applyWhitelistTransport()
+                } else ""
+                val report = reDialCoverLinks() + gateNote
                 _antiDpiConfig.update { it.copy(lastProbeReport = report) }
                 withContext(Dispatchers.Main) { onBannerMessage(report) }
             }

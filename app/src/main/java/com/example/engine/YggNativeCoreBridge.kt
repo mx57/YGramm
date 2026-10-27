@@ -162,6 +162,30 @@ object YggNativeCoreBridge {
     }
 
     /**
+     * Every dial the running core holds, whether or not the socket behind it ever answered.
+     *
+     * This is the list the whitelist profile actually has to change. The database's probe flag
+     * cannot stand in for it: on an allow-listed uplink no probe answers, so a pass keyed on it
+     * parks and restores nothing while the node goes on dialling the exact cleartext endpoints
+     * the profile was switched on to stop. Like [readCoreConfirmedPeers], the URI is taken
+     * without the `maxbackoff` query the core appends.
+     */
+    internal fun readConfiguredPeerUris(rawJson: String): Set<String> {
+        val peers = try {
+            JSONObject(rawJson).optJSONArray("peers")
+        } catch (_: Exception) {
+            null
+        } ?: return emptySet()
+        val result = HashSet<String>(peers.length())
+        for (i in 0 until peers.length()) {
+            val peer = peers.optJSONObject(i) ?: continue
+            val endpoint = peer.optString("URI").substringBefore("?").trim().lowercase()
+            if (endpoint.isNotBlank()) result.add(endpoint)
+        }
+        return result
+    }
+
+    /**
      * The peers this node really has an overlay link with.
      *
      * `Up` alone is not enough. yggdrasil-go (src/core/api.go, v0.5.14) sets it the moment a
