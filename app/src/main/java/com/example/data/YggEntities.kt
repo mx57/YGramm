@@ -26,7 +26,16 @@ data class UserProfileEntity(
     // last saw from us. The hash is what decides whether a message has to carry the
     // bytes again.
     val avatarUri: String = "",
-    val avatarHashHex: String = ""
+    val avatarHashHex: String = "",
+    // The user's own status line — the text that travels to peers in a PROFILE frame.
+    // Separate from [statusText] on purpose: that column is written by the node-role and
+    // background-state bookkeeping ("Пир-узел • В фоне (:51921)"), so shipping it as a person's
+    // status would broadcast machine bookkeeping and overwrite whatever they typed.
+    val socialStatus: String = "",
+    // When this profile was last edited. Every PROFILE frame carries it, and the receiver
+    // applies a frame only when it is newer than what it already stored: without a version on
+    // the wire, a delayed or replayed frame could rewrite a contact's name with an older one.
+    val profileVersion: Long = 0L
 )
 
 @Entity(tableName = "conversations")
@@ -58,7 +67,24 @@ data class ConversationEntity(
     // The identifier every member of a group sees on the wire. chatId stays local — one
     // per owning profile — so two profiles on this device can each hold their own row for
     // the same group instead of fighting over one primary key.
-    val groupId: String = ""
+    val groupId: String = "",
+    // What the contact told us about themselves, through a frame this device actually
+    // opened. A name on the wire is a claim; these fields only ever hold what the sealed
+    // profile envelope proved, so an unauthenticated node cannot rename a contact.
+    val peerHandle: String = "",
+    val peerStatusText: String = "",
+    // The sender's own edit timestamp, kept so an older frame never overwrites a newer one.
+    val peerProfileVersion: Long = 0,
+    // The last time a frame from this peer opened successfully on this device. This is the
+    // only presence fact the app has: it is not "online now", it is "was reachable then".
+    val peerLastSeenAt: Long = 0,
+    // True only after this peer sent an envelope this device opened as v3. Outgoing traffic
+    // uses v3 toward a peer that proved it, so the flag is evidence, not a preference.
+    val peerEnvelopeV3Proven: Boolean = false,
+    // Same rule for the voice codec: an Opus note is only sent to a peer that showed it can make
+    // or open one. A receiver that cannot decode the container gets silence from a file it cannot
+    // read, which is worse than a note five times the size.
+    val peerVoiceOpusProven: Boolean = false
 )
 
 @Entity(

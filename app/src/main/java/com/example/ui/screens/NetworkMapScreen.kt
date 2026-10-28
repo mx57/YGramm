@@ -168,12 +168,18 @@ fun NetworkMapScreen(
     }
 
     val contactNodes = conversations.take(4).mapIndexed { idx, c ->
+        // A contact node answers for the mesh path, never for the person: the only presence
+        // fact worth putting on a map is when one of their frames last opened here.
         MapNodeItem(
             id = c.chatId,
             label = c.title,
             ipv6 = c.yggIpv6Address,
             countryFlag = "👤",
-            region = "Получатель Yggdrasil",
+            region = if (c.peerLastSeenAt > 0L) {
+                "Выходил на связь: ${SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(c.peerLastSeenAt))}"
+            } else {
+                "Выход на связь не зафиксирован"
+            },
             type = "CONTACT",
             xRatio = 0.82f,
             yRatio = 0.20f + idx * 0.22f,

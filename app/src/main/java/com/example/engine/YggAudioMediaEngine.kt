@@ -17,6 +17,7 @@ import android.os.Build
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -296,8 +297,8 @@ object YggAudioMediaEngine {
     }
 
     /**
-     * Plays a voice note file with real audible output using AudioTrack (direct PCM streaming from WAV)
-     * with MediaPlayer fallback, reporting live playback progress (0f..1f).
+     * Plays a voice note file with real audible output using AudioTrack (direct PCM streaming
+     * from a WAV, or from a YGO1 Opus container decoded first), reporting live progress (0f..1f).
      */
     fun startPlayingVoiceNote(
         context: Context,
@@ -306,7 +307,8 @@ object YggAudioMediaEngine {
         durationSec: Int,
         waveformCsv: String?,
         onProgress: (Float) -> Unit,
-        onComplete: () -> Unit
+        onComplete: () -> Unit,
+        onPlaybackFailure: (String) -> Unit = {}
     ) {
         stopVoiceNotePlayback()
         currentPlayingMessageId = messageId
@@ -333,9 +335,28 @@ object YggAudioMediaEngine {
                 ByteArray(0)
             }
 
-            if (rawBytes.size > 44) {
-                val pcmOffset = 44
-                val pcmLength = rawBytes.size - pcmOffset
+            // The container decides the path, not the file name: a YGO1 file holds Opus packets,
+            // and feeding those bytes to AudioTrack as PCM would sound like static. A container
+            // that will not open is reported instead of playing silence.
+            val isOpusPayload = YggVoiceCodec.isOpusContainer(rawBytes)
+            val pcm = when {
+                isOpusPayload -> YggVoiceCodec.decode(rawBytes)
+                rawBytes.size > 44 -> rawBytes.copyOfRange(44, rawBytes.size)
+                else -> null
+            }
+            if (isOpusPayload && pcm == null) {
+                val reason = if (!YggVoiceCodec.capability().canDecodeOpus) {
+                    "Нет декодера Opus на этом устройстве"
+                } else {
+                    "Декодер Opus не открыл запись"
+                }
+                withContext(Dispatchers.Main) {
+                    onPlaybackFailure(reason)
+                }
+            }
+
+            if (pcm != null && pcm.isNotEmpty()) {
+                val pcmLength = pcm.size
                 val minBuffer = AudioTrack.getMinBufferSize(
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
@@ -369,7 +390,7 @@ object YggAudioMediaEngine {
                     var written = 0
                     while (isActive && currentPlayingMessageId == messageId && written < pcmLength) {
                         val toWrite = (pcmLength - written).coerceAtMost(chunkSize)
-                        val res = track.write(rawBytes, pcmOffset + written, toWrite)
+                        val res = track.write(pcm, written, toWrite)
                         if (res > 0) {
                             written += res
                         } else {
@@ -779,7 +800,9 @@ object YggAudioMediaEngine {
         attachmentType: String?,
         attachmentUri: String?,
         voiceDurationSec: Int = 0,
-        voiceWaveformCsv: String? = null
+        voiceWaveformCsv: String? = null,
+        // Set only when the peer proved it runs an Opus codec; see YggRepository.rememberPeerCapabilities.
+        allowVoiceOpus: Boolean = false
     ): Pair<String?, String> {
         if (attachmentName == null && attachmentType == null) return null to ""
 
@@ -804,13 +827,22 @@ object YggAudioMediaEngine {
                     } else {
                         attachmentUri
                     }
-                    if (rawBytes.size > MAX_P2P_INLINE_BYTES) {
+                    // Compression is decided per send, never at record time, and only for a peer
+                    // that proved it runs the codec. The returned Uri points at the bytes that
+                    // leave this device, so the stored note always matches what the peer got —
+                    // and a note that shrinks below the inline ceiling now travels inline.
+                    val wire = if (allowVoiceOpus && attachmentType == "VOICE") {
+                        opusWireCopy(context, rawBytes) ?: rawBytes to localCopy
+                    } else {
+                        rawBytes to localCopy
+                    }
+                    if (wire.first.size > MAX_P2P_INLINE_BYTES) {
                         // Truncating used to hand the peer a corrupt file while the sender saw
                         // "sent": over-cap payloads are refused outright, the local copy stays.
-                        return localCopy to ""
+                        return wire.second to ""
                     }
-                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(rawBytes)
-                    return localCopy to b64
+                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(wire.first)
+                    return wire.second to b64
                 }
             } catch (_: Throwable) {
             }
@@ -820,6 +852,46 @@ object YggAudioMediaEngine {
         // sender see "sent" while the peer received media that never existed, so the caller gets
         // an empty payload and must report the failure instead.
         return attachmentUri to ""
+    }
+
+    /**
+     * The compressed voice payload and the file it lives in, or null when there is nothing to gain
+     * — no codec, already compressed, or the "compressed" form came out bigger than the WAV.
+     */
+    private fun opusWireCopy(context: Context, wavBytes: ByteArray): Pair<ByteArray, String>? {
+        if (YggVoiceCodec.isOpusContainer(wavBytes)) return null
+        if (!YggVoiceCodec.capability().canEncodeOpus) return null
+        val pcm = wavBytes
+            .takeIf { it.size > 44 && String(it, 0, 4, Charsets.US_ASCII) == "RIFF" }
+            ?.let { it.copyOfRange(44, it.size) }
+            ?: return null
+        val encoded = YggVoiceCodec.encode(pcm) ?: return null
+        if (encoded.codecId != YggVoiceCodec.CODEC_OPUS || encoded.bytes.size >= wavBytes.size) return null
+        return try {
+            val dir = File(context.filesDir, "voice_notes").apply { mkdirs() }
+            val out = File(dir, "send_${System.currentTimeMillis()}_${(1..999_999).random()}.opus")
+            out.writeBytes(encoded.bytes)
+            encoded.bytes to Uri.fromFile(out).toString()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * What a stored voice file actually holds, read from its first bytes rather than from what the
+     * sender intended: the wire field must describe the payload, and a rename is not a codec.
+     */
+    fun voiceCodecOf(attachmentUri: String?): String = try {
+        val path = attachmentUri?.let { Uri.parse(it).path } ?: return ""
+        val header = RandomAccessFile(path, "r").use { raf ->
+            val size = minOf(raf.length(), 4L).toInt()
+            val bytes = ByteArray(size)
+            if (size > 0) raf.readFully(bytes)
+            bytes
+        }
+        if (YggVoiceCodec.hasOpusMagic(header)) YggVoiceCodec.NAME_OPUS else ""
+    } catch (_: Throwable) {
+        ""
     }
 
     /**
@@ -853,8 +925,12 @@ object YggAudioMediaEngine {
                     } else {
                         File(context.filesDir, "ygg_attachments").apply { mkdirs() }
                     }
-                    val finalName = if (attachmentType == "VOICE" && !safeName.endsWith(".wav", true)) {
-                        "${safeName.substringBeforeLast(".")}.wav"
+                    // The extension follows the bytes, not the sender's file name: a container
+                    // saved as ".wav" would be read as PCM header plus garbage, and the player
+                    // has to be able to tell the two apart from disk alone.
+                    val finalName = if (attachmentType == "VOICE") {
+                        val stem = safeName.substringBeforeLast(".")
+                        if (YggVoiceCodec.isOpusContainer(decodedBytes)) "$stem.opus" else "$stem.wav"
                     } else {
                         safeName
                     }

@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -120,6 +121,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -186,6 +189,7 @@ fun ChatsScreen(
     onCreateGroup: (String, List<String>) -> Unit = { _, _ -> },
     onAddContactsToGroup: (String, List<String>) -> Unit = { _, _ -> },
     onRenameGroup: (String, String) -> Unit = { _, _ -> },
+    onSetGroupAvatar: (String, Uri) -> Unit = { _, _ -> },
     onRemoveGroupMember: (String, String) -> Unit = { _, _ -> },
     onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
@@ -366,6 +370,7 @@ fun ChatsScreen(
                                 onAddContactsToGroup(activeConversation.chatId, ids)
                             },
                             onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                            onSetGroupAvatar = { uri -> onSetGroupAvatar(activeConversation.chatId, uri) },
                             onRemoveGroupMember = { ipv6 ->
                                 onRemoveGroupMember(activeConversation.chatId, ipv6)
                             },
@@ -437,6 +442,7 @@ fun ChatsScreen(
                         onAddContactsToGroup(activeConversation.chatId, ids)
                     },
                     onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                    onSetGroupAvatar = { uri -> onSetGroupAvatar(activeConversation.chatId, uri) },
                     onRemoveGroupMember = { ipv6 -> onRemoveGroupMember(activeConversation.chatId, ipv6) },
                     onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
                     rejectedDraft = uiState.rejectedDraft
@@ -898,7 +904,7 @@ private fun CallLogRow(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = formatCallLogTime(entry.startedAt),
+                    text = formatDayAwareTime(entry.startedAt),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -938,7 +944,7 @@ private fun CallLogRow(
     }
 }
 
-private fun formatCallLogTime(timestamp: Long): String {
+private fun formatDayAwareTime(timestamp: Long): String {
     val now = Calendar.getInstance()
     val then = Calendar.getInstance().apply { timeInMillis = timestamp }
     val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
@@ -1339,12 +1345,22 @@ private fun ConversationRowCard(
                                 .clip(CircleShape)
                                 .background(
                                     if (conversation.isOnlineInMesh) {
-                                        EmeraldPrimary
+                                        CyberTealSecondary
                                     } else {
                                         MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                                     }
                                 )
-                                .testTag("conversation_online_dot_${conversation.chatId}")
+                                // A route check answers for the node, not for the person behind
+                                // it, so this dot is deliberately not the "online" green: it says
+                                // whether the overlay path was up when it was last measured.
+                                .semantics {
+                                    contentDescription = if (conversation.isOnlineInMesh) {
+                                        "Маршрут к узлу подтверждён"
+                                    } else {
+                                        "Маршрут к узлу не подтверждён"
+                                    }
+                                }
+                                .testTag("conversation_route_dot_${conversation.chatId}")
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
@@ -1494,6 +1510,7 @@ private fun ChatDetailPane(
     groupContactCandidates: List<ConversationEntity> = emptyList(),
     onAddContactsToGroup: (List<String>) -> Unit = {},
     onRenameGroup: (String) -> Unit = {},
+    onSetGroupAvatar: (Uri) -> Unit = {},
     onRemoveGroupMember: (String) -> Unit = {},
     onLeaveGroup: () -> Unit = {},
     rejectedDraft: String? = null,
@@ -1522,6 +1539,13 @@ private fun ChatDetailPane(
     var forwardTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     var deleteTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     val isSelfChat = YggRepository.isSelfChatId(conversation.chatId)
+    // The same picker and the same codec a profile picture uses: a cover that will not fit one
+    // frame is refused here instead of arriving torn at a peer's device.
+    val groupAvatarPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) onSetGroupAvatar(uri)
+    }
     val wireIdIndex = remember(messages) {
         buildMap {
             messages.forEach { msg ->
@@ -1676,6 +1700,43 @@ private fun ChatDetailPane(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (conversation.chatType != "GROUP" && !isSelfChat) {
+                            // The one presence fact this app has, stated as a past event: the
+                            // time the peer's frame last opened on this device. There is no
+                            // "now" to report — nothing on the overlay answers for a person. And
+                            // "не зафиксирован" rather than "не выходил": the stamp only exists
+                            // from 1.7.6, so an old dialog simply has no measurement yet.
+                            Text(
+                                text = if (conversation.peerLastSeenAt > 0L) {
+                                    "Выходил на связь: ${formatDayAwareTime(conversation.peerLastSeenAt)}"
+                                } else {
+                                    "Выход на связь не зафиксирован"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("peer_last_seen_line_text")
+                            )
+                        }
+                        if (conversation.chatType != "GROUP" &&
+                            (conversation.peerHandle.isNotBlank() || conversation.peerStatusText.isNotBlank())
+                        ) {
+                            // Only what the peer sealed for this device is shown: a contact whose
+                            // profile never arrived has no line here at all, rather than a guess
+                            // built from the mesh address.
+                            Text(
+                                text = listOfNotNull(
+                                    conversation.peerHandle.takeIf { it.isNotBlank() },
+                                    conversation.peerStatusText.takeIf { it.isNotBlank() }
+                                ).joinToString(" • "),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CyberTealSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("peer_profile_line_text")
+                            )
+                        }
                         if (conversation.chatType == "GROUP") {
                             Text(
                                 // The roster is what the mesh actually told us, so an empty
@@ -2178,6 +2239,43 @@ private fun ChatDetailPane(
                                 .testTag("group_rename_confirm")
                         ) {
                             Text("Переименовать")
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            YggAvatar(
+                                avatarUri = conversation.avatarUri,
+                                name = conversation.title,
+                                size = 40.dp
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Обложка группы",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                // What this app does not have: a role that owns the group. Saying
+                                // so is the honest version of "who can change this".
+                                Text(
+                                    text = "Заменить может любой участник. Новая картинка уйдёт " +
+                                        "остальным с первым вашим сообщением в группу.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Button(
+                                onClick = {
+                                    groupAvatarPickerLauncher.launch(
+                                        PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly
+                                        )
+                                    )
+                                },
+                                modifier = Modifier.testTag("group_avatar_pick_button")
+                            ) {
+                                Text("Выбрать")
+                            }
                         }
                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                         Text(
@@ -2732,9 +2830,12 @@ private fun EncryptedMessageBubble(
                 if (showCipherHex) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        // ratchetStep travels in the envelope but is not mixed into the HKDF key -
-                        // calling it "HKDF step" would advertise a ratchet this build does not have.
-                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}\nEnvelope: v${message.envelopeVersion} • шаг #${message.ratchetStep} (в ключ HKDF не входит)",
+                        // ratchetStep is cosmetic: v2 carries it without mixing it into the HKDF
+                        // key and v3 leaves it out of the frame entirely, so calling this an
+                        // "HKDF step" would advertise a ratchet this build does not have.
+                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}\nEnvelope: v${message.envelopeVersion}" +
+                            (if (message.envelopeVersion >= 3) " • ключ на это сообщение одноразовый" else "") +
+                            " • шаг #${message.ratchetStep} (в ключ HKDF не входит)",
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                         color = AmberShieldTertiary
                     )

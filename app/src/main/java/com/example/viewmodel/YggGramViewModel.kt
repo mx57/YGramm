@@ -18,6 +18,7 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.sqlite.db.SimpleSQLiteQuery
 import com.example.data.BackupSnapshotEntity
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
@@ -29,6 +30,7 @@ import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
 import com.example.data.UserProfileEntity
 import com.example.data.YggDatabase
+import com.example.data.YggEncryptedExport
 import com.example.data.YggPeerEntity
 import com.example.data.YggRepository
 import com.example.engine.CountryFilterOption
@@ -36,7 +38,9 @@ import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.DiscoveredYggPeer
 import com.example.engine.IncomingCallAudioPacket
 import com.example.engine.IncomingCallSignalPacket
+import com.example.engine.IncomingProfilePacket
 import com.example.engine.OverlayProbeOutcome
+import com.example.engine.ProfileDispatchResult
 import com.example.engine.SelfYggdrasilRelayResult
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
@@ -45,6 +49,7 @@ import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
+import com.example.engine.YggVoiceCodec
 import com.example.viewmodel.controllers.ChatConversationController
 import com.example.viewmodel.controllers.NetworkDpiController
 import com.example.viewmodel.controllers.VaultIdentityController
@@ -57,6 +62,7 @@ import com.example.service.YggNotificationCenter
 import com.example.service.YggPopupNotificationItem
 import com.example.service.YggQuickReplyBus
 import com.example.ui.components.PendingProfileSwitchRequest
+import com.example.update.ApkRelayRequest
 import com.example.update.YGrammUpdateController
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -157,7 +163,16 @@ data class AntiDpiConfigState(
     // refused handshake says something about the peer, and reading one as the other is how the
     // user ends up blaming the app for the carrier's filter.
     val networkFilterSummary: String = "",
-    val networkFilterEvidence: List<String> = emptyList()
+    val networkFilterEvidence: List<String> = emptyList(),
+    // A verdict describes the link it was measured on. Without the moment of measurement the
+    // screen would present an hour-old answer as if it were about the network in front of the
+    // user now, which is exactly how a killed hotspot reads as a permanent filter.
+    val networkFilterMeasuredAtMs: Long = 0L,
+    // Measured on this device, by this app: which codec it really found and what one note
+    // actually costs there. A number copied from a codec brochure would be a guess.
+    val voiceCodecSummary: String = "",
+    val voiceCodecMeasuredAtMs: Long = 0L,
+    val isCheckingVoiceCodec: Boolean = false
 )
 
 data class DecentralizedUserProfile(
@@ -166,6 +181,9 @@ data class DecentralizedUserProfile(
     val handle: String = "@node1.ygg",
     val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
     val statusText: String = "В оверлее 200::/7 (Порт 51921)",
+    // The user's own status line — the one peers see. [statusText] holds the node's machine state
+    // and is rewritten by the app, so it can never be the text a person chose about themselves.
+    val socialStatus: String = "",
     val allocatedTcpPort: Int = 51921,
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
@@ -333,6 +351,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         // A muted peer still transmits encrypted silence, so this many seconds without a
         // single decrypted inbound frame can only mean the media path is dead.
         const val CALL_RX_STALL_SECONDS = 6
+
+        const val TAG_EXPORT = "YggExport"
+
+        /**
+         * Where the database key actually comes from. SQLCipher's own KDF parameters are read
+         * from PRAGMA at export time, so this line only states the custody of the passphrase.
+         */
+        const val KEY_CUSTODY_SPEC =
+            "Пароль базы: 32 байта из SecureRandom, обёрнут AES-GCM ключом Android Keystore"
     }
 
     private var activeCallJob: kotlinx.coroutines.Job? = null
@@ -407,7 +434,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
                 // After the message, so the conversation row this writes onto already
                 // exists; the picture is checked against its own hash inside the codec.
-                repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
+                if (packet.groupId.isNotBlank()) {
+                    repository.storeIncomingGroupAvatars(
+                        groupChatId = chatId,
+                        senderIpv6 = packet.senderIpv6,
+                        ownerProfileId = targetProfile?.profileId ?: currentPrimaryId,
+                        groupAvatarHash = packet.groupAvatarHash,
+                        groupAvatarData = packet.groupAvatarData,
+                        senderAvatarHash = packet.senderAvatarHash,
+                        senderAvatarData = packet.senderAvatarData
+                    )
+                } else {
+                    repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
+                }
 
                 val targetProfileName = targetProfile?.displayName
                 val profileSuffix = if (targetProfile != null && targetProfile.profileId != currentPrimaryId) {
@@ -482,12 +521,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 syncForegroundServiceNotification()
             }.join()
         },
-        onDeliveryAckReceived = { chatId, messageId, rttMs, ackSenderKey ->
+        onDeliveryAckReceived = { chatId, messageId, rttMs, ackSenderKey, acceptedEnvelopeVersions ->
             viewModelScope.launch {
                 // The message row is authoritative for which chat an ACK belongs to: a group
                 // message confirmed by one member must not be written as delivered to all.
                 val ackedMsg = repository.getMessage(messageId)
                 val ackedChatId = ackedMsg?.chatId?.takeIf { it.isNotBlank() } ?: chatId
+                // What the peer's own ACK said it can read. Nothing here is a guess: an empty
+                // advertisement (an older build, or a socket that proved no identity) leaves
+                // the dialog on v2, which both builds read.
+                repository.rememberPeerEnvelopeVersions(ackedChatId, ackSenderKey, acceptedEnvelopeVersions)
                 if (repository.getConversation(ackedChatId)?.chatType == "GROUP") {
                     // An ACK that lands after the fan-out still has to be counted, otherwise
                     // «2 из 3» freezes at whatever the synchronous pass managed to record.
@@ -631,6 +674,31 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
+        onProfileReceived = { packet ->
+            // Awaited, not launched: the bridge puts this answer into the ACK it sends back, and a
+            // coroutine started beside it would always report "not applied" before the store
+            // finished.
+            val outcome = repository.applyIncomingProfile(
+                senderIpv6 = packet.senderIpv6,
+                senderPubKeyHex = packet.senderPubKeyHex,
+                profileEnvelope = packet.profileEnvelope,
+                avatarHashHex = packet.senderAvatarHash,
+                avatarBase64 = packet.senderAvatarData,
+                recipientProfileId = packet.recipientProfileId,
+                currentPrimaryProfileId = _uiState.value.currentProfileId
+            )
+            android.util.Log.i(
+                "YGG-SEND",
+                "RX <- PRF • ${packet.senderIpv6} • ${describeProfileOutcome(outcome)}"
+            )
+            if (outcome != YggRepository.ProfileApplyOutcome.APPLIED) {
+                // An applied profile changes the chat list by itself - the dialog row now
+                // carries the new name. Announcing every one of those would bury the user in
+                // banners each time a contact edits their status.
+                _uiState.update { it.copy(statusBannerMessage = describeProfileOutcome(outcome)) }
+            }
+            profileVerdictCode(outcome)
+        },
         onReadReceiptReceived = { chatId, ids ->
             viewModelScope.launch {
                 // A group has no reader-of-record: one member's receipt would mark the
@@ -675,6 +743,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 repository.incrementProfileRelayedPackets(profileId, 1)
             }
         },
+        // A peer that advertises Opus in its own ACK can encode and decode it, because that is
+        // exactly the condition our build applies before it writes an advertisement. The dialog
+        // stores the proof, and only then does a note leave this device compressed to it.
+        onPeerVoiceCodecsReceived = { chatId, ackSenderKey, voiceCodecsCsv ->
+            viewModelScope.launch {
+                repository.rememberPeerCapabilities(chatId, ackSenderKey, "", voiceCodecsCsv)
+            }
+        },
         // A streamed piece is only decryptable with the key derived from this conversation's
         // pinned peer key, so the bridge asks the repository instead of guessing one.
         resolveFileTransferKey = { profileId, chatId, transferId ->
@@ -687,6 +763,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         },
         onFileTransferProgress = { progress ->
             repository.recordFileTransferProgress(progress)
+        },
+        // A carried APK never becomes a chat row: it is handed to the updater, which is the only
+        // place holding this device's own manifest and the pinned signing key to judge it by.
+        onApkRelayOutcome = { transferId, localPath, refusalReason ->
+            if (localPath != null) {
+                YGrammUpdateController.onRelayApkDelivered(transferId, localPath)
+            } else {
+                YGrammUpdateController.onRelayHandshakeFailed(refusalReason)
+            }
+        },
+        onApkRelayProgress = { transferId, doneBytes, totalBytes ->
+            YGrammUpdateController.relayProgress(transferId, doneBytes, totalBytes)
         }
     )
 
@@ -756,18 +844,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } }
     )
 
-    val vaultIdentityController = VaultIdentityController(
-        application = application,
-        repository = repository,
-        networkEngine = networkEngine,
-        scope = viewModelScope,
-        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } },
-        onProfileUpdated = { applyUserProfileEntityToState(it) },
-        onSyncForegroundNotification = { syncForegroundServiceNotification() }
-    )
+    val vaultIdentityController = VaultIdentityController()
 
     init {
         YGrammUpdateController.attach(application)
+        viewModelScope.launch {
+            // A relay reply has to name this node with something a human chose, not a key hash.
+            _uiState.map { it.userProfile.displayName }.distinctUntilChanged().collect { name ->
+                networkEngine.localProfileLabel = name.ifBlank { "Мой узел Yggdrasil" }
+            }
+        }
         viewModelScope.launch {
             networkDpiController.antiDpiConfig.collect { cfg ->
                 _uiState.update { it.copy(antiDpiConfig = cfg) }
@@ -990,6 +1076,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     handle = profileEntity.handle,
                     bio = profileEntity.bio,
                     statusText = profileEntity.statusText,
+                    socialStatus = profileEntity.socialStatus,
                     allocatedTcpPort = profileEntity.allocatedTcpPort,
                     isActiveInBackground = profileEntity.isActiveInBackground,
                     nodeRelayRole = profileEntity.nodeRelayRole,
@@ -1076,6 +1163,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (!privacy.inAppNotificationsEnabled && !privacy.systemNotificationsEnabled) return
 
         val app = getApplication<Application>()
+        // The chat's own picture — the contact's for a dialog, the cover for a group. Taken from
+        // the row rather than passed in, so no caller can pair a name with someone else's face;
+        // a picture that has not reached this device yet simply produces no icon.
+        val chatAvatarUri = conversations.value
+            .firstOrNull { it.chatId == chatId }?.avatarUri
+            .orEmpty()
         val item = YggPopupNotificationItem(
             notificationId = "notif_${UUID.randomUUID().toString().take(8)}",
             category = category,
@@ -1090,6 +1183,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             messagePreview = messagePreview,
             voiceDurationSec = voiceDurationSec,
             callId = callId,
+            chatAvatarUri = chatAvatarUri,
             timestamp = System.currentTimeMillis()
         )
         if (privacy.inAppNotificationsEnabled && appIsForeground) {
@@ -2021,6 +2115,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val rosterCsv = roster.joinToString(",") { "${it.first}|${it.second}" }
         val candidatePeers = buildCandidateExternalPeersList()
         val avatarBase64 = YggAvatarCodec.base64OfStoredFile(state.userProfile.avatarUri).orEmpty()
+        // A group has no server holding its cover, so the cover travels from the row of whoever
+        // is speaking: each member's device repeats it to each peer until that peer ACKs it.
+        val groupAvatarBase64 = YggAvatarCodec.base64OfStoredFile(conv.avatarUri).orEmpty()
 
         var acked = 0
         var routed = 0
@@ -2084,10 +2181,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentBase64 = memberAttachment,
                 voiceDurationSec = msg.voiceDurationSec,
                 voiceWaveformCsv = msg.voiceWaveformCsv,
+                // Groups never get a compressed note (one payload serves every member), but the
+                // marker still describes the file rather than the send decision.
+                voiceCodec = wireVoiceCodec(msg.attachmentType, msg.attachmentUri),
                 replyToMessageId = msg.replyToMessageId,
                 forwardedFrom = msg.forwardedFrom,
                 senderAvatarHash = state.userProfile.avatarHashHex,
                 senderAvatarBase64 = avatarBase64,
+                groupAvatarHash = conv.avatarHashHex,
+                groupAvatarBase64 = groupAvatarBase64,
                 groupId = conv.groupId,
                 groupTitle = conv.title,
                 groupMembersCsv = rosterCsv
@@ -2213,12 +2315,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentType = msg.attachmentType,
                         attachmentUri = msg.attachmentUri,
                         voiceDurationSec = msg.voiceDurationSec,
-                        voiceWaveformCsv = msg.voiceWaveformCsv
+                        voiceWaveformCsv = msg.voiceWaveformCsv,
+                        allowVoiceOpus = voiceOpusAllowed(conv)
                     )
                 } else {
                     null
                 }
                 val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
+                // A queued note is re-prepared on its way out, so the codec marker and the size
+                // describe the bytes this attempt actually carries, not what was stored.
+                val wireVoiceCodecName = wireVoiceCodec(msg.attachmentType, prepared?.first ?: msg.attachmentUri)
+                val wireSizeBytes = if (wireVoiceCodecName.isNotEmpty()) {
+                    localAttachmentBytes(prepared?.first).takeIf { it > 0L } ?: msg.attachmentSizeBytes
+                } else {
+                    msg.attachmentSizeBytes
+                }
                 // A content:// source has to travel as the app's own copy: a piece stream reads the
                 // file back from disk, and the picked Uri is not guaranteed to still resolve.
                 val attachmentUri = prepared?.first ?: msg.attachmentUri
@@ -2272,7 +2383,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         cipherPayloadHex = msg.cipherPayloadHex,
                         hashcashToken = msg.hashcashPowToken,
                         attachmentName = msg.attachmentName,
-                        attachmentSizeBytes = msg.attachmentSizeBytes,
+                        attachmentSizeBytes = wireSizeBytes,
                         candidatePeers = candidateExternalPeers,
                         allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery,
                         attachmentType = msg.attachmentType,
@@ -2280,6 +2391,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentBase64 = sealedAttachment,
                         voiceDurationSec = msg.voiceDurationSec,
                         voiceWaveformCsv = msg.voiceWaveformCsv,
+                        voiceCodec = wireVoiceCodecName,
                         senderAvatarHash = _uiState.value.userProfile.avatarHashHex,
                         senderAvatarBase64 = YggAvatarCodec
                             .base64OfStoredFile(_uiState.value.userProfile.avatarUri).orEmpty()
@@ -2484,6 +2596,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             // Prepare local copy and binary Base64 payload for real P2P transfer
             var resolvedLocalUri = attachmentUri
             var resolvedSizeBytes = attachmentSizeBytes
+            var resolvedVoiceCodec = ""
             var attachmentBase64: String? = null
 
             if (effectiveType != null) {
@@ -2493,7 +2606,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     attachmentType = effectiveType,
                     attachmentUri = attachmentUri,
                     voiceDurationSec = voiceDurationSec.coerceAtLeast(1),
-                    voiceWaveformCsv = voiceWaveformCsv
+                    voiceWaveformCsv = voiceWaveformCsv,
+                    allowVoiceOpus = voiceOpusAllowed(targetConv)
                 )
                 resolvedLocalUri = localSavedUri
                 attachmentBase64 = encodedB64.takeIf { it.isNotBlank() }
@@ -2507,13 +2621,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         return@launch
                     }
                 }
-                if (resolvedSizeBytes <= 0L && !localSavedUri.isNullOrBlank()) {
-                    try {
-                        val path = android.net.Uri.parse(localSavedUri).path
-                        if (!path.isNullOrBlank()) {
-                            resolvedSizeBytes = java.io.File(path).length()
-                        }
-                    } catch (_: Throwable) {
+                // The wire marker comes from the bytes that were actually written, not from the
+                // intent to compress — a refused compression still leaves a WAV here.
+                resolvedVoiceCodec = wireVoiceCodec(effectiveType, localSavedUri)
+                if (resolvedSizeBytes <= 0L || resolvedVoiceCodec.isNotEmpty()) {
+                    val onDiskBytes = localAttachmentBytes(localSavedUri)
+                    if (onDiskBytes > 0L) {
+                        resolvedSizeBytes = onDiskBytes
                     }
                 }
             }
@@ -2646,6 +2760,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentBase64 = sealedAttachment,
                 voiceDurationSec = voiceDurationSec,
                 voiceWaveformCsv = voiceWaveformCsv,
+                voiceCodec = resolvedVoiceCodec,
                 replyToMessageId = wireQuoteId,
                 forwardedFrom = forwardedFrom,
                 senderAvatarHash = currentState.userProfile.avatarHashHex,
@@ -2677,6 +2792,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             targetConv?.title ?: "Узел Yggdrasil"
                         )
                     )
+                }
+                // A peer that has never sent a profile is a dialog this device has never been
+                // introduced in: the message carries the avatar bytes but not the name or status.
+                // One offer per dialog per run, and it is retried on the next message only if this
+                // one went unacknowledged.
+                if (targetConv != null && targetConv.chatType != "GROUP" &&
+                    !YggRepository.isSelfChatId(chatId) && targetConv.peerProfileVersion == 0L &&
+                    profileOfferedChats.add(chatId)
+                ) {
+                    launch { broadcastProfileToPeers(announce = false, onlyChatId = chatId) }
                 }
             } else {
                 repository.updateConversationRouteStatus(
@@ -2860,7 +2985,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         result.delivered ->
                             "Реакция $emoji доставлена адресату по LAN (ACK)"
                         else -> "Реакция $emoji сохранена локально, но адресат её не подтвердил: " +
-                            (result.errorDetail ?: "нет подтвержденного маршрута")
+                            (result.errorDetail ?: "нет подтверждённого маршрута")
                     }
                 )
             }
@@ -3000,7 +3125,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             "Запрос приняли $acked из ${targets.size} собеседников; остальные подтверждения не прислали"
                         else ->
                             "Удалено на этом устройстве$freedPart, но собеседник не подтвердил: " +
-                                (failure ?: "нет подтвержденного маршрута") +
+                                (failure ?: "нет подтверждённого маршрута") +
                                 " — запрос останется в очереди и уйдёт, когда связь появится"
                     }
                 )
@@ -4172,6 +4297,30 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
+     * Opus compression is offered only to a one-to-one dialog whose peer proved it runs the
+     * codec, and only while this device still finds an encoder for it. A group frame carries one
+     * payload for every member, so one member's proof cannot authorize it for the rest.
+     */
+    private fun voiceOpusAllowed(conv: ConversationEntity?): Boolean =
+        conv != null &&
+            conv.chatType != "GROUP" &&
+            conv.peerVoiceOpusProven &&
+            YggVoiceCodec.capability().canEncodeOpus
+
+    /**
+     * The wire codec marker, read from the bytes that are about to leave rather than from the
+     * decision to compress: a compression that did not happen still sends a WAV.
+     */
+    private fun wireVoiceCodec(attachmentType: String?, localSavedUri: String?): String =
+        if (attachmentType == "VOICE" &&
+            YggAudioMediaEngine.voiceCodecOf(localSavedUri) == YggVoiceCodec.NAME_OPUS
+        ) {
+            YggVoiceCodec.NAME_OPUS
+        } else {
+            ""
+        }
+
+    /**
      * `prepareAttachmentForP2P` returns an empty payload for both an unreadable file and one over
      * the inline ceiling, and it keeps the local copy either way. The second case is no longer a
      * refusal: the bridge carries those bytes as separately encrypted pieces, so this only reports
@@ -4221,13 +4370,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     attachmentType = message.attachmentType,
                     attachmentUri = message.attachmentUri,
                     voiceDurationSec = message.voiceDurationSec,
-                    voiceWaveformCsv = message.voiceWaveformCsv
+                    voiceWaveformCsv = message.voiceWaveformCsv,
+                    allowVoiceOpus = voiceOpusAllowed(conv)
                 )
             } else {
                 null
             }
             val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
             val attachmentUri = prepared?.first ?: message.attachmentUri
+            val wireVoiceCodecName = wireVoiceCodec(message.attachmentType, attachmentUri)
+            val wireSizeBytes = if (wireVoiceCodecName.isNotEmpty()) {
+                localAttachmentBytes(attachmentUri).takeIf { it > 0L } ?: message.attachmentSizeBytes
+            } else {
+                message.attachmentSizeBytes
+            }
             val refusal = if (attachmentBase64 == null) attachmentRefusalReason(attachmentUri) else null
             if (wantsAttachment && refusal != null) {
                 _uiState.update { it.copy(statusBannerMessage = refusal) }
@@ -4283,14 +4439,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     cipherPayloadHex = sealedText,
                     hashcashToken = message.hashcashPowToken,
                     attachmentName = message.attachmentName,
-                    attachmentSizeBytes = message.attachmentSizeBytes,
+                    attachmentSizeBytes = wireSizeBytes,
                     candidatePeers = candidatePeers,
                     allowLanFallback = allowManualLan,
                     attachmentType = message.attachmentType,
                     attachmentUri = attachmentUri,
                     attachmentBase64 = sealedAttachment,
                     voiceDurationSec = message.voiceDurationSec,
-                    voiceWaveformCsv = message.voiceWaveformCsv
+                    voiceWaveformCsv = message.voiceWaveformCsv,
+                    voiceCodec = wireVoiceCodecName
                 )
                 if (overlayRes.delivered) {
                     if (!overlayRes.endToEndConfirmed) {
@@ -4751,6 +4908,115 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         networkDpiController.probeNetworkFilter()
     }
 
+    /**
+     * Runs the whole voice path on this device — encoder, container, decoder — against a tone
+     * this code generates itself, and writes down what came back. The card must be able to say
+     * "no codec here", because that is the honest state of a phone whose system image has no
+     * Opus encoder, and a note the peer cannot open is worse than a note five times bigger.
+     */
+    fun checkVoiceCodec() {
+        if (_uiState.value.antiDpiConfig.isCheckingVoiceCodec) return
+        _uiState.update { state ->
+            state.copy(
+                antiDpiConfig = state.antiDpiConfig.copy(
+                    isCheckingVoiceCodec = true,
+                    voiceCodecSummary = ""
+                )
+            )
+        }
+        viewModelScope.launch {
+            val check = withContext(Dispatchers.IO) { YggVoiceCodec.selfCheck(seconds = 3) }
+            val summary = buildString {
+                append("Кодер: ").append(check.encoder ?: "не найден")
+                append(" • декодер: ").append(check.decoder ?: "не найден")
+                append('\n')
+                append("Замер: ").append(check.pcmBytes).append(" байт PCM → ")
+                append(check.payloadBytes).append(" байт на проводе (")
+                append(check.payloadPercent).append("%)")
+                check.snrDb?.let { append(" • тон сохранился, SNR ~").append(it.toInt()).append(" дБ") }
+                append('\n')
+                append(if (check.passed) {
+                    "Сжатие включается только собеседнику, сам назвавшему Opus в подтверждении доставки."
+                } else {
+                    check.verdict
+                })
+            }
+            _uiState.update { state ->
+                state.copy(
+                    antiDpiConfig = state.antiDpiConfig.copy(
+                        isCheckingVoiceCodec = false,
+                        voiceCodecSummary = summary,
+                        voiceCodecMeasuredAtMs = System.currentTimeMillis()
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * Asks one personal-contact peer to carry the release APK over the overlay. The hash the peer
+     * is asked for is the one this device read from GitHub (or that the user pasted in) - never a
+     * number the peer supplies, so a willing peer cannot pick which build lands here.
+     */
+    fun requestApkFromPeer(chatId: String) {
+        val manifest = YGrammUpdateController.localManifest()
+        if (manifest == null) {
+            YGrammUpdateController.onRelayHandshakeFailed(
+                "Спрашивать не с чем: на этом устройстве нет своего манифеста релиза. " +
+                    "Нужна одна успешная проверка на GitHub или манифест, вставленный вручную"
+            )
+            return
+        }
+        val conv = conversations.value.firstOrNull { it.chatId == chatId && it.chatType != "GROUP" }
+        if (conv == null) {
+            YGrammUpdateController.onRelayHandshakeFailed("Нет личного диалога с этим собеседником — спросить не у кого")
+            return
+        }
+        val transferId = "apk_" + System.currentTimeMillis().toString(36) +
+            java.util.UUID.randomUUID().toString().take(8)
+        val request = ApkRelayRequest(
+            transferId = transferId,
+            chatId = chatId,
+            apkAssetName = manifest.apkAssetName,
+            sha256Hex = manifest.sha256Hex,
+            versionCode = manifest.versionCode
+        )
+        // The order is registered before anything is looked up: from this moment the device is
+        // waiting for exactly this transfer id and refuses any other APK stream.
+        if (!YGrammUpdateController.beginRelayRequest(transferId, manifest)) return
+        viewModelScope.launch {
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+            if (peerIpv6.isBlank()) {
+                networkEngine.forgetApkRelayOrder(transferId)
+                YGrammUpdateController.onRelayHandshakeFailed(
+                    "У диалога «${conv.title}» нет адреса узла — кадр адресовать нечем"
+                )
+                return@launch
+            }
+            val identity = _uiState.value.identity
+            val answer = networkEngine.requestApkRelay(
+                request = request,
+                peerIpv6 = peerIpv6,
+                senderIpv6 = identity.yggIpv6Address,
+                senderPubKeyHex = identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex
+            )
+            if (answer.first) YGrammUpdateController.onRelayServing(conv.title)
+            else YGrammUpdateController.onRelayHandshakeFailed(answer.second)
+        }
+    }
+
+    fun cancelApkRelay() {
+        val transferId = YGrammUpdateController.state.value.relayTransferId
+        if (transferId.isNotBlank()) networkEngine.forgetApkRelayOrder(transferId)
+        YGrammUpdateController.cancelRelay()
+    }
+
+    fun importReleaseManifest(rawText: String) {
+        YGrammUpdateController.importManifestFromText(rawText)
+    }
+
     fun addCustomPeer(
         endpointUri: String,
         transportType: String,
@@ -4944,32 +5210,119 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun createEncryptedBackup(passphrase: String, isWebDavCloud: Boolean) {
-        val effectivePass = passphrase.ifBlank { _uiState.value.identity.backupMasterKeyFingerprint }
+    /**
+     * Copies the live SQLCipher file to a user-picked document and records what the written bytes
+     * actually hash to. An archive is only marked verified when the read-back copy matches the
+     * database file piece for piece.
+     */
+    fun exportEncryptedDatabase(uri: Uri) {
         viewModelScope.launch {
-            val snapshot = repository.createBackupSnapshot(
-                passphrase = effectivePass,
-                isWebDavCloud = isWebDavCloud
-            )
-            _uiState.update {
-                it.copy(
-                    statusBannerMessage = "Сохранён снимок метаданных ${snapshot.archiveFileName}. " +
-                        "Файла архива на диске нет: экспорт шифрованной базы ещё не реализован"
-                )
+            val app = getApplication<Application>()
+            val dbFile = app.getDatabasePath(YggDatabase.DATABASE_NAME)
+            if (!dbFile.exists() || dbFile.length() == 0L) {
+                setBanner("Экспорт не выполнен: файл шифрованной базы «${YggDatabase.DATABASE_NAME}» пуст или отсутствует")
+                return@launch
             }
+            val pendingJournal = java.io.File("${dbFile.absolutePath}-journal")
+            if (pendingJournal.exists() && pendingJournal.length() > 0L) {
+                setBanner("Экспорт не выполнен: в базе идёт незавершённая транзакция — подождите и повторите")
+                return@launch
+            }
+            val archiveName = readArchiveDisplayName(uri) ?: uri.lastPathSegment ?: YggDatabase.DATABASE_NAME
+            val outcome = runCatching {
+                withContext(Dispatchers.IO) {
+                    val cipherSpec = readSqlCipherSpec()
+                    YggEncryptedExport.copyAndProfile(
+                        sourceFile = dbFile,
+                        archiveFileName = archiveName,
+                        openSink = {
+                            app.contentResolver.openOutputStream(uri, "w")
+                                ?: error("Выбранный файл не открылся для записи")
+                        },
+                        readBackArchive = { app.contentResolver.openInputStream(uri) },
+                        cipherSpec = cipherSpec,
+                        keySpec = KEY_CUSTODY_SPEC
+                    )
+                }
+            }
+            outcome.fold(
+                onSuccess = { profile ->
+                    val snapshot = repository.recordDatabaseExport(profile)
+                    setBanner(
+                        if (profile.verified) {
+                            "Экспорт готов: ${archiveName}, ${profile.sizeBytes} байт, " +
+                                "${profile.pieceCount} кусков SHA-256, root совпал с базой"
+                        } else {
+                            "Архив ${archiveName} записан, но проверка не пройдена: " +
+                                "root файла ${profile.merkleRootHex.take(16)}… ≠ root базы " +
+                                "${profile.sourceRootHex.take(16)}… (${profile.sizeBytes} из ${profile.sourceSizeBytes} байт)"
+                        }
+                    )
+                    Log.i(TAG_EXPORT, "Export ${snapshot.snapshotId} verified=${profile.verified} bytes=${profile.sizeBytes}")
+                },
+                onFailure = { error ->
+                    setBanner("Экспорт не выполнен: ${error.javaClass.simpleName} — ${error.message}")
+                }
+            )
         }
     }
 
-    fun verifyOrRestoreBackup(snapshot: BackupSnapshotEntity, isRestore: Boolean) {
-        val msg = if (isRestore) {
-            "Восстановление из ${snapshot.archiveFileName} выполнено быть не может: реального архива нет, " +
-                "изменены только записи об этом снимке"
-        } else {
-            "Сводка ${snapshot.archiveFileName} посчитана по метаданным снимка: ни Poly1305, " +
-                "ни дерево Merkle от файла архива не проверялись — самого файла нет"
+    /** Re-hashes the archive the user points at and compares it with the recorded export. */
+    fun verifyExportedArchive(snapshot: BackupSnapshotEntity, uri: Uri) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val mismatch = withContext(Dispatchers.IO) {
+                val stream = runCatching { app.contentResolver.openInputStream(uri) }
+                    .onFailure { return@withContext "Файл не открылся для чтения: ${it.message}" }
+                    .getOrNull()
+                YggEncryptedExport.checkAgainstSnapshot(stream, snapshot)
+            }
+            repository.recordSnapshotCheck(snapshot, mismatch == null)
+            setBanner(
+                if (mismatch == null) {
+                    "Проверка пройдена: ${snapshot.archiveFileName} весит ${snapshot.sizeBytes} байт " +
+                        "и даёт тот же Merkle root, что был записан при экспорте"
+                } else {
+                    "Проверка не пройдена: $mismatch"
+                }
+            )
         }
-        _uiState.update { it.copy(statusBannerMessage = msg) }
     }
+
+    fun restoreFromArchive(snapshot: BackupSnapshotEntity) {
+        setBanner(YggEncryptedExport.restoreRefusalReason(snapshot.archiveFileName))
+    }
+
+    private fun setBanner(message: String) {
+        _uiState.update { it.copy(statusBannerMessage = message) }
+    }
+
+    private fun readArchiveDisplayName(uri: Uri): String? {
+        val app = getApplication<Application>()
+        if (uri.scheme != "content") return null
+        return runCatching {
+            app.contentResolver.query(uri, arrayOf(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst() && cursor.columnCount > 0) cursor.getString(0) else null
+                }
+        }.getOrNull()
+    }
+
+    /**
+     * Asks SQLCipher what it actually runs. The answer comes from PRAGMA on the open database, so
+     * an export log cannot drift from the cipher this build was linked against.
+     */
+    private fun readSqlCipherSpec(): String = runCatching {
+        val db = database.openHelper.writableDatabase
+        val version = db.query(SimpleSQLiteQuery("PRAGMA cipher_version"))
+            .use { if (it.moveToFirst()) it.getString(0) else "версия не прочиталась" }
+        val params = db.query(SimpleSQLiteQuery("PRAGMA cipher")).use { cursor ->
+            if (!cursor.moveToFirst()) ""
+            else (0 until minOf(cursor.columnCount, cursor.columnNames.size))
+                .joinToString(", ") { index -> "${cursor.columnNames[index]}=${cursor.getString(index)}" }
+        }
+        if (params.isBlank()) "SQLCipher $version" else "SQLCipher $version: $params"
+    }.getOrElse { "SQLCipher: параметры прочитались не полностью (${it.javaClass.simpleName})" }
 
     fun updateDecentralizedProfile(
         displayName: String,
@@ -4984,7 +5337,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 displayName = displayName,
                 handle = handle,
                 bio = bio,
-                statusText = statusText
+                socialStatus = statusText
             )
             if (updatedEntity != null) {
                 applyUserProfileEntityToState(updatedEntity)
@@ -4998,24 +5351,155 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             displayName = displayName.trim().ifBlank { it.userProfile.displayName },
                             handle = handle.trim().ifBlank { it.userProfile.handle },
                             bio = bio.trim(),
-                            statusText = statusText.trim(),
+                            socialStatus = statusText.trim(),
                             profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
                         )
                     )
                 }
             }
-            _uiState.update {
-                it.copy(statusBannerMessage = "Профиль сохранён • отпечаток вычислен по ключу узла")
-            }
+            broadcastProfileToPeers(announce = true)
         }
+    }
+
+    /** The wire word for this decision - the sender prints it in its own log instead of guessing. */
+    private fun profileVerdictCode(outcome: YggRepository.ProfileApplyOutcome): String =
+        when (outcome) {
+            YggRepository.ProfileApplyOutcome.APPLIED -> "applied"
+            YggRepository.ProfileApplyOutcome.NO_DIALOG -> "no_dialog"
+            YggRepository.ProfileApplyOutcome.KEY_MISMATCH -> "key_mismatch"
+            YggRepository.ProfileApplyOutcome.UNSEALED -> "unsealed"
+            YggRepository.ProfileApplyOutcome.CORRUPT -> "corrupt"
+            YggRepository.ProfileApplyOutcome.OUT_OF_DATE -> "out_of_date"
+        }
+
+    private fun describeProfileOutcome(outcome: YggRepository.ProfileApplyOutcome): String =        when (outcome) {
+            YggRepository.ProfileApplyOutcome.APPLIED ->
+                "Профиль собеседника принят: имя, статус и фото обновлены в его диалоге"
+            YggRepository.ProfileApplyOutcome.NO_DIALOG ->
+                "Профиль пришёл от узла, с которым нет диалога — не применён"
+            YggRepository.ProfileApplyOutcome.KEY_MISMATCH ->
+                "Профиль отклонён: ключ узла не соответствует его адресу в сети"
+            YggRepository.ProfileApplyOutcome.UNSEALED ->
+                "Профиль отклонён: тело не расшифровалось ключом этого устройства"
+            YggRepository.ProfileApplyOutcome.CORRUPT ->
+                "Профиль отклонён: расшифрованное тело не читается"
+            YggRepository.ProfileApplyOutcome.OUT_OF_DATE ->
+                "Профиль старше сохранённого — ничего не изменено"
+        }
+
+    /**
+     * Dialogs this run has already introduced the current profile to. In-RAM on purpose: after a
+     * restart a fresh offer is cheap and it is the profile's version, not this set, that decides
+     * whether the receiver applies anything.
+     */
+    private val profileOfferedChats: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * Offers this device's profile to the dialogs that have a key to seal it under.
+     *
+     * There is no directory of profiles and no way to search the mesh for one, so "отправлен
+     * всем" would be a claim this transport cannot support: the only recipients are peers this
+     * user already writes to. Each one answers with its own ACK, and the banner counts those ACKs
+     * rather than the frames handed to the socket.
+     */
+    private suspend fun broadcastProfileToPeers(announce: Boolean, onlyChatId: String? = null) {
+        val state = _uiState.value
+        val ownerProfile = repository.getAllProfilesNow().find { it.profileId == state.currentProfileId }
+        val senderIpv6 = ownerProfile?.yggIpv6Address ?: state.identity.yggIpv6Address
+        val senderPubKeyHex = ownerProfile?.yggPublicKeyHex ?: state.identity.yggNodePublicKeyHex
+        val dialogs = repository.directDialogsWithSealedKey(state.currentProfileId)
+            .let { all -> if (onlyChatId == null) all else all.filter { it.chatId == onlyChatId } }
+        if (dialogs.isEmpty()) {
+            if (announce && onlyChatId == null) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Профиль сохранён на этом устройстве: ни с кем " +
+                            "нет диалога с ключом собеседника — запечатать не для кого"
+                    )
+                }
+            }
+            return
+        }
+        val results = withContext(Dispatchers.IO) {
+            dialogs.map { conv ->
+                async {
+                    val offer = repository.profileOfferFor(conv.chatId, state.currentProfileId)
+                    if (offer == null) {
+                        ProfileDispatchResult(
+                            delivered = false,
+                            errorDetail = "Профиль не отправлен: у диалога не осталось ключа собеседника"
+                        )
+                    } else {
+                        networkEngine.dispatchProfileFrame(
+                            chatId = conv.chatId,
+                            profileEnvelope = offer.envelope,
+                            profileVersion = offer.version,
+                            peerIpv6 = conv.yggIpv6Address,
+                            directEndpointHint = extractDirectEndpointHint(conv),
+                            senderIpv6 = senderIpv6,
+                            senderPubKeyHex = senderPubKeyHex,
+                            recipientNodePubKeyHex = conv.publicKeyHex,
+                            senderAvatarHash = offer.avatarHashHex,
+                            senderAvatarBase64 = offer.avatarBase64
+                        )
+                    }
+                }
+            }.awaitAll()
+        }
+        val acked = results.count { it.delivered }
+        // The ACK alone does not say the contact's card changed: the receiver answers with its own
+        // verdict, and a frame it refused (no dialog, older version, unreadable body) arrived
+        // without being applied. "Подтвердили" would count those; "приняли" must not.
+        val applied = results.count { it.verdict == "applied" }
+        val refused = results.filter { it.delivered && it.verdict.isNotEmpty() && it.verdict != "applied" }
+        val failure = results.firstOrNull { !it.delivered }?.errorDetail
+        // Remembered per dialog, not globally: an acknowledged offer needs no repeat on the next
+        // message, while an unacknowledged one stays eligible for exactly that retry.
+        dialogs.zip(results).forEach { (conv, result) ->
+            if (result.delivered) profileOfferedChats.add(conv.chatId) else profileOfferedChats.remove(conv.chatId)
+        }
+        android.util.Log.i(
+            "YGG-SEND",
+            "TX -> PRF • подтвердили $acked из ${dialogs.size}, применили $applied" +
+                (refused.firstOrNull()?.let { " • первый отказ: ${it.verdict}" } ?: "") +
+                (failure?.let { " • первая причина доставки: $it" } ?: "")
+        )
+        if (!announce || onlyChatId != null) return
+        _uiState.update {
+            it.copy(
+                statusBannerMessage = when {
+                    applied == dialogs.size -> "Профиль приняли все: $applied"
+                    applied > 0 -> "Профиль приняли $applied из ${dialogs.size}" +
+                        (refused.firstOrNull()?.let { " • ${describeProfileVerdict(it.verdict)}" } ?: "")
+                    acked > 0 && applied == 0 && refused.isNotEmpty() ->
+                        "Кадр дошёл до $acked, но ни один узел его не применил: " +
+                            describeProfileVerdict(refused.first().verdict)
+                    acked > 0 -> "Профиль дошёл до $acked из ${dialogs.size}, но никто из них не ответил, что применил его (узел старше 1.7.6 вердикт не присылает)"
+                    else -> "Профиль сохранён здесь, но ни один собеседник его не подтвердил: " +
+                        (failure ?: "нет подтверждённого маршрута")
+                }
+            )
+        }
+    }
+
+    /** The receiver's refusal, in the user's language, straight from the verdict it sent back. */
+    private fun describeProfileVerdict(verdict: String): String = when (verdict) {
+        "no_dialog" -> "у узла нет диалога с этим контактом"
+        "key_mismatch" -> "ключ узла не сходится с его адресом"
+        "unsealed" -> "тело профиля не расшифровалось"
+        "corrupt" -> "тело профиля не читается"
+        "out_of_date" -> "у узла уже лежит более свежая версия"
+        "duplicate" -> "этот кадр уже был обработан"
+        else -> "вердикт узла: $verdict"
     }
 
     /**
      * Setting the profile picture from the gallery.
      *
-     * Nothing is announced as changed unless the codec produced a file: the avatar travels
-     * inside the message frame, so a picture too large to fit there has no honest delivery
-     * path and must not quietly become a half-cropped one.
+     * Nothing is announced as changed unless the codec produced a file: a picture too large to fit
+     * in a frame must not quietly become a half-cropped one. When it does fit, the avatar goes out
+     * with the profile frame immediately, and the banner reports the ACKs that came back.
      */
     fun setProfileAvatar(source: Uri) {
         viewModelScope.launch {
@@ -5023,9 +5507,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val updated = repository.setProfileAvatar(profileId, source)
             if (updated != null) {
                 applyUserProfileEntityToState(updated)
-                _uiState.update {
-                    it.copy(statusBannerMessage = "Фото профиля обновлено • будет передано при следующем сообщении")
-                }
+                broadcastProfileToPeers(announce = true)
             } else {
                 _uiState.update {
                     it.copy(
@@ -5036,13 +5518,46 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Setting a group's cover from the gallery.
+     *
+     * There is no node to push it to: a group is a roster, so the cover leaves this device on the
+     * next message written into the group, and the banner says so instead of implying the other
+     * members already see it.
+     */
+    fun setGroupAvatar(chatId: String, source: Uri) {
+        viewModelScope.launch {
+            val updated = repository.setGroupAvatar(chatId, source)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (updated != null) {
+                        "Обложка группы сохранена: участники получат её со следующим сообщением в группу"
+                    } else {
+                        "Фото не подходит: нужен файл, из которого получится квадрат до " +
+                            "${YggAvatarCodec.MAX_JPEG_BYTES / 1000} КБ"
+                    }
+                )
+            }
+        }
+    }
+
     fun clearProfileAvatar() {
         viewModelScope.launch {
             val profileId = _uiState.value.currentProfileId
+            val hadAvatar = repository.getAllProfilesNow()
+                .find { it.profileId == profileId }
+                ?.avatarHashHex?.isNotBlank() == true
             repository.clearProfileAvatar(profileId)
             repository.getAllProfilesNow().find { it.profileId == profileId }
                 ?.let { applyUserProfileEntityToState(it) }
-            _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
+            if (hadAvatar) {
+                // A removed picture has to reach peers as a removal: the sealed body now carries
+                // an empty hash, and the higher version is what makes the receiver erase the face
+                // rather than keep showing one the user deleted.
+                broadcastProfileToPeers(announce = true)
+            } else {
+                _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
+            }
         }
     }
 

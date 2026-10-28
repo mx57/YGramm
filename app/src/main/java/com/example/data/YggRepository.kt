@@ -10,6 +10,8 @@ import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
+import com.example.engine.YggProfilePayload
+import com.example.engine.YggVoiceCodec
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
@@ -338,19 +340,31 @@ class YggRepository(
         dao.upsertProfile(existing.copy(relayedPacketsCount = existing.relayedPacketsCount + delta))
     }
 
+    /**
+     * Stamp for the next outgoing profile.
+     *
+     * The receiver only applies a profile newer than the one it stored, so a stamp that does not
+     * strictly increase turns the second edit of a burst into a silent no-op. Wall-clock time ties
+     * inside a millisecond and rolls back when the network corrects the clock; the +1 floor covers
+     * both.
+     */
+    private fun nextProfileVersion(previous: Long): Long =
+        maxOf(System.currentTimeMillis(), previous + 1L)
+
     suspend fun updateCurrentProfileMetadata(
         profileId: String,
         displayName: String,
         handle: String,
         bio: String,
-        statusText: String
+        socialStatus: String
     ): UserProfileEntity? {
         val existing = dao.getProfileById(profileId) ?: return null
         val updated = existing.copy(
             displayName = displayName.trim().ifBlank { existing.displayName },
             handle = handle.trim().ifBlank { existing.handle },
             bio = bio.trim(),
-            statusText = statusText.trim().ifBlank { existing.statusText }
+            socialStatus = socialStatus.trim().ifBlank { existing.socialStatus },
+            profileVersion = nextProfileVersion(existing.profileVersion)
         )
         dao.upsertProfile(updated)
         return updated
@@ -370,7 +384,12 @@ class YggRepository(
         val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
         if (stored.hashHex != existing.avatarHashHex) {
             YggAvatarCodec.forget(context, existing.avatarUri)
-            dao.updateProfileAvatar(profileId, stored.localUri, stored.hashHex)
+            dao.updateProfileAvatar(
+                profileId,
+                stored.localUri,
+                stored.hashHex,
+                nextProfileVersion(existing.profileVersion)
+            )
         }
         return dao.getProfileById(profileId)
     }
@@ -380,13 +399,106 @@ class YggRepository(
         val existing = dao.getProfileById(profileId) ?: return
         if (existing.avatarUri.isBlank() && existing.avatarHashHex.isBlank()) return
         YggAvatarCodec.forget(context, existing.avatarUri)
-        dao.updateProfileAvatar(profileId, "", "")
+        // The new version is what tells peers the picture is gone rather than merely unreached:
+        // a body with an empty hash is a deletion the receiver can order against the last one.
+        dao.updateProfileAvatar(profileId, "", "", nextProfileVersion(existing.profileVersion))
     }
 
     suspend fun profileAvatarBase64(profileId: String): String =
         dao.getProfileById(profileId)?.avatarUri
             ?.let(YggAvatarCodec::base64OfStoredFile)
             .orEmpty()
+
+    /**
+     * What this device did with an incoming PROFILE frame, named apart because each of these
+     * outcomes has to be sayable differently: "не доставлено", "отклонено" and "старая версия"
+     * are not the same event, and only the first is the sender's fault.
+     */
+    enum class ProfileApplyOutcome {
+        APPLIED,
+        NO_DIALOG,
+        KEY_MISMATCH,
+        UNSEALED,
+        CORRUPT,
+        OUT_OF_DATE
+    }
+
+    /**
+     * A contact's own profile applied to the dialog it belongs to.
+     *
+     * Every field arrives inside a conversation envelope sealed to this device, and the frame is
+     * refused unless the sender's node key reproduces the mesh address it claims. That is the whole
+     * security argument: without it, any node able to put one frame on the path could rename
+     * itself as a saved contact or hand over a picture to plant under their face.
+     *
+     * The dialog must already exist. A profile is something peers exchange because they write to
+     * each other; accepting one from a stranger would turn the chat list into an inbox of names
+     * chosen by whoever messages first.
+     */
+    suspend fun applyIncomingProfile(
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        profileEnvelope: String,
+        avatarHashHex: String,
+        avatarBase64: String,
+        recipientProfileId: String = "",
+        currentPrimaryProfileId: String = DEFAULT_PROFILE_ID
+    ): ProfileApplyOutcome {
+        val verifiedSenderKey = senderPubKeyHex.trim().lowercase().takeIf {
+            isEd25519Hex(it) && YggCryptoEngine.addressMatchesEd25519Key(senderIpv6, it)
+        } ?: return ProfileApplyOutcome.KEY_MISMATCH
+
+        val allProfiles = dao.getAllProfilesNow()
+        val ownerProfileId = recipientProfileId.ifBlank { currentPrimaryProfileId }
+        val chatId = findConversationIdByPeerIpv6(senderIpv6, ownerProfileId)
+            ?: return ProfileApplyOutcome.NO_DIALOG
+        val conv = dao.getConversationById(chatId) ?: return ProfileApplyOutcome.NO_DIALOG
+
+        val recipientWords = allProfiles.find { it.profileId == ownerProfileId }
+            ?.mnemonicCsv?.split(" ")?.filter { it.isNotBlank() }.orEmpty()
+        val recipientXPriv = YggCryptoEngine.x25519PrivateKeyFromMnemonic(recipientWords)
+            .takeIf { recipientWords.isNotEmpty() }
+            ?: return ProfileApplyOutcome.UNSEALED
+        val opened = try {
+            YggCryptoEngine.openConversationEnvelope(
+                envelope = profileEnvelope,
+                recipientX25519PrivateKey = recipientXPriv,
+                senderEd25519PublicKeyHex = verifiedSenderKey
+            )
+        } catch (e: Exception) {
+            Log.w("YggGramProfile", "Профиль от $senderIpv6 не распечатан: ${e.javaClass.simpleName}")
+            return ProfileApplyOutcome.UNSEALED
+        }
+        val body = YggProfilePayload.decode(opened.plainText)
+            ?: return ProfileApplyOutcome.CORRUPT
+        if (body.version <= conv.peerProfileVersion) return ProfileApplyOutcome.OUT_OF_DATE
+
+        dao.updatePeerProfile(
+            chatId = chatId,
+            title = body.displayName.ifBlank { conv.title },
+            peerHandle = body.handle,
+            peerStatusText = body.statusText,
+            peerProfileVersion = body.version
+        )
+        // A body that says "no picture" is a removal the receiver can act on: the version already
+        // proved which side of the two states this is, and leaving the old face up would show the
+        // user a picture their contact deleted.
+        if (body.avatarHashHex.isBlank()) {
+            clearIncomingAvatar(chatId)
+        } else if (body.avatarHashHex == avatarHashHex.lowercase()) {
+            storeIncomingAvatar(chatId, avatarHashHex, avatarBase64)
+        }
+        dao.updatePeerLastSeen(chatId, System.currentTimeMillis())
+        return ProfileApplyOutcome.APPLIED
+    }
+
+    private suspend fun clearIncomingAvatar(chatId: String) {
+        val context = appContext ?: return
+        val conv = dao.getConversationById(chatId) ?: return
+        if (conv.avatarUri.isBlank() && conv.avatarHashHex.isBlank()) return
+        YggAvatarCodec.forget(context, conv.avatarUri)
+        dao.updateConversationAvatar(chatId, "", "")
+    }
 
     /**
      * Saving a contact's avatar received over the overlay.
@@ -409,6 +521,50 @@ class YggRepository(
     }
 
     // ── Groups ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * The two pictures a group frame can carry, applied to the two rows they belong to.
+     *
+     * The cover goes on the group; the speaking member's own face goes on that member's
+     * contact dialog. Writing both onto the group row would let any member's selfie
+     * overwrite the picture the group is named by, and the member's own dialog would stay
+     * faceless however many frames they sent.
+     */
+    suspend fun storeIncomingGroupAvatars(
+        groupChatId: String,
+        senderIpv6: String,
+        ownerProfileId: String,
+        groupAvatarHash: String,
+        groupAvatarData: String,
+        senderAvatarHash: String,
+        senderAvatarData: String
+    ) {
+        storeIncomingAvatar(groupChatId, groupAvatarHash, groupAvatarData)
+        val peerChatId = findConversationIdByPeerIpv6(senderIpv6, ownerProfileId) ?: return
+        storeIncomingAvatar(peerChatId, senderAvatarHash, senderAvatarData)
+    }
+
+    /**
+     * Installing a cover picture for a group.
+     *
+     * Any member may set one: a group here is a roster of mesh addresses with no owner and no
+     * server to arbitrate, so whoever's hash arrives last is what every device shows. The new
+     * picture then rides that member's group messages until each other member's node ACKs the
+     * bytes, which is the same gossip the roster itself travels on.
+     *
+     * @return the updated row, or null when the chat is not a group or the picture will not
+     *         fit a frame; the previous cover is kept in that case.
+     */
+    suspend fun setGroupAvatar(chatId: String, source: Uri): ConversationEntity? {
+        val context = appContext ?: return null
+        val existing = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return null
+        val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
+        if (stored.hashHex != existing.avatarHashHex) {
+            YggAvatarCodec.forget(context, existing.avatarUri)
+            dao.updateConversationAvatar(chatId, stored.localUri, stored.hashHex)
+        }
+        return dao.getConversationById(chatId)
+    }
 
     fun observeGroupMembers(chatId: String): Flow<List<GroupMemberEntity>> =
         dao.observeGroupMembers(chatId)
@@ -585,16 +741,30 @@ class YggRepository(
         val msg = dao.getMessageById(messageId) ?: return "" to (0 to 0)
         val members = dao.getGroupMembers(msg.chatId)
         val alreadyDelivered = msg.deliveredMemberCsv.split(',').filter { it.isNotBlank() }
+        val member = matchGroupMember(members, ackSenderKey)
+            ?: return "" to (alreadyDelivered.size to members.size)
+        return member.memberIpv6 to recordGroupMemberDelivery(messageId, member.memberIpv6)
+    }
+
+    /**
+     * The roster entry an ACK author matches: by the node key the overlay session attributed to
+     * them, by a key that reproduces a roster address, or by the mesh address itself when the
+     * transport only reports one.
+     */
+    private fun matchGroupMember(
+        members: List<GroupMemberEntity>,
+        ackSenderKey: String
+    ): GroupMemberEntity? {
         val sender = ackSenderKey.trim().lowercase()
+        if (sender.isBlank()) return null
         val senderAddress = if (sender.contains(':')) YggCryptoEngine.normalizeIpv6Literal(sender) else null
-        val member = members.firstOrNull { stored ->
+        return members.firstOrNull { stored ->
             val byKey = isEd25519Hex(sender) &&
                 (stored.memberPubKeyHex.trim().lowercase() == sender ||
                     YggCryptoEngine.addressMatchesEd25519Key(stored.memberIpv6, sender))
             byKey || (senderAddress != null &&
                 YggCryptoEngine.normalizeIpv6Literal(stored.memberIpv6) == senderAddress)
-        } ?: return "" to (alreadyDelivered.size to members.size)
-        return member.memberIpv6 to recordGroupMemberDelivery(messageId, member.memberIpv6)
+        }
     }
 
     /**
@@ -897,9 +1067,11 @@ class YggRepository(
     }
 
     /**
-     * Records the keys this app actually derives and uses. Message envelopes use static
-     * X25519 ECDH + HKDF-SHA256 + AES-256-GCM; no Double Ratchet, Signed PreKey or MLS
-     * state exists behind these records.
+     * Records the keys this app actually derives and uses. Message envelopes use X25519 ECDH +
+     * HKDF-SHA256 + AES-256-GCM: v2 from the static pair alone, v3 with a fresh per-message
+     * X25519 pair folded in (that one-off private half is never recorded as a key, because it
+     * exists only inside the call that seals and is not needed afterwards). No Double Ratchet,
+     * Signed PreKey or MLS state exists behind these records.
      */
     fun buildHierarchyKeyRecords(
         identity: DerivedIdentityHierarchy,
@@ -927,7 +1099,8 @@ class YggRepository(
             createdAt = now,
             rotationEpoch = 1,
             isActive = true,
-            usageScope = "Статический ECDH для конвертов v2 и медиаключей звонков; без прямой секретности"
+            usageScope = "Статический ECDH для конвертов v2 и одна из двух половин v3; медиаключи звонков. " +
+                "Прямая секретность появляется только в v3, куда к этому DH добавляется одноразовый ключ"
         ),
         CryptoKeyRecordEntity(
             keyId = "key_backup_master",
@@ -1036,12 +1209,109 @@ class YggRepository(
             peerX25519PublicKeyHex = keys.peerX25519PublicKeyHex,
             keyEpoch = 1,
             ratchetStep = ratchetStep,
-            sealedSender = sealedSender
+            sealedSender = sealedSender,
+            // v3 only where the peer has actually shown it can open one — an ACK naming "3",
+            // or a v3 frame from it that this device opened. Everywhere else v2, which both
+            // builds read, so no peer is ever handed a message it cannot decrypt.
+            envelopeVersion = if (conv.peerEnvelopeV3Proven) 3 else 2
         )
+    }
+
+    /**
+     * Records what a delivery ACK said about the envelope versions the peer's build can open.
+     * Only an ACK that really arrived counts: the advertisement comes from the other device
+     * inside the frame this device matched to a message it sent, so nothing here is guessed
+     * from reachability, route state, or the peer having answered anything else.
+     *
+     * @return true when the conversation is now cleared for v3 envelopes.
+     */
+    suspend fun rememberPeerEnvelopeVersions(
+        chatId: String,
+        ackSenderKey: String,
+        advertisedCsv: String
+    ): Boolean = rememberPeerCapabilities(chatId, ackSenderKey, advertisedCsv, "")
+
+    /**
+     * What the peer itself said it can do, learned from a frame addressed to this device: which
+     * envelope versions it opens and which voice codecs it carries. Both are evidence, both are
+     * one-way flags, and neither is a preference the app is allowed to assume.
+     */
+    suspend fun rememberPeerCapabilities(
+        chatId: String,
+        ackSenderKey: String,
+        acceptedEnvelopeVersions: String,
+        voiceCodecsCsv: String
+    ): Boolean {
+        val provesEnvelope = YggCryptoEngine.peerAcceptsEnvelopeVersion(acceptedEnvelopeVersions, 3)
+        val provesVoice = YggVoiceCodec.advertises(voiceCodecsCsv)
+        if (!provesEnvelope && !provesVoice) return false
+        val conv = dao.getConversationById(chatId) ?: return false
+        // A group message is acknowledged by one member, and it is that member's personal dialog
+        // row — the one the fan-out seals against — that has to carry the proof.
+        val target = if (conv.chatType == "GROUP") {
+            val member = matchGroupMember(dao.getGroupMembers(conv.chatId), ackSenderKey) ?: return false
+            dao.getAllConversationsNow().firstOrNull {
+                it.ownerProfileId == conv.ownerProfileId &&
+                    it.chatType != "GROUP" &&
+                    !isSelfChatId(it.chatId) &&
+                    sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+            }
+        } else {
+            conv.takeUnless { isSelfChatId(it.chatId) }
+        } ?: return false
+        val updated = target.copy(
+            peerEnvelopeV3Proven = target.peerEnvelopeV3Proven || provesEnvelope,
+            peerVoiceOpusProven = target.peerVoiceOpusProven || provesVoice
+        )
+        if (updated == target) return true
+        dao.upsertConversation(updated)
+        return true
     }
 
     suspend fun conversationHasEndToEndKey(chatId: String): Boolean =
         dao.getConversationById(chatId)?.let { resolveSealingKeys(it) != null } ?: false
+
+    /**
+     * Everything one PROFILE frame needs for one dialog: the body sealed to that peer's key,
+     * the version stamped on the last edit, and the picture the hash refers to.
+     *
+     * Returns null when the chat has no key to seal under. There is no unsealed form of this
+     * frame — a profile that anybody could write is not a profile, it is a way for a stranger to
+     * pick the name shown in the user's chat list.
+     */
+    suspend fun profileOfferFor(
+        chatId: String,
+        profileId: String
+    ): ProfileOffer? {
+        val conv = dao.getConversationById(chatId) ?: return null
+        val profile = dao.getProfileById(profileId) ?: return null
+        if (profile.profileVersion <= 0L) return null
+        val plain = YggProfilePayload.encode(
+            YggProfilePayload.ProfileBody(
+                displayName = profile.displayName,
+                handle = profile.handle,
+                statusText = profile.socialStatus,
+                avatarHashHex = profile.avatarHashHex,
+                version = profile.profileVersion
+            )
+        )
+        val envelope = sealForConversation(conv, plain) ?: return null
+        return ProfileOffer(
+            envelope = envelope,
+            version = profile.profileVersion,
+            avatarHashHex = profile.avatarHashHex,
+            avatarBase64 = YggAvatarCodec.base64OfStoredFile(profile.avatarUri).orEmpty()
+        )
+    }
+
+    suspend fun directDialogsWithSealedKey(ownerProfileId: String): List<ConversationEntity> =
+        dao.getAllConversationsNow().filter {
+            it.ownerProfileId == ownerProfileId &&
+                !isSelfChatId(it.chatId) &&
+                it.chatType != "GROUP" &&
+                it.yggIpv6Address.isNotBlank() &&
+                resolveSealingKeys(it) != null
+        }
 
     suspend fun sendEncryptedMessage(
         chatId: String,
@@ -1108,7 +1378,9 @@ class YggRepository(
             reactionsJson = "",
             replyToMessageId = replyToMessageId,
             forwardedFrom = forwardedFrom,
-            envelopeVersion = 2
+            // Read back out of the frame that was actually produced, so the ledger cannot
+            // claim a version this message is not sealed under.
+            envelopeVersion = YggCryptoEngine.envelopeVersionOf(cipherHex)
         )
         dao.insertMessage(message)
 
@@ -1716,6 +1988,12 @@ class YggRepository(
         }
     }
 
+    /**
+     * Records what a route check found. This is reachability of the node's TCP port on the
+     * overlay — nothing more, and in particular nothing about a person: a node answers while
+     * the phone is in a pocket. Presence has one source only, [peerLastSeenAt] on the row,
+     * and this method never touches it.
+     */
     suspend fun updateConversationRouteStatus(chatId: String, isOnline: Boolean, routeSummary: String) {
         val conv = dao.getConversationById(chatId) ?: return
         dao.upsertConversation(
@@ -1806,6 +2084,7 @@ class YggRepository(
         var resolvedPlainText = ""
         var authenticatedSenderX25519Pub = ""
         var resolvedEnvelopeVersion = 1
+        var envelopeOpened = false
         if (recipientXPriv != null && packet.cipherPayloadHex.isNotBlank()) {
             try {
                 val opened = YggCryptoEngine.openConversationEnvelope(
@@ -1816,6 +2095,7 @@ class YggRepository(
                 resolvedPlainText = opened.plainText
                 authenticatedSenderX25519Pub = opened.senderX25519PublicKeyHex
                 resolvedEnvelopeVersion = opened.version
+                envelopeOpened = true
             } catch (e: Exception) {
                 // Envelope did not verify under this profile's key; fall back to legacy text below.
                 Log.w(
@@ -2003,7 +2283,35 @@ class YggRepository(
                 lastMessagePreview = "$previewPrefix$firstLine".trim(),
                 lastTimestamp = packet.timestamp,
                 unreadCount = if (isCurrentlyViewing) 0 else conv.unreadCount + 1,
-                isOnlineInMesh = true
+                isOnlineInMesh = true,
+                // An envelope this device opened is the only presence evidence there is: the
+                // bytes arrived and the AEAD verified under this profile's key. A route check
+                // says the node answers TCP, not that anyone is there — so it stays away from
+                // this stamp, and a group chat never gets one because the frame proves only
+                // that some member wrote, not which one.
+                peerLastSeenAt = if (envelopeOpened && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId)) {
+                    System.currentTimeMillis()
+                } else {
+                    conv.peerLastSeenAt
+                },
+                // A v3 frame this device opened is direct evidence about the sender's build:
+                // only a device that can read v3 could have produced one. That is what unlocks
+                // writing v3 back to it. A group frame proves only that some member wrote it,
+                // so the flag travels through the member's own dialog instead, from their ACK.
+                peerEnvelopeV3Proven = conv.peerEnvelopeV3Proven ||
+                    (resolvedEnvelopeVersion == 3 && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId)),
+                // A YGO1 payload this device read off the disk is stronger evidence than the
+                // sender's claim field: only a build that found both an Opus encoder and a decoder
+                // in its codec list could have written those bytes, and that is exactly what our
+                // own send rule requires. So compressing back to this peer is not a guess.
+                // A group frame is excluded for the same reason as the envelope flag — it proves
+                // only that some member wrote it, and the member's own dialog gets the proof
+                // through their ACK.
+                peerVoiceOpusProven = conv.peerVoiceOpusProven ||
+                    (packet.attachmentType == "VOICE" &&
+                        YggAudioMediaEngine.voiceCodecOf(resolvedAttachmentUri) == YggVoiceCodec.NAME_OPUS &&
+                        conv.chatType != "GROUP" &&
+                        !isSelfChatId(conv.chatId))
             )
         )
         return conv.chatId
@@ -2394,32 +2702,37 @@ class YggRepository(
         dao.upsertLinkedDevice(dev)
     }
 
-    suspend fun createBackupSnapshot(
-        passphrase: String,
-        isWebDavCloud: Boolean
-    ): BackupSnapshotEntity {
-        val convCount = dao.countConversations()
-        val keysCount = dao.getCryptoKeysNow().size
-        val bundle = YggCryptoEngine.buildEncryptedBackupContainer(
-            passphrase = passphrase,
-            conversationsCount = convCount,
-            messagesCount = 0,
-            keysCount = keysCount,
-            isWebDavCloud = isWebDavCloud
-        )
+    /**
+     * Records an export that already happened on disk. The numbers come from the archive bytes,
+     * never from row counts, and isVerified is only true when the read-back archive hashed the
+     * same as the database file.
+     */
+    suspend fun recordDatabaseExport(profile: YggEncryptedExport.ArchiveProfile): BackupSnapshotEntity {
         val entity = BackupSnapshotEntity(
             snapshotId = "bak_${UUID.randomUUID().toString().take(8)}",
-            archiveFileName = bundle.archiveFileName,
+            archiveFileName = profile.archiveFileName,
             createdAt = System.currentTimeMillis(),
-            sizeBytes = bundle.payloadSizeBytes,
-            chunkCountFastCdc = bundle.fastCdcChunks,
-            kdfSpec = bundle.kdfSummary,
-            cipherSpec = bundle.cipherSummary,
-            merkleRootHex = bundle.merkleRootSha256,
-            destination = if (isWebDavCloud) "WEBDAV_CLOUD_ZERO_KNOWLEDGE" else "LOCAL_ENCRYPTED_CONTAINER",
-            isVerified = true
+            sizeBytes = profile.sizeBytes,
+            chunkCountFastCdc = profile.pieceCount,
+            kdfSpec = profile.keySpec,
+            cipherSpec = profile.cipherSpec,
+            merkleRootHex = profile.merkleRootHex,
+            destination = "SQLCIPHER_DB_FILE_COPY",
+            isVerified = profile.verified
         )
         dao.upsertBackupSnapshot(entity)
         return entity
     }
+
+    suspend fun recordSnapshotCheck(snapshot: BackupSnapshotEntity, verified: Boolean) {
+        dao.upsertBackupSnapshot(snapshot.copy(isVerified = verified))
+    }
 }
+
+/** One peer's copy of this device's profile, ready to go on the wire as a PROFILE frame. */
+data class ProfileOffer(
+    val envelope: String,
+    val version: Long,
+    val avatarHashHex: String,
+    val avatarBase64: String
+)

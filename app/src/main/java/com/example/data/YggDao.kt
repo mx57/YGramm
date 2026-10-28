@@ -95,11 +95,38 @@ interface YggDao {
     )
     suspend fun updateConversationAvatar(chatId: String, avatarUri: String, avatarHashHex: String)
 
+    // Same reason as the avatar update above: an incoming profile frame has to rename the
+    // dialog without re-saving the row, because the re-save path rebuilds the conversation from
+    // a copy and drops whatever the writer never looked at.
     @Query(
-        "UPDATE ygg_profiles SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex " +
-            "WHERE profileId = :profileId"
+        "UPDATE conversations SET title = :title, peerHandle = :peerHandle, " +
+            "peerStatusText = :peerStatusText, peerProfileVersion = :peerProfileVersion " +
+            "WHERE chatId = :chatId"
     )
-    suspend fun updateProfileAvatar(profileId: String, avatarUri: String, avatarHashHex: String)
+    suspend fun updatePeerProfile(
+        chatId: String,
+        title: String,
+        peerHandle: String,
+        peerStatusText: String,
+        peerProfileVersion: Long
+    )
+
+    // A timestamp of the last frame this device actually opened. Deliberately its own partial
+    // UPDATE: it moves on every incoming message, and rewriting the whole row for that would
+    // wipe fields another writer owns.
+    @Query("UPDATE conversations SET peerLastSeenAt = :timestamp WHERE chatId = :chatId")
+    suspend fun updatePeerLastSeen(chatId: String, timestamp: Long)
+
+    @Query(
+        "UPDATE ygg_profiles SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex, " +
+            "profileVersion = :profileVersion WHERE profileId = :profileId"
+    )
+    suspend fun updateProfileAvatar(
+        profileId: String,
+        avatarUri: String,
+        avatarHashHex: String,
+        profileVersion: Long
+    )
 
     // Group membership is keyed by the member's mesh address, which is the only form of
     // identity both sides of the wire agree on. REPLACE makes roster merging idempotent:

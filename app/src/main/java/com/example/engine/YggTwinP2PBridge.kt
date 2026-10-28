@@ -6,6 +6,10 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.Settings
 import com.example.data.UserProfileEntity
+import com.example.update.ApkRelayRequest
+import com.example.update.YGrammPeerRelay
+import com.example.update.YGrammRelayDecision
+import com.example.update.YGrammUpdateCodec
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -70,6 +74,10 @@ data class IncomingTwinPacket(
     val streamedAttachmentRoot: String = "",
     val voiceDurationSec: Int = 0,
     val voiceWaveformCsv: String? = null,
+    // "opus" when the voice payload is a YGO1 container, empty when it is the WAV the app
+    // wrote before any codec existed. The receiver plays what the bytes say; this is only the
+    // claim the sender made, which is what proves the sender's own codec to the other side.
+    val voiceCodec: String = "",
     // Wire id of the message this one quotes, and the original author for forwards.
     val replyToMessageId: String = "",
     val forwardedFrom: String = "",
@@ -78,6 +86,11 @@ data class IncomingTwinPacket(
     // data is only present on the first message after the sender changes it.
     val senderAvatarHash: String = "",
     val senderAvatarData: String = "",
+    // The group's own picture. It rides the same frames as the roster because a group has no
+    // server to hold its cover: any member can change it, and the others learn the new one from
+    // the next message they receive.
+    val groupAvatarHash: String = "",
+    val groupAvatarData: String = "",
     // Group identity and roster, advertised by every group message. A member learns who
     // else is in the group from the messages themselves, so a group needs no separate
     // sync channel and no server: one frame from any member is enough to rebuild it.
@@ -124,6 +137,41 @@ data class DeleteDispatchResult(
     val transport: String = "",
     val rttMs: Long = -1L,
     val errorDetail: String? = null
+)
+
+/**
+ * A peer's account of itself, arriving as one sealed conversation envelope.
+ *
+ * [profileEnvelope] is the ciphertext; the fields inside it are only read after this device's own
+ * key opens it, which is what separates a contact's name from a stranger's claim about one.
+ * The avatar bytes ride beside the envelope unencrypted, exactly as they do on a message frame,
+ * and the hash that authorises them lives inside the sealed body.
+ */
+data class IncomingProfilePacket(
+    val chatId: String,
+    val senderIpv6: String,
+    val senderPubKeyHex: String,
+    val recipientProfileId: String,
+    val profileEnvelope: String,
+    val senderAvatarHash: String,
+    val senderAvatarData: String,
+    val rttMs: Long
+)
+
+data class ProfileDispatchResult(
+    val delivered: Boolean,
+    val transport: String = "",
+    val rttMs: Long = -1L,
+    val errorDetail: String? = null,
+    /**
+     * What the receiving node did with the frame, as it said in its own ACK: `applied`, a refusal
+     * code, or empty from an older node that ACKs without a verdict.
+     *
+     * The transport ACK alone cannot say the contact's card changed - the receiver may have had no
+     * dialog to write into, or opened a body older than what it stores - and counting that as
+     * "confirmed" would be a delivery claim with nothing behind it.
+     */
+    val verdict: String = ""
 )
 
 /**
@@ -293,13 +341,19 @@ data class DiscoveredLanNode(
 class YggTwinP2PBridge(
     private val context: Context? = null,
     private val onPacketReceived: suspend (IncomingTwinPacket) -> Unit,
-    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long, ackSenderPubKeyHex: String) -> Unit,
+    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long, ackSenderPubKeyHex: String, acceptedEnvelopeVersions: String) -> Unit,
     private val onDeliveryAckTimeout: suspend (chatId: String, messageId: String, attempts: Int) -> Unit = { _, _, _ -> },
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
     private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {},
     private val onDeleteForEveryoneReceived: suspend (IncomingDeletePacket) -> Unit = {},
+    /**
+     * A peer rewrote its own name, handle, status or picture; the repository decides if it sticks.
+     * The returned string is that decision, echoed back to the sender in the ACK, because "the
+     * frame arrived" and "the contact's card changed" are two different claims.
+     */
+    private val onProfileReceived: suspend (IncomingProfilePacket) -> String = { "" },
     /**
      * Gives the AEAD key for one streamed file transfer: the repository derives it from the
      * conversation's pinned peer X25519 key and the local profile's own private key, so a piece
@@ -317,7 +371,19 @@ class YggTwinP2PBridge(
     private val onTypingReceived: suspend (chatId: String, senderNodeLabel: String, senderIpv6: String) -> Unit = { _, _, _ -> },
     private val onIncomingCallSignalReceived: suspend (IncomingCallSignalPacket) -> Unit = {},
     private val onCallAudioFrameReceived: suspend (IncomingCallAudioPacket) -> Unit = {},
-    private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> }
+    private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> },
+    /**
+     * What the peer's own ACK said about its voice codec. Unknown means "never proven", which is
+     * the same as "send PCM": a note the other side cannot open is not a smaller note.
+     */
+    private val onPeerVoiceCodecsReceived: suspend (chatId: String, ackSenderPubKeyHex: String, voiceCodecsCsv: String) -> Unit = { _, _, _ -> },
+    /**
+     * A peer finished carrying a release APK that this device asked for. `localPath` is the file
+     * on disk, or null when the stream was dropped; the updater — not this bridge — decides
+     * whether the bytes are the release, because the anchors live in its records.
+     */
+    private val onApkRelayOutcome: suspend (transferId: String, localPath: String?, refusalReason: String) -> Unit = { _, _, _ -> },
+    private val onApkRelayProgress: suspend (transferId: String, doneBytes: Long, totalBytes: Long) -> Unit = { _, _, _ -> }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
@@ -340,6 +406,10 @@ class YggTwinP2PBridge(
 
     var localTcpPort: Int = 51921
         private set
+
+    // The name this node signs its own frames with. The ViewModel sets it once from the stored
+    // profile; a relay reply has to carry something other than a bare key hash.
+    var localProfileLabel: String = "Мой узел Yggdrasil"
 
     val localUdpPort: Int
         get() = localTcpPort
@@ -382,6 +452,15 @@ class YggTwinP2PBridge(
     private val outgoingStreamVerified = ConcurrentHashMap<String, Boolean>()
     private val outgoingStreamRefusal = ConcurrentHashMap<String, String>()
     private val streamAckWaiters = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Int>>()
+
+    // APK relay. Outbound orders are keyed by the transfer id this device invented: an incoming
+    // APK stream is opened only for an id that appears here, so no node can push an installer into
+    // this device's update folder without being asked. The sha of a served file is cached per
+    // (path, size, mtime) because hashing tens of megabytes on every request would be pointless.
+    private val apkRelayOrders = ConcurrentHashMap<String, Long>()
+    private val apkRelayAckWaiters =
+        ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>>()
+    private val servedApkShaCache = ConcurrentHashMap<String, Triple<Long, Long, String>>()
 
     private data class CallMediaSession(
         val callId: String,
@@ -886,22 +965,42 @@ class YggTwinP2PBridge(
     /**
      * Avatar advertisement bookkeeping.
      *
-     * [advertisedAvatarHashes] holds, per chat, the last picture the recipient has been
+     * [advertisedAvatarHashes] holds, per recipient, the last picture that peer has been
      * CONFIRMED to hold — an ACK, nothing less. Until that confirmation arrives every
-     * message to the chat repeats the bytes, so a torn or undelivered frame cannot leave
-     * a contact permanently faceless. [pendingAvatarAdverts] maps an in-flight message to
-     * what it carried, so whichever transport finally returns the ACK can record it.
+     * message repeats the bytes, so a torn or undelivered frame cannot leave a contact
+     * permanently faceless. [pendingAvatarAdverts] maps an in-flight message to everything
+     * it carried, so whichever transport finally returns the ACK can record all of it.
+     *
+     * The key names the recipient rather than the chat, because a group fan-out writes the
+     * same chat row for every member: keyed by chat, the first member to ACK would silence
+     * the picture for all the others, and they would store a hash with no bytes to match it.
      */
     private val advertisedAvatarHashes = ConcurrentHashMap<String, String>()
-    private val pendingAvatarAdverts = ConcurrentHashMap<String, Pair<String, String>>()
+    private val pendingAvatarAdverts = ConcurrentHashMap<String, List<Pair<String, String>>>()
+
+    private fun avatarAdvertKey(chatId: String, peerIpv6: String, group: Boolean = false): String =
+        (if (group) "group:" else "peer:") + chatId + "|" + peerIpv6.trim().lowercase()
+
+    /**
+     * The voice codecs this device can actually run, as advertised in an ACK. A system without an
+     * Opus encoder advertises nothing, and then the peer keeps sending the WAV it always sent.
+     */
+    private fun voiceCodecAdvert(): String =
+        if (YggVoiceCodec.capability().canEncodeOpus) YggVoiceCodec.NAME_OPUS else ""
+
+    private suspend fun reportPeerVoiceCodecs(chatId: String, ackSenderKey: String, ackFrame: Map<String, String>) {
+        val advertised = ackFrame["voiceCodecs"].orEmpty()
+        if (advertised.isBlank()) return
+        onPeerVoiceCodecsReceived(chatId, ackSenderKey, advertised)
+    }
 
     /**
      * Base64url of a JPEG capped at [YggAvatarCodec.MAX_JPEG_BYTES], plus the frame's own
      * overhead. Anything longer did not come from this codec and is dropped before it can
      * displace the message it rode in on.
      */
-    private fun avatarDataOf(frame: Map<String, String>): String =
-        frame["senderAvatarData"].orEmpty().takeIf {
+    private fun avatarDataOf(frame: Map<String, String>, field: String = "senderAvatarData"): String =
+        frame[field].orEmpty().takeIf {
             it.length <= YggAvatarCodec.MAX_JPEG_BYTES * 2 && it.all { c -> c.isLetterOrDigit() || c == '-' || c == '_' }
         }.orEmpty()
 
@@ -929,8 +1028,8 @@ class YggTwinP2PBridge(
             .orEmpty()
 
     private fun markAvatarAdvertised(messageId: String) {
-        pendingAvatarAdverts.remove(messageId)?.let { (chatId, hash) ->
-            advertisedAvatarHashes[chatId] = hash
+        pendingAvatarAdverts.remove(messageId)?.forEach { (advertKey, hash) ->
+            advertisedAvatarHashes[advertKey] = hash
         }
     }
     // Reaction ACKs must never be confused with message ACKs: a reaction frame carries
@@ -940,6 +1039,11 @@ class YggTwinP2PBridge(
     // A delete is keyed by its own event id, exactly like a reaction: the ACK for a delete of
     // message X must not be read as the delivery ACK of message X.
     private val pendingDeleteAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
+    // A profile refresh is keyed by the sender's own version stamp: the ACK that comes back for
+    // profile version N must not be read as the delivery ACK of a message that happens to share
+    // an id, and must not complete a different version's waiter either.
+    private val pendingProfileAcks =
+        ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Pair<Long, String>>>()
     private val profileIdToPubKeyMap = ConcurrentHashMap<String, String>() // profileId -> Ed25519 node pubkey hex
     private val pubKeyToProfileIdMap = ConcurrentHashMap<String, String>() // Ed25519 node pubkey hex -> profileId
     // What the running node reported about itself, kept across profile syncs: the stored
@@ -1893,6 +1997,9 @@ class YggTwinP2PBridge(
 
     private fun pruneFileStreams() {
         val cutoff = System.currentTimeMillis() - FILE_STREAM_TTL_MS
+        apkRelayOrders.entries.toList().forEach { entry ->
+            if (entry.value < cutoff) apkRelayOrders.remove(entry.key)
+        }
         incomingFileStreams.entries.toList().forEach { entry ->
             if (entry.value.startedAtMs < cutoff) {
                 incomingFileStreams.remove(entry.key)
@@ -1928,6 +2035,28 @@ class YggTwinP2PBridge(
         val pieceCount = map["pieceCount"]?.toIntOrNull() ?: 0
         val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
         pruneFileStreams()
+
+        // An installer is the one file kind this device never accepts unasked: the stream is
+        // opened only for a transfer id this device itself put into a request frame.
+        if (map["attachmentType"] == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE &&
+            !apkRelayOrders.containsKey(transferId)
+        ) {
+            reply(
+                streamAckFrame(
+                    "refused",
+                    transferId,
+                    0,
+                    sentAt,
+                    refusalReason = "этот APK-поток устройство не запрашивало"
+                )
+            )
+            logPacket(
+                direction = "ERR • RELAY",
+                summary = "Входящий поток APK отклонён: запроса на него не было",
+                details = "transferId=${transferId.take(12)} • узел $senderPubKeyHex"
+            )
+            return
+        }
 
         val existing = incomingFileStreams[transferId]
         if (existing != null && existing.declaredRoot == declaredRoot && existing.totalBytes == totalBytes) {
@@ -2142,20 +2271,26 @@ class YggTwinP2PBridge(
         if (reportPrefix) {
             val doneBytes = stream.writtenBytes
             val elapsed = System.currentTimeMillis() - stream.startedAtMs
-            scope.launch {
-                onFileTransferProgress(
-                    FileTransferProgress(
-                        chatId = stream.chatId,
-                        transferId = transferId,
-                        fileName = stream.fileName,
-                        doneBytes = doneBytes,
-                        totalBytes = stream.totalBytes,
-                        elapsedMs = elapsed,
-                        merkleRootHex = stream.declaredRoot,
-                        isOutgoing = false,
-                        state = "STREAMING"
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                // A relay is not a chat attachment: it must not create a message or a transfer
+                // row, only move the updater's own progress line.
+                onApkRelayProgress(transferId, doneBytes, stream.totalBytes)
+            } else {
+                scope.launch {
+                    onFileTransferProgress(
+                        FileTransferProgress(
+                            chatId = stream.chatId,
+                            transferId = transferId,
+                            fileName = stream.fileName,
+                            doneBytes = doneBytes,
+                            totalBytes = stream.totalBytes,
+                            elapsedMs = elapsed,
+                            merkleRootHex = stream.declaredRoot,
+                            isOutgoing = false,
+                            state = "STREAMING"
+                        )
                     )
-                )
+                }
             }
         }
     }
@@ -2191,6 +2326,15 @@ class YggTwinP2PBridge(
             incomingFileStreams.remove(transferId)
             stream.partFile.delete()
             reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                apkRelayOrders.remove(transferId)
+                onApkRelayOutcome(
+                    transferId,
+                    null,
+                    "пира не устроил целый файл: кусков собрано ${orderedDigests.size} из ${stream.pieceCount}"
+                )
+                return
+            }
             val failedBytes = stream.writtenBytes
             val totalBytesForReport = stream.totalBytes
             val root = stream.declaredRoot
@@ -2219,6 +2363,25 @@ class YggTwinP2PBridge(
         incomingFileStreams.remove(transferId)
         if (!moved) {
             reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                apkRelayOrders.remove(transferId)
+                onApkRelayOutcome(transferId, null, "собранный файл не удалось записать на диск")
+            }
+            return
+        }
+        if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+            // Transport integrity proved the pieces match what the peer sent - nothing more.
+            // Whether those pieces are the release is the updater's call, made against this
+            // device's own manifest and the pinned signing key.
+            apkRelayOrders.remove(transferId)
+            reply(streamAckFrame("done", transferId, stream.pieceCount, sentAt, true))
+            logPacket(
+                direction = "RX <- RELAY",
+                summary = "Файл обновления доехал через пира: ${finalFile.name}",
+                details = "${stream.totalBytes / (1024 * 1024)} МБ • ${stream.pieceCount} кусков • " +
+                    "проверка по локальному манифесту впереди"
+            )
+            onApkRelayOutcome(transferId, finalFile.absolutePath, "")
             return
         }
         val uri = android.net.Uri.fromFile(finalFile).toString()
@@ -2257,6 +2420,284 @@ class YggTwinP2PBridge(
         return completedFileStreams[transferId]
     }
 
+    /**
+     * Asks one known peer to carry the release APK this device's own manifest describes. The
+     * answer only says whether the peer will start streaming; the bytes that follow travel as an
+     * ordinary piece stream and are judged by the updater, never here.
+     */
+    suspend fun requestApkRelay(
+        request: ApkRelayRequest,
+        peerIpv6: String,
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        recipientNodePubKeyHex: String
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()] ?: ""
+        if (senderProfileId.isBlank() || !initializedNativeProfiles.contains(senderProfileId)) {
+            return@withContext false to "нода этого профиля не запущена — запрос некуда отправить"
+        }
+        val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
+        if (recipientKeyHex.isBlank()) {
+            return@withContext false to "неизвестен Ed25519-ключ собеседника: кадр нечем запечатать"
+        }
+        if (!isRealNetworkAvailable()) return@withContext false to "интернета нет — оверлей не отправляет кадры"
+        val livePeers = awaitLivePeer(senderProfileId, waitMs = 6000L)
+        if (livePeers <= 0) return@withContext false to "у ноды нет живых пиров: запрос не ушёл в сеть"
+
+        val frame = encodeWireFrame(
+            YGrammPeerRelay.requestFields(request) + mapOf(
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "recipientIpv6" to peerIpv6,
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+        val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>()
+        apkRelayAckWaiters[request.transferId] = deferred
+        apkRelayOrders[request.transferId] = System.currentTimeMillis()
+        var sendAttempted = false
+        for (attempt in 1..2) {
+            if (!sendOverlayFrame(senderProfileId, recipientKeyHex, frame, "APKREQ")) break
+            sendAttempted = true
+            val answer = kotlinx.coroutines.withTimeoutOrNull(
+                streamAckTimeout(FILE_PIECE_ACK_TIMEOUT_MS * 2)
+            ) { deferred.await() }
+            if (answer != null) {
+                apkRelayAckWaiters.remove(request.transferId, deferred)
+                logPacket(
+                    direction = if (answer.first) "ACK <- YGG" else "ERR • RELAY",
+                    summary = if (answer.first) {
+                        "Собеседник подтвердил, что начнёт передачу APK"
+                    } else {
+                        "Собеседник отказал в передаче APK: ${answer.second}"
+                    },
+                    details = "${request.apkAssetName} • sha256 ${request.sha256Hex.take(16)}… • " +
+                        "transferId=${request.transferId.take(12)} • узел $peerIpv6"
+                )
+                return@withContext answer
+            }
+        }
+        apkRelayAckWaiters.remove(request.transferId, deferred)
+        if (!sendAttempted) {
+            apkRelayOrders.remove(request.transferId)
+            return@withContext false to "оверлей отклонил кадр запроса"
+        }
+        apkRelayOrders.remove(request.transferId)
+        false to "собеседник молчит: ответа на запрос нет. Либо у него сборка, которая не знает " +
+            "этого кадра, либо до него не доходят кадры"
+    }
+
+    /** Cancels an order so pieces that are still travelling are refused instead of assembled. */
+    fun forgetApkRelayOrder(transferId: String) {
+        if (transferId.isNotBlank()) apkRelayOrders.remove(transferId)
+    }
+
+    /**
+     * The file this device is willing to hand over: a release APK it downloaded and verified
+     * itself, with the digest cached per (size, mtime). Null means there is nothing to share;
+     * a null digest inside a non-null pair means the file exists but cannot be read to the end.
+     */
+    private suspend fun verifiedApkHeldHere(
+        apkAssetName: String
+    ): Pair<File, String?>? = withContext(Dispatchers.IO) {
+        val storage = context ?: return@withContext null
+        val file = File(storage.filesDir, "update").let { dir -> File(dir, apkAssetName) }
+        if (!file.isFile || file.length() <= 0L) return@withContext null
+        val size = file.length()
+        val modified = file.lastModified()
+        servedApkShaCache[file.absolutePath]?.let { cached ->
+            if (cached.first == size && cached.second == modified) return@withContext file to cached.third
+        }
+        val digest = try {
+            YGrammUpdateCodec.sha256HexOfFile(file)
+        } catch (_: Throwable) {
+            null
+        }
+        if (digest != null) servedApkShaCache[file.absolutePath] = Triple(size, modified, digest)
+        file to digest
+    }
+
+    private suspend fun handleApkRelayRequest(
+        profileId: String,
+        senderPubKeyHex: String,
+        map: Map<String, String>,
+        reply: (String) -> Unit
+    ) {
+        val transferId = map["transferId"]?.trim().orEmpty()
+        // Without an id the answer has nowhere to go, so the request is dropped in silence: the
+        // sender never made one up that this device could echo back.
+        if (transferId.isBlank()) return
+        val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
+        val requesterIpv6 = map["senderIpv6"].orEmpty()
+        val request = YGrammPeerRelay.parseRequest(map)
+        val storage = context
+        val offerEnabled = storage?.getSharedPreferences("ygggram_ui_prefs", Context.MODE_PRIVATE)
+            ?.getBoolean(YGrammPeerRelay.PREF_OFFER_ENABLED, false) == true
+        // The dialog is checked before the file is hashed: a stranger cannot make this device read
+        // tens of megabytes, and a piece stream without a local dialog could not be verified anyway.
+        val dialogChatId = if (offerEnabled && request != null) {
+            resolveIncomingDialogChatId(profileId, senderPubKeyHex, requesterIpv6)
+        } else {
+            null
+        }
+        val held = if (dialogChatId != null && request != null) {
+            verifiedApkHeldHere(request.apkAssetName)
+        } else {
+            null
+        }
+        val decision = YGrammPeerRelay.decideServe(
+            request = request,
+            offerEnabled = offerEnabled,
+            hasDialogWithRequester = !dialogChatId.isNullOrBlank(),
+            heldFile = held?.first,
+            heldFileSha256Hex = held?.second
+        )
+        val identity = mapOf(
+            "sentAt" to sentAt,
+            "senderIpv6" to (ipv6ToProfileIdMap.entries.firstOrNull { it.value == profileId }?.key ?: ""),
+            "senderPubKeyHex" to profileIdToPubKeyMap[profileId].orEmpty()
+        )
+        if (decision is YGrammRelayDecision.Refuse) {
+            reply(
+                encodeWireFrame(
+                    YGrammPeerRelay.replyFields(transferId, serving = false, decision.reason) + identity
+                )
+            )
+            logPacket(
+                direction = "ERR • RELAY",
+                summary = "Запрос на APK отклонён: ${decision.reason}",
+                details = "transferId=${transferId.take(12)} • узел $requesterIpv6"
+            )
+            return
+        }
+        val file = held?.first ?: return
+        reply(encodeWireFrame(YGrammPeerRelay.replyFields(transferId, serving = true) + identity))
+        logPacket(
+            direction = "TX -> STREAM",
+            summary = "Собеседнику передан файл обновления: ${file.name}",
+            details = "${file.length() / (1024 * 1024)} МБ • sha256 ${held.second?.take(16)}… • " +
+                "проситель $requesterIpv6 • диалог ${dialogChatId?.take(16)}…"
+        )
+        val localIpv6 = identity["senderIpv6"].orEmpty()
+        val localKeyHex = profileIdToPubKeyMap[profileId].orEmpty()
+        val chatId = dialogChatId.orEmpty()
+        scope.launch {
+            streamFileOverOverlay(
+                senderProfileId = profileId,
+                recipientKeyHex = senderPubKeyHex.trim().lowercase(),
+                transferId = transferId,
+                chatId = chatId,
+                sourceFile = file,
+                attachmentName = file.name,
+                attachmentType = YGrammPeerRelay.RELAY_ATTACHMENT_TYPE,
+                peerIpv6 = requesterIpv6,
+                senderIpv6 = localIpv6,
+                senderPubKeyHex = localKeyHex,
+                senderNodeLabel = localProfileLabel
+            ) { frame, kind -> sendOverlayFrame(profileId, senderPubKeyHex, frame, kind) }
+        }
+    }
+
+    /**
+     * Handles one PROFILE frame from either transport.
+     *
+     * Both paths must reach the same decision: refuse what this device cannot authenticate,
+     * hand the sealed body to the store exactly once, and answer with what the store actually
+     * did. Writing it twice is how an overlay copy and a LAN copy of the same profile end up
+     * applied in different orders on two devices.
+     */
+    private suspend fun handleProfileFrame(
+        profileId: String,
+        senderPubKeyHex: String,
+        frame: Map<String, String>,
+        transportNote: String,
+        sendAck: suspend (String) -> Unit
+    ) {
+        val versionTag = frame["profileVersion"].orEmpty().trim()
+        val envelope = frame["profileEnvelope"].orEmpty()
+        // The sender picks the correlation tag and this device echoes it back unchanged. Using the
+        // version alone would be wrong: one profile edit fans out to every peer at the same
+        // version, so two pending ACKs would land on the same key and one of them would never
+        // resolve - the sender would then report a profile it actually delivered as undelivered.
+        val ackTag = frame["profileAckKey"].orEmpty().trim().ifBlank { versionTag }
+        val senderIpv6 = frame["senderIpv6"] ?: ""
+        val targetIpv6 = frame["recipientIpv6"] ?: ""
+        val resolvedProfileId = profileId.ifBlank {
+            ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
+        }
+        if (versionTag.isBlank() || envelope.isBlank()) {
+            // A profile frame without a version cannot be de-duplicated, and one without a
+            // sealed body has nothing this device can authenticate. Neither is a partial
+            // profile - it is not a profile.
+            logPacket(
+                direction = "ERR <- PRF",
+                summary = "Профиль-кадр отклонён: нет ни версии, ни запечатанного тела",
+                details = "От узла $senderIpv6 • ноды ${senderPubKeyHex.take(16)}..."
+            )
+            return
+        }
+        val ownAddress = senderIpv6.trim().lowercase()
+        val ownKey = senderPubKeyHex.trim().lowercase()
+        if ((ownAddress.isNotBlank() && ipv6ToProfileIdMap.containsKey(ownAddress)) ||
+            (ownKey.isNotBlank() && pubKeyToProfileIdMap.containsKey(ownKey))
+        ) {
+            // A frame claiming to come from an address this process owns is our own copy coming
+            // back through the mesh. Answering it would hand the sender an acknowledgement that
+            // reads "the peer confirmed my profile" while nobody outside this device read it.
+            logPacket(
+                direction = "ERR <- PRF",
+                summary = "Профиль-кадр от собственного адреса сброшен: подтверждения нет",
+                details = "Заявленный отправитель $senderIpv6 • версия $versionTag • этот адрес принадлежит данному узлу"
+            )
+            return
+        }
+        pruneRecentIncomingOverlayMessages()
+        val seenBefore = recentIncomingOverlayMessages.putIfAbsent(
+            "prf:${senderPubKeyHex.lowercase()}:$versionTag",
+            System.currentTimeMillis()
+        ) != null
+        val verdict = if (seenBefore) {
+            logPacket(
+                direction = "RX <- YGG",
+                summary = "Дубликат профиля версии $versionTag пропущен (ретрай отправителя)",
+                details = "Вердикт повторного ACK: duplicate $transportNote"
+            )
+            "duplicate"
+        } else {
+            logPacket(
+                direction = "RX <- YGG",
+                summary = "Принят профиль узла версии $versionTag $transportNote",
+                details = "От узла $senderIpv6 • запечатанное тело ${envelope.take(24)}..."
+            )
+            onProfileReceived(
+                IncomingProfilePacket(
+                    chatId = frame["chatId"] ?: "",
+                    senderIpv6 = senderIpv6,
+                    senderPubKeyHex = senderPubKeyHex.trim().lowercase(),
+                    recipientProfileId = resolvedProfileId,
+                    profileEnvelope = envelope,
+                    senderAvatarHash = frame["senderAvatarHash"].orEmpty().trim().lowercase(),
+                    senderAvatarData = avatarDataOf(frame),
+                    rttMs = (System.currentTimeMillis() -
+                        (frame["sentAt"]?.toLongOrNull() ?: System.currentTimeMillis())).coerceAtLeast(1L)
+                )
+            )
+        }
+        // The ACK goes out only after the store has answered, and it carries that answer: the
+        // sender's "confirmed" can then mean the contact's card changed, not merely that one
+        // datagram landed.
+        sendAck(
+            encodeWireFrame(
+                mapOf(
+                    "type" to "ACK",
+                    "profileAck" to ackTag,
+                    "profileVerdict" to verdict,
+                    "sentAt" to (frame["sentAt"] ?: System.currentTimeMillis().toString())
+                )
+            )
+        )
+    }
+
     private suspend fun handleOverlayFrame(profileId: String, payload: ByteArray, senderPubKeyHex: String) {
         val map = decodeWireFrame(String(payload, StandardCharsets.UTF_8))
         val senderIpv6 = map["senderIpv6"] ?: ""
@@ -2288,7 +2729,15 @@ class YggTwinP2PBridge(
                         "type" to "ACK",
                         "messageId" to wireMessageId,
                         "chatId" to (map["chatId"] ?: ""),
-                        "sentAt" to sentAt.toString()
+                        "sentAt" to sentAt.toString(),
+                        // Which envelope versions this build can open. The sender reads it as
+                        // the peer's own statement about its code, and only then starts writing
+                        // v3 to it; a peer that never answers this way keeps receiving v2.
+                        "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS,
+                        // The same argument for the voice codec: this device only names Opus if
+                        // MediaCodec really shows it an encoder, so the peer's compressed note
+                        // arrives somewhere it can be opened.
+                        "voiceCodecs" to voiceCodecAdvert()
                     )
                 )
                 if (seenBefore) {
@@ -2359,10 +2808,13 @@ class YggTwinP2PBridge(
                     streamedAttachmentRoot = streamedFile?.merkleRootHex ?: "",
                     voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                     voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
+                    voiceCodec = map["voiceCodec"].orEmpty(),
                     replyToMessageId = map["replyToMessageId"].orEmpty(),
                     forwardedFrom = map["forwardedFrom"].orEmpty(),
                     senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
                     senderAvatarData = avatarDataOf(map),
+                    groupAvatarHash = map["groupAvatarHash"].orEmpty().trim().lowercase(),
+                    groupAvatarData = avatarDataOf(map, "groupAvatarData"),
                     groupId = groupIdOf(map),
                     groupTitle = map["groupTitle"].orEmpty().trim().take(80),
                     groupMembersCsv = rosterOf(map),
@@ -2387,6 +2839,17 @@ class YggTwinP2PBridge(
                     if (transferId.isNotBlank() && chunkIndex >= 0) {
                         pendingChunkAcks.remove("$transferId:$chunkIndex")?.complete(1L)
                     }
+                    return
+                }
+                if (map["apkReply"] != null) {
+                    val transferId = map["transferId"]?.trim().orEmpty()
+                    val answer = YGrammPeerRelay.parseReply(map)
+                    if (transferId.isBlank() || answer == null) return
+                    map["sentAt"]?.toLongOrNull()?.let {
+                        observedOverlayAckRttMs.set((System.currentTimeMillis() - it).coerceAtLeast(1L))
+                    }
+                    if (!answer.first) apkRelayOrders.remove(transferId)
+                    apkRelayAckWaiters.remove(transferId)?.complete(answer)
                     return
                 }
                 if (map["fileStreamAck"] != null) {
@@ -2418,11 +2881,16 @@ class YggTwinP2PBridge(
                 val messageId = map["messageId"] ?: ""
                 val reactionId = map["reactionId"] ?: ""
                 val deleteId = map["deleteId"] ?: ""
+                val profileAck = map["profileAck"] ?: ""
                 val sentAt = map["sentAt"]?.toLongOrNull() ?: 0L
                 val rtt = if (sentAt > 0) (System.currentTimeMillis() - sentAt).coerceAtLeast(1L) else 1L
                 observedOverlayAckRttMs.set(rtt)
                 onTwinReachableChanged(true)
-                if (deleteId.isNotBlank()) {
+                if (profileAck.isNotBlank()) {
+                    pendingProfileAcks.remove(profileAck)?.complete(
+                        rtt to map["profileVerdict"].orEmpty().trim().lowercase()
+                    )
+                } else if (deleteId.isNotBlank()) {
                     pendingDeleteAcks.remove(deleteId)?.complete(rtt)
                     logPacket(
                         direction = "ACK <- YGG",
@@ -2440,7 +2908,14 @@ class YggTwinP2PBridge(
                 } else {
                     pendingOverlayAcks.remove(messageId)?.complete(rtt)
                     markAvatarAdvertised(messageId)
-                    onDeliveryAckReceived(map["chatId"] ?: "", messageId, rtt, senderPubKeyHex)
+                    onDeliveryAckReceived(
+                        map["chatId"] ?: "",
+                        messageId,
+                        rtt,
+                        senderPubKeyHex,
+                        map["envVersions"].orEmpty()
+                    )
+                    reportPeerVoiceCodecs(map["chatId"] ?: "", senderPubKeyHex, map)
                     logPacket(
                         direction = "ACK <- YGG",
                         summary = "ACK получен через оверлей Yggdrasil (RTT: $rtt мс)",
@@ -2546,6 +3021,16 @@ class YggTwinP2PBridge(
                     )
                 }
             }
+            "PROFILE" -> {
+                onTwinReachableChanged(true)
+                handleProfileFrame(
+                    profileId = profileId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    frame = map,
+                    transportNote = "через оверлей Yggdrasil",
+                    sendAck = { ackFrame -> sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK") }
+                )
+            }
             "READ_RECEIPT" -> {
                 onTwinReachableChanged(true)
                 val chatId = map["chatId"] ?: ""
@@ -2578,6 +3063,12 @@ class YggTwinP2PBridge(
                 onTwinReachableChanged(true)
                 handleFileDone(map) { frame ->
                     sendOverlayFrame(profileId, senderPubKeyHex, frame, "STREAM_ACK")
+                }
+            }
+            "APKREQ" -> {
+                onTwinReachableChanged(true)
+                handleApkRelayRequest(profileId, senderPubKeyHex, map) { frame ->
+                    sendOverlayFrame(profileId, senderPubKeyHex, frame, "APK_ACK")
                 }
             }
             "ATTACH_CHUNK" -> {
@@ -2918,10 +3409,13 @@ class YggTwinP2PBridge(
                         streamedAttachmentRoot = lanStreamFile?.merkleRootHex ?: "",
                         voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                         voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
+                        voiceCodec = map["voiceCodec"].orEmpty(),
                         replyToMessageId = map["replyToMessageId"].orEmpty(),
                         forwardedFrom = map["forwardedFrom"].orEmpty(),
                         senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
                         senderAvatarData = avatarDataOf(map),
+                        groupAvatarHash = map["groupAvatarHash"].orEmpty().trim().lowercase(),
+                        groupAvatarData = avatarDataOf(map, "groupAvatarData"),
                         groupId = groupIdOf(map),
                         groupTitle = map["groupTitle"].orEmpty().trim().take(80),
                         groupMembersCsv = rosterOf(map)
@@ -2932,7 +3426,9 @@ class YggTwinP2PBridge(
                             "type" to "ACK",
                             "messageId" to msgId,
                             "chatId" to incoming.targetChatId,
-                            "sentAt" to sentAt.toString()
+                            "sentAt" to sentAt.toString(),
+                            "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS,
+                            "voiceCodecs" to voiceCodecAdvert()
                         )
                     )
                     val viaInfo = if (routedViaPeer.isNotBlank()) {
@@ -3072,6 +3568,17 @@ class YggTwinP2PBridge(
                             )
                         )
                     }
+                }
+                "PROFILE" -> {
+                    onTwinReachableChanged(true)
+                    val senderKeyFromFrame = map["senderPubKeyHex"].orEmpty().trim().lowercase()
+                    handleProfileFrame(
+                        profileId = recipientProfileId,
+                        senderPubKeyHex = senderKeyFromFrame,
+                        frame = map,
+                        transportNote = "по LAN $remoteIp",
+                        sendAck = { ackFrame -> writer.println(ackFrame) }
+                    )
                 }
                 "READ_RECEIPT" -> {
                     onTwinReachableChanged(true)
@@ -3607,10 +4114,13 @@ class YggTwinP2PBridge(
         attachmentBase64: String? = null,
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
+        voiceCodec: String = "",
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
         senderAvatarBase64: String = "",
+        groupAvatarHash: String = "",
+        groupAvatarBase64: String = "",
         groupId: String = "",
         groupTitle: String = "",
         groupMembersCsv: String = ""
@@ -3863,7 +4373,13 @@ class YggTwinP2PBridge(
         // 12 KB on every message forever, and an unconfirmed one must not be forgotten.
         val avatarRidesAlong = senderAvatarHash.isNotBlank() &&
             senderAvatarBase64.isNotBlank() &&
-            advertisedAvatarHashes[chatId] != senderAvatarHash
+            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] != senderAvatarHash
+        // A member relaying a group cover carries it to each peer separately: whoever's device
+        // holds the newest picture is the one that tells the others, and it keeps telling them
+        // until every one of them has ACKed the bytes.
+        val groupAvatarRidesAlong = groupAvatarHash.isNotBlank() &&
+            groupAvatarBase64.isNotBlank() &&
+            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6, group = true)] != groupAvatarHash
         val messageFields = linkedMapOf(
             "type" to "MSG",
             "chatId" to chatId,
@@ -3887,10 +4403,13 @@ class YggTwinP2PBridge(
             },
             "voiceDurationSec" to voiceDurationSec.toString(),
             "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
+            "voiceCodec" to voiceCodec,
             "replyToMessageId" to replyToMessageId,
             "forwardedFrom" to forwardedFrom,
             "senderAvatarHash" to senderAvatarHash,
             "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+            "groupAvatarHash" to groupAvatarHash,
+            "groupAvatarData" to (if (groupAvatarRidesAlong) groupAvatarBase64 else ""),
             "groupId" to groupId,
             "groupTitle" to groupTitle,
             "groupMembers" to groupMembersCsv,
@@ -3915,7 +4434,13 @@ class YggTwinP2PBridge(
         val totalOutboundBytes = wirePayload.length.toLong() + (attachmentBase64?.length ?: 0)
 
         var ackDeferred: kotlinx.coroutines.CompletableDeferred<Long>? = null
-        if (avatarRidesAlong) pendingAvatarAdverts[messageId] = chatId to senderAvatarHash
+        val carriedAdverts = buildList {
+            if (avatarRidesAlong) add(avatarAdvertKey(chatId, peerIpv6) to senderAvatarHash)
+            if (groupAvatarRidesAlong) {
+                add(avatarAdvertKey(chatId, peerIpv6, group = true) to groupAvatarHash)
+            }
+        }
+        if (carriedAdverts.isNotEmpty()) pendingAvatarAdverts[messageId] = carriedAdverts
         if (overlayReady) {
             logPacket(
                 direction = "TX -> YGG",
@@ -4133,10 +4658,13 @@ class YggTwinP2PBridge(
         attachmentBase64: String? = null,
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
+        voiceCodec: String = "",
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
         senderAvatarBase64: String = "",
+        groupAvatarHash: String = "",
+        groupAvatarBase64: String = "",
         groupId: String = "",
         groupTitle: String = "",
         groupMembersCsv: String = ""
@@ -4201,13 +4729,22 @@ class YggTwinP2PBridge(
                         "attachmentBase64" to (attachmentBase64 ?: ""),
                         "voiceDurationSec" to voiceDurationSec.toString(),
                         "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
+                        "voiceCodec" to voiceCodec,
                         "replyToMessageId" to replyToMessageId,
                         "forwardedFrom" to forwardedFrom,
                         "senderAvatarHash" to senderAvatarHash,
                         "senderAvatarData" to (
                             if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank() &&
-                                advertisedAvatarHashes[chatId] != senderAvatarHash
+                                advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] != senderAvatarHash
                             ) senderAvatarBase64 else ""
+                            ),
+                        "groupAvatarHash" to groupAvatarHash,
+                        "groupAvatarData" to (
+                            if (groupAvatarHash.isNotBlank() && groupAvatarBase64.isNotBlank() &&
+                                advertisedAvatarHashes[
+                                    avatarAdvertKey(chatId, peerIpv6, group = true)
+                                ] != groupAvatarHash
+                            ) groupAvatarBase64 else ""
                             ),
                         "groupId" to groupId,
                         "groupTitle" to groupTitle,
@@ -4224,9 +4761,15 @@ class YggTwinP2PBridge(
                     if (ackMap["type"] == "ACK" && ackMap["messageId"] == messageId) {
                         val rtt = (System.currentTimeMillis() - now).coerceAtLeast(1L)
                         onTwinReachableChanged(true)
-                        onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6)
+                        onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6, ackMap["envVersions"].orEmpty())
+                        reportPeerVoiceCodecs(chatId, peerIpv6, ackMap)
                         if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
-                            advertisedAvatarHashes[chatId] = senderAvatarHash
+                            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] = senderAvatarHash
+                        }
+                        if (groupAvatarHash.isNotBlank() && groupAvatarBase64.isNotBlank()) {
+                            advertisedAvatarHashes[
+                                avatarAdvertKey(chatId, peerIpv6, group = true)
+                            ] = groupAvatarHash
                         }
                         logPacket(
                             direction = "ACK <- PEER",
@@ -4569,6 +5112,197 @@ class YggTwinP2PBridge(
             rttMs = -1L,
             errorDetail = reason
         )
+    }
+
+    /**
+     * Offers this device's profile to one peer. [profileEnvelope] is the sealed body - the same
+     * conversation AEAD used for messages - produced for that peer's key. Without it the frame is
+     * refused here, because an open profile would let any node on the path rename itself as a
+     * saved contact.
+     *
+     * Delivery is confirmed only by that peer's ACK, so a profile that reached the overlay but was
+     * never read reports "не подтверждён" instead of pretending the contact's card changed.
+     */
+    suspend fun dispatchProfileFrame(
+        chatId: String,
+        profileEnvelope: String,
+        profileVersion: Long,
+        peerIpv6: String,
+        directEndpointHint: String,
+        senderIpv6: String,
+        senderPubKeyHex: String = "",
+        recipientNodePubKeyHex: String = "",
+        senderAvatarHash: String = "",
+        senderAvatarBase64: String = "",
+        allowLanFallback: Boolean = allowDirectLanRouting
+    ): ProfileDispatchResult = withContext(Dispatchers.IO) {
+        if (profileEnvelope.isBlank()) {
+            return@withContext ProfileDispatchResult(
+                delivered = false,
+                errorDetail = "Нет ключа собеседника: профиль нечем запечатать"
+            )
+        }
+        if (profileVersion <= 0L) {
+            // A frame the receiver cannot order against what it already stored would either
+            // overwrite a newer profile or be silently dropped - neither is honest.
+            return@withContext ProfileDispatchResult(
+                delivered = false,
+                errorDetail = "Профиль без отметки времени не отправляется: приёмник не смог бы " +
+                    "отличить его от более свежей версии"
+            )
+        }
+        if (directEndpointHint.isNotBlank()) {
+            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
+        }
+        val ackKey = "$chatId:$profileVersion"
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()] ?: ""
+        val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
+        val directAddress = resolveDirectSocketAddress(
+            peerIpv6 = peerIpv6,
+            directHint = directEndpointHint,
+            senderIpv6 = senderIpv6,
+            allowPassiveLan = allowLanFallback
+        )
+        val hasInternet = isRealNetworkAvailable()
+        val senderCoreReady = senderProfileId.isNotBlank() && initializedNativeProfiles.contains(senderProfileId)
+        val senderPort = activeProfilePortMap[senderProfileId] ?: localTcpPort
+        // The avatar travels as a separate field and its hash is inside the sealed body, so the
+        // receiver checks the bytes against what the key confirmed. Unlike a message, a profile
+        // rewrite is rare and self-limiting: the sender stops including the bytes as soon as the
+        // hash arrives ACKed.
+        val avatarRidesAlong = senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()
+        val wirePayload = encodeWireFrame(
+            mapOf(
+                "type" to "PROFILE",
+                "chatId" to chatId,
+                "profileEnvelope" to profileEnvelope,
+                "profileVersion" to profileVersion.toString(),
+                "profileAckKey" to ackKey,
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "senderTcpPort" to senderPort.toString(),
+                "recipientIpv6" to peerIpv6,
+                "senderAvatarHash" to senderAvatarHash,
+                "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+
+        var overlayPossible = hasInternet && senderCoreReady && recipientKeyHex.isNotBlank()
+        var livePeers = 0
+        if (overlayPossible) {
+            livePeers = awaitLivePeer(senderProfileId, waitMs = if (directAddress != null) 3500L else 6000L)
+            if (livePeers <= 0) overlayPossible = false
+        }
+        if (overlayPossible) {
+            logPacket(
+                direction = "TX -> YGG",
+                summary = "Профиль направлен в оверлей Yggdrasil",
+                details = "К получателю $peerIpv6 • версия $profileVersion • Живых пиров: $livePeers",
+                mirror = true
+            )
+            val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Long, String>>()
+            pendingProfileAcks[ackKey] = deferred
+            for (attempt in 1..2) {
+                if (!sendOverlayFrame(senderProfileId, recipientKeyHex, wirePayload, "PROFILE")) break
+                val ack = kotlinx.coroutines.withTimeoutOrNull(
+                    if (directAddress != null) 2500L else 4000L
+                ) { deferred.await() }
+                if (ack != null) {
+                    val (ackRtt, verdict) = ack
+                    pendingProfileAcks.remove(ackKey, deferred)
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- YGG",
+                        summary = "Профиль версии $profileVersion подтверждён адресатом через оверлей Yggdrasil (RTT: $ackRtt мс)",
+                        details = "Узел $peerIpv6 • вердикт приёмника: ${describeVerdict(verdict)}" +
+                            if (avatarRidesAlong) " • аватар ехал рядом" else "",
+                        mirror = true
+                    )
+                    return@withContext ProfileDispatchResult(
+                        delivered = true,
+                        transport = "YGG_OVERLAY",
+                        rttMs = ackRtt,
+                        verdict = verdict
+                    )
+                }
+            }
+            pendingProfileAcks.remove(ackKey, deferred)
+        }
+
+        if (directAddress != null) {
+            logPacket(
+                direction = "TX -> LAN",
+                summary = "Профиль направлен напрямую по LAN",
+                details = "${directAddress.hostString}:${directAddress.port} • версия $profileVersion"
+            )
+            try {
+                val startedAt = System.currentTimeMillis()
+                var lanRtt: Long? = null
+                var lanVerdict = ""
+                Socket().use { socket ->
+                    socket.soTimeout = 5000
+                    socket.connect(directAddress, 3500)
+                    val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+                    writer.println(wirePayload)
+                    val reply = reader.readLine()?.let { decodeWireFrame(it) }
+                    if (reply?.get("type") == "ACK" && reply["profileAck"].orEmpty() == ackKey) {
+                        lanRtt = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
+                        lanVerdict = reply["profileVerdict"].orEmpty().trim().lowercase()
+                    }
+                }
+                val confirmedRtt = lanRtt
+                if (confirmedRtt != null) {
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- PEER",
+                        summary = "Профиль подтверждён адресатом по LAN (ACK)",
+                        details = "Адресат: $peerIpv6 • ${directAddress.hostString}:${directAddress.port} • вердикт приёмника: ${describeVerdict(lanVerdict)}"
+                    )
+                    return@withContext ProfileDispatchResult(
+                        delivered = true,
+                        transport = "LAN_DIRECT",
+                        rttMs = confirmedRtt,
+                        verdict = lanVerdict
+                    )
+                }
+            } catch (e: Exception) {
+                logPacket(
+                    direction = "ERR • PRF",
+                    summary = "Профиль не доставлен по LAN (${e.javaClass.simpleName})",
+                    details = "Адресат $peerIpv6 • ${directAddress.hostString}:${directAddress.port}"
+                )
+            }
+        }
+
+        val reason = when {
+            !hasInternet && directAddress == null -> "Нет подключения к интернету, LAN-маршрут к получателю не задан"
+            recipientKeyHex.isBlank() && directAddress == null ->
+                "Неизвестен Ed25519-ключ получателя: профиль можно запечатать только для известного узла"
+            !senderCoreReady && directAddress == null -> "Нода Yggdrasil отправителя не активна"
+            !overlayPossible && livePeers <= 0 && directAddress == null -> "Нода Yggdrasil без живых пиров"
+            else -> "Оверлей Yggdrasil и LAN-маршрут не подтвердили приём профиля"
+        }
+        logPacket(
+            direction = "ERR • PRF",
+            summary = "Профиль не подтверждён",
+            details = "Причина: $reason • адресат $peerIpv6 • версия $profileVersion"
+        )
+        ProfileDispatchResult(delivered = false, transport = "", rttMs = -1L, errorDetail = reason)
+    }
+
+    /** The receiver's own word for what it did with a profile frame, spelled out for the log. */
+    private fun describeVerdict(verdict: String): String = when (verdict) {
+        "applied" -> "профиль применён"
+        "no_dialog" -> "диалога с этим узлом нет, не применён"
+        "key_mismatch" -> "ключ узла не сходится с его адресом, отклонён"
+        "unsealed" -> "тело не расшифровалось, отклонён"
+        "corrupt" -> "тело не читается, отклонён"
+        "out_of_date" -> "старше сохранённого, не применён"
+        "duplicate" -> "уже был обработан ранее"
+        "" -> "ACK без вердикта (узел старше 1.7.6)"
+        else -> verdict
     }
 
     /**
@@ -5185,7 +5919,8 @@ class YggTwinP2PBridge(
                     onTwinReachableChanged(true)
                     // This socket proves nothing about who answered, so the frame carries no
                     // sender key and a group message is not attributed to a member here.
-                    onDeliveryAckReceived(chatId, messageId, rtt, "")
+                    onDeliveryAckReceived(chatId, messageId, rtt, "", ackMap?.get("envVersions").orEmpty())
+                    if (ackMap != null) reportPeerVoiceCodecs(chatId, "", ackMap)
                     logPacket(
                         direction = "ACK <- PEER",
                         summary = "Доставка подтверждена ACK через ${targetSocket.hostString}:${targetSocket.port} (RTT: $rtt мс)",

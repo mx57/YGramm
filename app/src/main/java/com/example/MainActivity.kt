@@ -748,6 +748,7 @@ fun YggGramRootApp(
                                 onCreateGroup = viewModel::createGroup,
                                 onAddContactsToGroup = viewModel::addContactsToGroup,
                                 onRenameGroup = viewModel::renameGroup,
+                                onSetGroupAvatar = viewModel::setGroupAvatar,
                                 onRemoveGroupMember = viewModel::removeGroupMember,
                                 onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,
@@ -801,6 +802,7 @@ fun YggGramRootApp(
                                 onImportCustomPeers = viewModel::importCustomPeersFromText,
                                 onProbeCoverMask = viewModel::probeCoverMask,
                                 onProbeNetworkFilter = viewModel::probeNetworkFilter,
+                                onCheckVoiceCodec = viewModel::checkVoiceCodec,
                                 onClearPacketLogs = viewModel::clearPacketLogs
                             )
 
@@ -813,8 +815,9 @@ fun YggGramRootApp(
                                 onRegenerateIdentity = viewModel::regenerateNewSeedIdentity,
                                 onSyncDevicesNow = viewModel::triggerCrossPlatformSyncNow,
                                 onPairDevice = viewModel::pairNewDevice,
-                                onCreateBackup = viewModel::createEncryptedBackup,
-                                onVerifyOrRestoreBackup = viewModel::verifyOrRestoreBackup
+                                onExportDatabase = viewModel::exportEncryptedDatabase,
+                                onVerifyExportedArchive = viewModel::verifyExportedArchive,
+                                onRestoreFromArchive = viewModel::restoreFromArchive
                             )
 
                             YggNavTab.PROFILE_PRIVACY -> ProfilePrivacyScreen(
@@ -840,7 +843,11 @@ fun YggGramRootApp(
                                 onPickProfileAvatar = viewModel::setProfileAvatar,
                                 onClearProfileAvatar = viewModel::clearProfileAvatar,
                                 onRefreshStorage = viewModel::refreshStorageBreakdown,
-                                onPurgeOrphanedFiles = viewModel::purgeOrphanedFiles
+                                onPurgeOrphanedFiles = viewModel::purgeOrphanedFiles,
+                                conversations = conversations,
+                                onRequestApkFromPeer = viewModel::requestApkFromPeer,
+                                onCancelApkRelay = viewModel::cancelApkRelay,
+                                onImportReleaseManifest = viewModel::importReleaseManifest
                             )
                         }
                     }

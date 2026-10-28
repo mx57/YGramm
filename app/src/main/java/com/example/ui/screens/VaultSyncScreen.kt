@@ -1,6 +1,9 @@
 // File: app/src/main/java/com/example/ui/screens/VaultSyncScreen.kt
 package com.example.ui.screens
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,7 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Info
@@ -79,11 +81,29 @@ fun VaultSyncScreen(
     onRegenerateIdentity: () -> Unit,
     onSyncDevicesNow: () -> Unit,
     onPairDevice: (String, String, String, String) -> Unit,
-    onCreateBackup: (String, Boolean) -> Unit,
-    onVerifyOrRestoreBackup: (BackupSnapshotEntity, Boolean) -> Unit
+    onExportDatabase: (Uri) -> Unit,
+    onVerifyExportedArchive: (BackupSnapshotEntity, Uri) -> Unit,
+    onRestoreFromArchive: (BackupSnapshotEntity) -> Unit
 ) {
     var showPairDeviceDialog by rememberSaveable { mutableStateOf(false) }
-    var backupPassphrase by rememberSaveable { mutableStateOf("") }
+    // The snapshot being checked is remembered only while the picker is open: creating an
+    // archive needs a write target, checking one needs to open the existing file, so the
+    // two jobs cannot share a contract.
+    var archiveToVerify by remember { mutableStateOf<BackupSnapshotEntity?>(null) }
+    val exportArchiveLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        if (uri != null) onExportDatabase(uri)
+    }
+    val verifyArchiveLauncher = rememberLauncherForActivityResult(
+        // Any mime: a document provider may label a .db file however it likes, and a filter
+        // that hides the user's own archive would be worse than an over-broad list.
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        val pending = archiveToVerify
+        archiveToVerify = null
+        if (uri != null && pending != null) onVerifyExportedArchive(pending, uri)
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -268,7 +288,7 @@ fun VaultSyncScreen(
             }
         }
 
-        // 3. Encrypted Local & Zero-Knowledge Cloud Backups
+        // 3. Export of the encrypted database
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -283,67 +303,42 @@ fun VaultSyncScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Column {
                             Text(
-                                text = "Снимки метаданных хранилища (архив не создаётся)",
+                                text = "Экспорт шифрованной базы",
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Text(
-                                text = "Argon2id, XChaCha20-Poly1305, Zstd и FastCDC здесь не применяются: " +
-                                    "сводка считается из SHA-256 по размерам записей",
+                                text = "Копируется сам файл SQLCipher: archive = байты базы, " +
+                                    "ключ к ней остаётся в Keystore этого устройства",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    OutlinedTextField(
-                        value = backupPassphrase,
-                        onValueChange = { backupPassphrase = it },
-                        label = { Text("Парольная фраза контейнера (или фингерпринт мастер-ключа)") },
-                        placeholder = { Text("Оставьте пустым для использования 256-bit Master Key") },
-                        singleLine = true,
+                    Button(
+                        onClick = {
+                            exportArchiveLauncher.launch("ygggram_export_${System.currentTimeMillis() / 1000}.db")
+                        },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("backup_passphrase_input")
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            .testTag("export_database_button")
                     ) {
-                        Button(
-                            onClick = {
-                                onCreateBackup(backupPassphrase, false)
-                                backupPassphrase = ""
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("create_local_backup_button")
-                        ) {
-                            Icon(Icons.Default.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Метка: локально", maxLines = 1)
-                        }
-
-                        OutlinedButton(
-                            onClick = {
-                                onCreateBackup(backupPassphrase, true)
-                                backupPassphrase = ""
-                            },
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("create_webdav_backup_button")
-                        ) {
-                            Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Метка: WebDAV", maxLines = 1)
-                        }
+                        Icon(Icons.Default.Storage, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Выбрать файл для архива", maxLines = 1)
                     }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = "Восстановление из архива не реализовано: кнопка снимка объяснит причину. " +
+                            "Экспорт не резервирует ключ — без этого устройства архив не открыть.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
 
                     HorizontalDivider(
                         modifier = Modifier.padding(vertical = 10.dp),
@@ -351,7 +346,7 @@ fun VaultSyncScreen(
                     )
 
                     Text(
-                        text = "Журнал контейнеров резервных копий (${backupSnapshots.size})",
+                        text = "Журнал экспортов (${backupSnapshots.size})",
                         style = MaterialTheme.typography.labelLarge
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -359,8 +354,11 @@ fun VaultSyncScreen(
                     backupSnapshots.forEach { snap ->
                         BackupSnapshotCard(
                             snapshot = snap,
-                            onVerify = { onVerifyOrRestoreBackup(snap, false) },
-                            onRestore = { onVerifyOrRestoreBackup(snap, true) }
+                            onVerify = {
+                                archiveToVerify = snap
+                                verifyArchiveLauncher.launch(arrayOf("*/*"))
+                            },
+                            onRestore = { onRestoreFromArchive(snap) }
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                     }
@@ -500,7 +498,7 @@ private fun BackupSnapshotCard(
                 ) {
                     Icon(
                         Icons.Default.Info,
-                        contentDescription = "Снимок метаданных: архив на диск не записан",
+                        contentDescription = "Запись об экспорте файла шифрованной базы",
                         tint = AmberShieldTertiary,
                         modifier = Modifier.size(16.dp)
                     )
@@ -520,18 +518,22 @@ private fun BackupSnapshotCard(
             }
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                // These numbers come from buildEncryptedBackupContainer, which estimates a size
-                // from the row counts instead of sealing the database - so they are labelled as
-                // an estimate, not as properties of a file that exists.
-                text = "Оценка: ${snapshot.sizeBytes / 1024} КБ, ${snapshot.chunkCountFastCdc} чанков • " +
+                // Every number here came off the written archive: YggEncryptedExport profiles the
+                // bytes read back from the document, not a guess built from row counts.
+                text = "Файл: ${snapshot.sizeBytes / 1024} КБ, ${snapshot.chunkCountFastCdc} кусков по 12 КИБ • " +
                     "${snapshot.kdfSpec} • ${snapshot.cipherSpec}",
                 style = MaterialTheme.typography.labelSmall,
                 color = CyberTealSecondary
             )
             Text(
-                text = "Merkle SHA-256 (от оценки, не от файла): ${snapshot.merkleRootHex.take(28)}...",
+                text = "Merkle SHA-256 по байтам архива: ${snapshot.merkleRootHex.take(28)}...",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = if (snapshot.isVerified) "Сверка с базой: root совпал" else "Сверка с базой: root НЕ совпал",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (snapshot.isVerified) EmeraldPrimary else MaterialTheme.colorScheme.error
             )
             Spacer(modifier = Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -541,7 +543,7 @@ private fun BackupSnapshotCard(
                 ) {
                     Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(15.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Проверить MAC")
+                    Text("Проверить архив")
                 }
                 Button(
                     onClick = onRestore,

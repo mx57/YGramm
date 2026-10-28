@@ -4,6 +4,7 @@ package com.example.engine
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.InputStream
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -24,16 +25,6 @@ data class DerivedIdentityHierarchy(
     val x25519SignedPreKeyHex: String,
     val mlsLeafKeyHex: String,
     val backupMasterKeyFingerprint: String
-)
-
-data class EncryptedArchiveBundle(
-    val archiveFileName: String,
-    val payloadSizeBytes: Long,
-    val fastCdcChunks: Int,
-    val merkleRootSha256: String,
-    val authTagHex: String,
-    val kdfSummary: String,
-    val cipherSummary: String
 )
 
 object YggCryptoEngine {
@@ -528,9 +519,23 @@ object YggCryptoEngine {
     }
 
     /**
+     * The envelope versions this build can open, as advertised in a delivery ACK. A sender only
+     * writes v3 to a peer that has named "3" here, so the advertisement is a statement about the
+     * code on that device, not about a key — and v2 stays readable forever, which means no
+     * message becomes unreadable because one side upgraded.
+     */
+    const val ACCEPTED_ENVELOPE_VERSIONS = "2,3"
+
+    /** True when the advertised list names a version this build can seal under. */
+    fun peerAcceptsEnvelopeVersion(advertisedCsv: String?, version: Int): Boolean =
+        advertisedCsv?.split(',')?.any { it.trim() == version.toString() } == true
+
+    /**
      * Seals a message into a self-describing AEAD envelope (stored in cipherPayloadHex):
-     * key = HKDF-SHA256(X25519(sender_x_priv, recipient_x_pub)), AES-256-GCM with a random
+     * v2 key = HKDF-SHA256(X25519(sender_x_priv, recipient_x_pub)), AES-256-GCM with a random
      * IV and AAD binding the sender key and epoch.
+     * [envelopeVersion] 3 adds a fresh, never-stored X25519 pair to the same derivation, so a
+     * recorded frame cannot be opened later even if the sender's long-term key is exposed then.
      * Returns null when the peer X25519 key is unknown: without it there is no shared secret,
      * and any key derived from public values alone would be readable by anyone who records
      * the traffic, so the message must not be sent at all.
@@ -542,12 +547,23 @@ object YggCryptoEngine {
         peerX25519PublicKeyHex: String?,
         keyEpoch: Int = 1,
         ratchetStep: Int = 0,
-        sealedSender: Boolean = true
+        sealedSender: Boolean = true,
+        envelopeVersion: Int = 2
     ): String? {
         val senderEdHex = senderEd25519PublicKeyHex.lowercase()
         val iv = ByteArray(12).also { secureRandom.nextBytes(it) }
         val peerXPub = peerX25519PublicKeyHex?.trim()?.lowercase() ?: return null
         if (!isUsablePeerX25519PublicKey(peerXPub)) return null
+        if (envelopeVersion == 3) {
+            return sealEphemeralEnvelope(
+                plainText = plainText,
+                iv = iv,
+                senderX25519PrivateKey = senderX25519PrivateKey,
+                senderEdHex = senderEdHex,
+                peerXPub = peerXPub,
+                keyEpoch = keyEpoch
+            )
+        }
 
         val aad = "ygggram-v2:$senderEdHex:$keyEpoch".toByteArray(StandardCharsets.UTF_8)
         val key = run {
@@ -586,6 +602,58 @@ object YggCryptoEngine {
         }
     }
 
+    /**
+     * v3: the message key also takes a freshly generated X25519 pair. The private half exists
+     * only as a local value inside this call — nothing writes it down, because the sender's own
+     * copy of the message is read from plainText in its database, not by opening this frame.
+     * So a frame captured today stays closed even if the sender's long-term key is exposed
+     * later, which is the one property v2 could not offer.
+     */
+    private fun sealEphemeralEnvelope(
+        plainText: String,
+        iv: ByteArray,
+        senderX25519PrivateKey: ByteArray,
+        senderEdHex: String,
+        peerXPub: String,
+        keyEpoch: Int
+    ): String {
+        val ephemeralPrivate = ByteArray(32).also { secureRandom.nextBytes(it) }
+        val ephemeralPublic = x25519PublicKeyFromPrivate(ephemeralPrivate)
+            .joinToString("") { "%02x".format(it) }
+        val peerBytes = peerXPub.hexToBytes()
+        // Ephemeral half first, identity half second — the reader rebuilds them in this order.
+        val ikm = x25519(ephemeralPrivate, peerBytes) + x25519(senderX25519PrivateKey, peerBytes)
+        val key = hkdfSha256(
+            ikm = ikm,
+            salt = sha256Hex("ygggram-cr-v3").hexToBytes(),
+            info = "ygggram-envelope-v3:ep=$keyEpoch".toByteArray(StandardCharsets.UTF_8),
+            outputLength = 32
+        )
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD("ygggram-v3:$senderEdHex:$ephemeralPublic:$keyEpoch".toByteArray(StandardCharsets.UTF_8))
+        val encrypted = cipher.doFinal(plainText.toByteArray(StandardCharsets.UTF_8))
+
+        return buildString {
+            append("{\"v\":")
+            append(3)
+            append(",\"es\":\"")
+            append(ephemeralPublic)
+            append("\",\"sx\":\"")
+            append(x25519PublicKeyFromPrivate(senderX25519PrivateKey).joinToString("") { "%02x".format(it) })
+            append("\",\"sp\":\"")
+            append(senderEdHex)
+            append("\",\"ep\":")
+            append(keyEpoch)
+            append(",\"iv\":\"")
+            append(iv.joinToString("") { "%02x".format(it) })
+            append("\",\"ct\":\"")
+            append(encrypted.joinToString("") { "%02x".format(it) })
+            append("\"}")
+        }
+    }
+
     data class OpenedConversationEnvelope(
         val plainText: String,
         val senderX25519PublicKeyHex: String,
@@ -593,11 +661,14 @@ object YggCryptoEngine {
     )
 
     /**
-     * Opens an envelope produced by [sealConversationEnvelope].
+     * Opens an envelope produced by [sealConversationEnvelope], version 2 or 3. Both are read:
+     * a peer that has not proven it accepts v3 still sends v2, and this is what keeps a mixed
+     * fleet working.
      * senderEd25519PublicKeyHex comes from the wire frame; a mismatch with the envelope's
      * pinned sender key is rejected. The returned senderX25519PublicKeyHex is the envelope's
      * "sx" value, implicitly authenticated by successful AEAD verification — safe to pin
-     * as the peer's X25519 key. Throws SecurityException on tampering or wrong key.
+     * as the peer's X25519 key. For v3 that is the sender's long-term key, never the
+     * one-off "es" point. Throws SecurityException on tampering or wrong key.
      */
     fun openConversationEnvelope(
         envelope: String,
@@ -622,29 +693,57 @@ object YggCryptoEngine {
         val iv = ivHex.hexToBytes()
         val encrypted = ctHex.hexToBytes()
 
-        if (version != 2) {
+        if (version != 2 && version != 3) {
             throw SecurityException("Envelope version $version is not accepted: it is keyed from public values only")
         }
         val senderXPub = fields.string("sx").orEmpty().lowercase()
         if (senderXPub.length != 64) throw SecurityException("Envelope missing sender X25519 key")
         val envelopeEpoch = fields.int("ep") ?: 1
-        val shared = x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
+        val shared: ByteArray
+        val aad: ByteArray
+        if (version == 3) {
+            val ephemeralPub = fields.string("es").orEmpty().lowercase()
+            if (!isUsablePeerX25519PublicKey(ephemeralPub)) {
+                throw SecurityException("Envelope missing the per-message ephemeral key")
+            }
+            // The frame names two points and this device's own scalar multiplies both, so the
+            // "sx" value is authenticated by the AEAD check exactly as in v2: a forged sender
+            // key gives a different secret and the tag fails.
+            shared = x25519(recipientX25519PrivateKey, ephemeralPub.hexToBytes()) +
+                x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
+            aad = "ygggram-v3:$senderEdHex:$ephemeralPub:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8)
+        } else {
+            shared = x25519(recipientX25519PrivateKey, senderXPub.hexToBytes())
+            aad = "ygggram-v2:$senderEdHex:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8)
+        }
         val key = hkdfSha256(
             ikm = shared,
-            salt = sha256Hex("ygggram-cr-v2").hexToBytes(),
-            info = "ygggram-envelope-v2:ep=$envelopeEpoch".toByteArray(StandardCharsets.UTF_8),
+            salt = sha256Hex(if (version == 3) "ygggram-cr-v3" else "ygggram-cr-v2").hexToBytes(),
+            info = "ygggram-envelope-v$version:ep=$envelopeEpoch".toByteArray(StandardCharsets.UTF_8),
             outputLength = 32
         )
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        cipher.updateAAD("ygggram-v2:$senderEdHex:$envelopeEpoch".toByteArray(StandardCharsets.UTF_8))
+        cipher.updateAAD(aad)
         val plain = cipher.doFinal(encrypted)
         return OpenedConversationEnvelope(
             plainText = String(plain, StandardCharsets.UTF_8),
             senderX25519PublicKeyHex = senderXPub,
             version = version
         )
+    }
+
+    /**
+     * Which envelope version a sealed frame actually is, read back from the frame itself.
+     * The message ledger stamps this instead of the version the sender hoped to use, so what
+     * the keys screen reports is a measurement of the bytes rather than an intention.
+     * A frame with no readable version is the legacy plaintext form, reported as 1.
+     */
+    fun envelopeVersionOf(cipherHex: String): Int {
+        val trimmed = cipherHex.trim()
+        if (!trimmed.startsWith("{")) return 1
+        return runCatching { EnvelopeFields(trimmed).int("v") }.getOrNull() ?: 1
     }
 
     // ── Voice-call media encryption ──────────────────────────────────────────
@@ -780,47 +879,34 @@ object YggCryptoEngine {
         return cipher.doFinal(decoder.decode(cipherBase64))
     }
 
-    /**
-     * Streams [file] in fixed pieces, handing each one to [onPiece] so the caller can send or
-     * hash it without ever holding the whole file. Returns the byte count actually read.
-     */
-    fun forEachFilePiece(
-        file: File,
-        pieceBytes: Int = FILE_PIECE_BYTES,
-        onPiece: (index: Int, bytes: ByteArray) -> Unit
-    ): Long {
-        if (!file.exists() || pieceBytes <= 0) return 0L
-        var total = 0L
-        FileInputStream(file).use { input ->
-            val buffer = ByteArray(pieceBytes)
-            var index = 0
-            while (true) {
-                var filled = 0
-                while (filled < pieceBytes) {
-                    val read = input.read(buffer, filled, pieceBytes - filled)
-                    if (read < 0) break
-                    filled += read
-                }
-                if (filled == 0) break
-                onPiece(index, buffer.copyOf(filled))
-                total += filled
-                index++
-                if (filled < pieceBytes) break
-            }
-        }
-        return total
-    }
-
     data class PieceProfile(val pieceCount: Int, val totalBytes: Long, val merkleRootHex: String)
 
     /** Real SHA-256 Merkle root over the file's own piece digests. Null if the file is unreadable. */
     fun pieceProfileOf(file: File, pieceBytes: Int = FILE_PIECE_BYTES): PieceProfile? {
         if (!file.exists() || !file.isFile) return null
+        return FileInputStream(file).use { pieceProfileOfStream(it, pieceBytes) }
+    }
+
+    /**
+     * Same profile over a stream, for bytes that only exist behind a content Uri or a socket.
+     * A short final read is the end of the stream, not a truncated piece.
+     */
+    fun pieceProfileOfStream(source: InputStream, pieceBytes: Int = FILE_PIECE_BYTES): PieceProfile {
+        require(pieceBytes > 0) { "Piece size must be positive" }
         val digests = mutableListOf<ByteArray>()
+        val buffer = ByteArray(pieceBytes)
         var bytes = 0L
-        forEachFilePiece(file, pieceBytes) { _, piece ->
-            digests += sha256Bytes(piece)
-            bytes += piece.size
+        while (true) {
+            var filled = 0
+            while (filled < pieceBytes) {
+                val read = source.read(buffer, filled, pieceBytes - filled)
+                if (read < 0) break
+                filled += read
+            }
+            if (filled == 0) break
+            digests += sha256Bytes(buffer.copyOf(filled))
+            bytes += filled
+            if (filled < pieceBytes) break
         }
         return PieceProfile(
             pieceCount = digests.size,
@@ -1013,51 +1099,5 @@ object YggCryptoEngine {
             nonce++
         }
         return "hc1:$difficultyBits:$timestampSec:$nonce:0000"
-    }
-
-    /**
-     * Chunk count and root for the backup *estimate* only: nothing is read from a file here, the
-     * numbers describe a hypothetical archive built from row counts. Real transfers use
-     * [pieceProfileOf], which hashes the bytes.
-     */
-    fun estimateBackupChunkProfile(fileName: String, fileSizeBytes: Long): Pair<Int, String> {
-        val avgChunkSize = 64 * 1024L // 64 KB content-defined chunks
-        val chunks = ((fileSizeBytes + avgChunkSize - 1) / avgChunkSize).toInt().coerceAtLeast(1)
-        val leafHashes = (0 until chunks.coerceAtMost(64)).map { idx ->
-            sha256Hex("$fileName:$fileSizeBytes:chunk=$idx")
-        }
-        val combinedLeaves = leafHashes.joinToString(":")
-        val merkleRoot = sha256Hex(combinedLeaves)
-        return chunks to merkleRoot
-    }
-
-    /**
-     * Builds a verified Zero-Knowledge backup snapshot metadata bundle using Argon2id + XChaCha20-Poly1305.
-     */
-    fun buildEncryptedBackupContainer(
-        passphrase: String,
-        conversationsCount: Int,
-        messagesCount: Int,
-        keysCount: Int,
-        isWebDavCloud: Boolean
-    ): EncryptedArchiveBundle {
-        val now = System.currentTimeMillis()
-        val saltHex = sha256Hex("salt:$now:$passphrase").take(32)
-        val derivedKeyHex = sha256Hex("argon2id:m=65536,t=4,p=4:$saltHex:$passphrase")
-        val estimatedBytes = (conversationsCount * 4096L) + (messagesCount * 1536L) + (keysCount * 2048L) + 32768L
-        val prefix = if (isWebDavCloud) "ygg_webdav_zk" else "ygg_vault_local"
-        val fileName = "${prefix}_${now / 1000}.yggbak"
-        val (chunkCount, merkleRoot) = estimateBackupChunkProfile(fileName, estimatedBytes)
-        val authTag = sha256Hex("$derivedKeyHex:$merkleRoot:$estimatedBytes").take(32)
-
-        return EncryptedArchiveBundle(
-            archiveFileName = fileName,
-            payloadSizeBytes = estimatedBytes,
-            fastCdcChunks = chunkCount,
-            merkleRootSha256 = merkleRoot,
-            authTagHex = authTag,
-            kdfSummary = "Argon2id (m=64MB, t=4, p=4)",
-            cipherSummary = "XChaCha20-Poly1305 + FastCDC/Zstd"
-        )
     }
 }
