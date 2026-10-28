@@ -281,7 +281,7 @@ class YggProfileFrameTest {
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {},
             onProfileReceived = { packet ->
@@ -300,7 +300,7 @@ class YggProfileFrameTest {
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -421,7 +421,7 @@ class YggProfileFrameTest {
     ): YggTwinP2PBridge = YggTwinP2PBridge(
         context = null,
         onPacketReceived = {},
-        onDeliveryAckReceived = { _, _, _, _ -> },
+        onDeliveryAckReceived = { _, _, _, _, _ -> },
         onTwinReachableChanged = {},
         onPacketLogAdded = {},
         onProfileReceived = { packet ->

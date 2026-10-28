@@ -740,16 +740,30 @@ class YggRepository(
         val msg = dao.getMessageById(messageId) ?: return "" to (0 to 0)
         val members = dao.getGroupMembers(msg.chatId)
         val alreadyDelivered = msg.deliveredMemberCsv.split(',').filter { it.isNotBlank() }
+        val member = matchGroupMember(members, ackSenderKey)
+            ?: return "" to (alreadyDelivered.size to members.size)
+        return member.memberIpv6 to recordGroupMemberDelivery(messageId, member.memberIpv6)
+    }
+
+    /**
+     * The roster entry an ACK author matches: by the node key the overlay session attributed to
+     * them, by a key that reproduces a roster address, or by the mesh address itself when the
+     * transport only reports one.
+     */
+    private fun matchGroupMember(
+        members: List<GroupMemberEntity>,
+        ackSenderKey: String
+    ): GroupMemberEntity? {
         val sender = ackSenderKey.trim().lowercase()
+        if (sender.isBlank()) return null
         val senderAddress = if (sender.contains(':')) YggCryptoEngine.normalizeIpv6Literal(sender) else null
-        val member = members.firstOrNull { stored ->
+        return members.firstOrNull { stored ->
             val byKey = isEd25519Hex(sender) &&
                 (stored.memberPubKeyHex.trim().lowercase() == sender ||
                     YggCryptoEngine.addressMatchesEd25519Key(stored.memberIpv6, sender))
             byKey || (senderAddress != null &&
                 YggCryptoEngine.normalizeIpv6Literal(stored.memberIpv6) == senderAddress)
-        } ?: return "" to (alreadyDelivered.size to members.size)
-        return member.memberIpv6 to recordGroupMemberDelivery(messageId, member.memberIpv6)
+        }
     }
 
     /**
@@ -1052,9 +1066,11 @@ class YggRepository(
     }
 
     /**
-     * Records the keys this app actually derives and uses. Message envelopes use static
-     * X25519 ECDH + HKDF-SHA256 + AES-256-GCM; no Double Ratchet, Signed PreKey or MLS
-     * state exists behind these records.
+     * Records the keys this app actually derives and uses. Message envelopes use X25519 ECDH +
+     * HKDF-SHA256 + AES-256-GCM: v2 from the static pair alone, v3 with a fresh per-message
+     * X25519 pair folded in (that one-off private half is never recorded as a key, because it
+     * exists only inside the call that seals and is not needed afterwards). No Double Ratchet,
+     * Signed PreKey or MLS state exists behind these records.
      */
     fun buildHierarchyKeyRecords(
         identity: DerivedIdentityHierarchy,
@@ -1082,7 +1098,8 @@ class YggRepository(
             createdAt = now,
             rotationEpoch = 1,
             isActive = true,
-            usageScope = "Статический ECDH для конвертов v2 и медиаключей звонков; без прямой секретности"
+            usageScope = "Статический ECDH для конвертов v2 и одна из двух половин v3; медиаключи звонков. " +
+                "Прямая секретность появляется только в v3, куда к этому DH добавляется одноразовый ключ"
         ),
         CryptoKeyRecordEntity(
             keyId = "key_backup_master",
@@ -1191,8 +1208,45 @@ class YggRepository(
             peerX25519PublicKeyHex = keys.peerX25519PublicKeyHex,
             keyEpoch = 1,
             ratchetStep = ratchetStep,
-            sealedSender = sealedSender
+            sealedSender = sealedSender,
+            // v3 only where the peer has actually shown it can open one — an ACK naming "3",
+            // or a v3 frame from it that this device opened. Everywhere else v2, which both
+            // builds read, so no peer is ever handed a message it cannot decrypt.
+            envelopeVersion = if (conv.peerEnvelopeV3Proven) 3 else 2
         )
+    }
+
+    /**
+     * Records what a delivery ACK said about the envelope versions the peer's build can open.
+     * Only an ACK that really arrived counts: the advertisement comes from the other device
+     * inside the frame this device matched to a message it sent, so nothing here is guessed
+     * from reachability, route state, or the peer having answered anything else.
+     *
+     * @return true when the conversation is now cleared for v3 envelopes.
+     */
+    suspend fun rememberPeerEnvelopeVersions(
+        chatId: String,
+        ackSenderKey: String,
+        advertisedCsv: String
+    ): Boolean {
+        if (!YggCryptoEngine.peerAcceptsEnvelopeVersion(advertisedCsv, 3)) return false
+        val conv = dao.getConversationById(chatId) ?: return false
+        // A group message is acknowledged by one member, and it is that member's personal dialog
+        // row — the one the fan-out seals against — that has to carry the proof.
+        val target = if (conv.chatType == "GROUP") {
+            val member = matchGroupMember(dao.getGroupMembers(conv.chatId), ackSenderKey) ?: return false
+            dao.getAllConversationsNow().firstOrNull {
+                it.ownerProfileId == conv.ownerProfileId &&
+                    it.chatType != "GROUP" &&
+                    !isSelfChatId(it.chatId) &&
+                    sameMeshAddress(it.yggIpv6Address, member.memberIpv6)
+            }
+        } else {
+            conv.takeUnless { isSelfChatId(it.chatId) }
+        } ?: return false
+        if (target.peerEnvelopeV3Proven) return true
+        dao.upsertConversation(target.copy(peerEnvelopeV3Proven = true))
+        return true
     }
 
     suspend fun conversationHasEndToEndKey(chatId: String): Boolean =
@@ -1305,7 +1359,9 @@ class YggRepository(
             reactionsJson = "",
             replyToMessageId = replyToMessageId,
             forwardedFrom = forwardedFrom,
-            envelopeVersion = 2
+            // Read back out of the frame that was actually produced, so the ledger cannot
+            // claim a version this message is not sealed under.
+            envelopeVersion = YggCryptoEngine.envelopeVersionOf(cipherHex)
         )
         dao.insertMessage(message)
 
@@ -2218,7 +2274,13 @@ class YggRepository(
                     System.currentTimeMillis()
                 } else {
                     conv.peerLastSeenAt
-                }
+                },
+                // A v3 frame this device opened is direct evidence about the sender's build:
+                // only a device that can read v3 could have produced one. That is what unlocks
+                // writing v3 back to it. A group frame proves only that some member wrote it,
+                // so the flag travels through the member's own dialog instead, from their ACK.
+                peerEnvelopeV3Proven = conv.peerEnvelopeV3Proven ||
+                    (resolvedEnvelopeVersion == 3 && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId))
             )
         )
         return conv.chatId

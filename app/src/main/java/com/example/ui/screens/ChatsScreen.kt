@@ -2830,9 +2830,12 @@ private fun EncryptedMessageBubble(
                 if (showCipherHex) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        // ratchetStep travels in the envelope but is not mixed into the HKDF key -
-                        // calling it "HKDF step" would advertise a ratchet this build does not have.
-                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}\nEnvelope: v${message.envelopeVersion} • шаг #${message.ratchetStep} (в ключ HKDF не входит)",
+                        // ratchetStep is cosmetic: v2 carries it without mixing it into the HKDF
+                        // key and v3 leaves it out of the frame entirely, so calling this an
+                        // "HKDF step" would advertise a ratchet this build does not have.
+                        text = "AEAD Cipher: ${message.cipherPayloadHex.take(36)}...\nPoW: ${message.hashcashPowToken}\nEnvelope: v${message.envelopeVersion}" +
+                            (if (message.envelopeVersion >= 3) " • ключ на это сообщение одноразовый" else "") +
+                            " • шаг #${message.ratchetStep} (в ключ HKDF не входит)",
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                         color = AmberShieldTertiary
                     )

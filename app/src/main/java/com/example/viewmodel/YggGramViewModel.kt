@@ -514,12 +514,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 syncForegroundServiceNotification()
             }.join()
         },
-        onDeliveryAckReceived = { chatId, messageId, rttMs, ackSenderKey ->
+        onDeliveryAckReceived = { chatId, messageId, rttMs, ackSenderKey, acceptedEnvelopeVersions ->
             viewModelScope.launch {
                 // The message row is authoritative for which chat an ACK belongs to: a group
                 // message confirmed by one member must not be written as delivered to all.
                 val ackedMsg = repository.getMessage(messageId)
                 val ackedChatId = ackedMsg?.chatId?.takeIf { it.isNotBlank() } ?: chatId
+                // What the peer's own ACK said it can read. Nothing here is a guess: an empty
+                // advertisement (an older build, or a socket that proved no identity) leaves
+                // the dialog on v2, which both builds read.
+                repository.rememberPeerEnvelopeVersions(ackedChatId, ackSenderKey, acceptedEnvelopeVersions)
                 if (repository.getConversation(ackedChatId)?.chatType == "GROUP") {
                     // An ACK that lands after the fan-out still has to be counted, otherwise
                     // «2 из 3» freezes at whatever the synchronous pass managed to record.

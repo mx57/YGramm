@@ -238,14 +238,14 @@ class YggGroupAvatarTest {
             onPacketReceived = { packet ->
                 if (!received.isCompleted) received.complete(packet)
             },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )

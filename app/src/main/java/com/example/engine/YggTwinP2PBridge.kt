@@ -333,7 +333,7 @@ data class DiscoveredLanNode(
 class YggTwinP2PBridge(
     private val context: Context? = null,
     private val onPacketReceived: suspend (IncomingTwinPacket) -> Unit,
-    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long, ackSenderPubKeyHex: String) -> Unit,
+    private val onDeliveryAckReceived: suspend (chatId: String, messageId: String, rttMs: Long, ackSenderPubKeyHex: String, acceptedEnvelopeVersions: String) -> Unit,
     private val onDeliveryAckTimeout: suspend (chatId: String, messageId: String, attempts: Int) -> Unit = { _, _, _ -> },
     private val onTwinReachableChanged: (Boolean) -> Unit,
     private val onPacketLogAdded: (YggLivePacketLogEntry) -> Unit,
@@ -2446,7 +2446,11 @@ class YggTwinP2PBridge(
                         "type" to "ACK",
                         "messageId" to wireMessageId,
                         "chatId" to (map["chatId"] ?: ""),
-                        "sentAt" to sentAt.toString()
+                        "sentAt" to sentAt.toString(),
+                        // Which envelope versions this build can open. The sender reads it as
+                        // the peer's own statement about its code, and only then starts writing
+                        // v3 to it; a peer that never answers this way keeps receiving v2.
+                        "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS
                     )
                 )
                 if (seenBefore) {
@@ -2605,7 +2609,13 @@ class YggTwinP2PBridge(
                 } else {
                     pendingOverlayAcks.remove(messageId)?.complete(rtt)
                     markAvatarAdvertised(messageId)
-                    onDeliveryAckReceived(map["chatId"] ?: "", messageId, rtt, senderPubKeyHex)
+                    onDeliveryAckReceived(
+                        map["chatId"] ?: "",
+                        messageId,
+                        rtt,
+                        senderPubKeyHex,
+                        map["envVersions"].orEmpty()
+                    )
                     logPacket(
                         direction = "ACK <- YGG",
                         summary = "ACK получен через оверлей Yggdrasil (RTT: $rtt мс)",
@@ -3109,7 +3119,8 @@ class YggTwinP2PBridge(
                             "type" to "ACK",
                             "messageId" to msgId,
                             "chatId" to incoming.targetChatId,
-                            "sentAt" to sentAt.toString()
+                            "sentAt" to sentAt.toString(),
+                            "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS
                         )
                     )
                     val viaInfo = if (routedViaPeer.isNotBlank()) {
@@ -4438,7 +4449,7 @@ class YggTwinP2PBridge(
                     if (ackMap["type"] == "ACK" && ackMap["messageId"] == messageId) {
                         val rtt = (System.currentTimeMillis() - now).coerceAtLeast(1L)
                         onTwinReachableChanged(true)
-                        onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6)
+                        onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6, ackMap["envVersions"].orEmpty())
                         if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
                             advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] = senderAvatarHash
                         }
@@ -5595,7 +5606,7 @@ class YggTwinP2PBridge(
                     onTwinReachableChanged(true)
                     // This socket proves nothing about who answered, so the frame carries no
                     // sender key and a group message is not attributed to a member here.
-                    onDeliveryAckReceived(chatId, messageId, rtt, "")
+                    onDeliveryAckReceived(chatId, messageId, rtt, "", ackMap?.get("envVersions").orEmpty())
                     logPacket(
                         direction = "ACK <- PEER",
                         summary = "Доставка подтверждена ACK через ${targetSocket.hostString}:${targetSocket.port} (RTT: $rtt мс)",

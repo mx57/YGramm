@@ -108,7 +108,7 @@ class ExampleRobolectricTest {
                     incomingMessageReceived.complete(packet)
                 }
             },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {},
             onReactionReceived = { reaction ->
@@ -121,7 +121,7 @@ class ExampleRobolectricTest {
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, messageId, _, _ ->
+            onDeliveryAckReceived = { _, messageId, _, _, _ ->
                 if (!ackReceived.isCompleted) {
                     ackReceived.complete(messageId)
                 }
@@ -260,14 +260,14 @@ class ExampleRobolectricTest {
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { if (!rx.isCompleted) rx.complete(it) },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -497,7 +497,7 @@ class ExampleRobolectricTest {
                     receivedByProfile.complete(pkt)
                 }
             },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -568,7 +568,7 @@ class ExampleRobolectricTest {
         val node = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = { logs.add(it) }
         )
@@ -628,14 +628,14 @@ class ExampleRobolectricTest {
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { packets.add(it) },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
@@ -812,14 +812,14 @@ class ExampleRobolectricTest {
         val receiverNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = { packets.add(it) },
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
         val senderNode = YggTwinP2PBridge(
             context = null,
             onPacketReceived = {},
-            onDeliveryAckReceived = { _, _, _, _ -> },
+            onDeliveryAckReceived = { _, _, _, _, _ -> },
             onTwinReachableChanged = {},
             onPacketLogAdded = {}
         )
