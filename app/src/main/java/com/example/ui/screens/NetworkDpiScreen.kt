@@ -64,7 +64,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -93,6 +95,10 @@ import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.CensorshipPreset
 import com.example.viewmodel.PeerScannerState
 import com.example.viewmodel.YggGramUiState
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.delay
 
 enum class NetworkViewMode(val title: String, val icon: String) {
     SIMPLE("Умный щит", "🛡️"),
@@ -2151,6 +2157,11 @@ private fun SimpleNetworkShieldContent(
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
+                        Text(
+                            text = rememberFilterAgeLabel(cfg.networkFilterMeasuredAtMs),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         cfg.networkFilterEvidence.forEach { line ->
                             Text(
                                 text = line,
@@ -2206,3 +2217,29 @@ private fun SimpleNetworkShieldContent(
     }
 }
 
+/**
+ * How old the network measurement on this screen is, reticking while the screen is open.
+ *
+ * A verdict describes the link it was taken on. A «только что» left on screen for the next hour
+ * would present a hotspot that died minutes ago as a permanent property of the network, which is
+ * the exact misreading the measurement exists to prevent.
+ */
+@Composable
+private fun rememberFilterAgeLabel(measuredAtMs: Long): String {
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
+    if (measuredAtMs <= 0L) return "Время измерения не записано"
+    val minutes = ((nowMs - measuredAtMs) / 60_000L).coerceAtLeast(0L)
+    val clock = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(measuredAtMs))
+    val age = when {
+        minutes < 1 -> "только что"
+        minutes < 60 -> "$minutes мин назад"
+        else -> "${minutes / 60} ч назад"
+    }
+    return "Измерено в $clock • $age"
+}

@@ -185,7 +185,8 @@ class NetworkDpiController(
         _antiDpiConfig.update {
             it.copy(
                 networkFilterSummary = report.summary,
-                networkFilterEvidence = YggNetworkFilterProbe.evidenceLines(report)
+                networkFilterEvidence = YggNetworkFilterProbe.evidenceLines(report),
+                networkFilterMeasuredAtMs = report.measuredAtMs
             )
         }
         return report
@@ -218,12 +219,27 @@ class NetworkDpiController(
                     // could be reached at all, because the filter decides by destination
                     // address: hunting a spare there only spends the user's metered data.
                     val filter = networkFilterReport(force = false)
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (filter != null && filter.verdict == YggNetworkFilterProbe.Verdict.NO_LINK) {
+                        // A link that answers nothing about any address is not a link to hunt a
+                        // spare node over: the directory fetch, every candidate probe and the dial
+                        // would all be spent on the same route that carries nothing. The autopilot
+                        // says it is standing by instead of pretending it tried, once per pause.
+                        if (now - lastWatchdogFailoverAt < FILTERED_FAILOVER_COOLDOWN_MS) continue
+                        lastWatchdogFailoverAt = now
+                        withContext(Dispatchers.Main) {
+                            onBannerMessage("Автопилот узел не ищет: ${filter.summary}")
+                        }
+                        continue
+                    }
+                    // Silence gets the same long pause a filter gets. The measurement cannot say
+                    // which of the two it is, and both make a directory hunt expensive the same
+                    // way: on a path that answers nothing, a candidate probe answers nothing either.
                     val cooldown = if (filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN) {
                         WATCHDOG_FAILOVER_COOLDOWN_MS
                     } else {
                         FILTERED_FAILOVER_COOLDOWN_MS
                     }
-                    val now = android.os.SystemClock.elapsedRealtime()
                     if (now - lastWatchdogFailoverAt < cooldown) continue
                     lastWatchdogFailoverAt = now
                     autoCascadeFailover(

@@ -35,8 +35,33 @@ object YggNetworkFilterProbe {
         /** Hostnames would not resolve while literal addresses still answered: DNS is filtered. */
         DNS_FILTERED("сеть фильтрует DNS"),
 
-        /** Nothing answered: there is no usable data connection to classify at all. */
-        NO_LINK("нет выхода в интернет")
+        /**
+         * Nothing answered, and nothing was refused either: every connect ran out its timeout.
+         * Packets left the phone and no reply came back, which is a different behaviour from an
+         * explicit refusal and from a link with no route at all.
+         */
+        SILENTLY_DROPPED("сеть молча дропает соединения"),
+
+        /** Nothing answered and the network said why: refused, no route, no DNS. */
+        NO_LINK("нет выхода в интернет"),
+
+        /** No reference was measured at all, so no claim about the network is available. */
+        NOT_MEASURED("измерение не выполнено")
+    }
+
+    /**
+     * How one reference failed, named by the mechanism the socket layer showed.
+     *
+     * A refusal and a silence are not the same observation: a refusal is the network answering
+     * about an address, a timeout is the address never answering. The verdict needs that split,
+     * and so does the autopilot, which should not spend a directory fetch on a link that carries
+     * nothing at all.
+     */
+    enum class Reason(val labelRu: String) {
+        ANSWERED("адрес ответил"),
+        REFUSED("отклонено сетью"),
+        DROPPED("молчит до таймаута"),
+        UNRESOLVED("имя не разрешилось")
     }
 
     /** One reference destination. [byName] marks whether the host has to be resolved first. */
@@ -57,19 +82,33 @@ object YggNetworkFilterProbe {
         AFTER_CONNECT
     }
 
-    /** What one reference did: connected, refused, timed out, or would not resolve. */
+    /** What one reference did: connected, refused, fell silent, or would not resolve. */
     data class Probe(
         val reference: Reference,
         val connected: Boolean,
         val elapsedMs: Long,
         val detail: String,
-        val stage: FailureStage? = null
-    )
+        val stage: FailureStage? = null,
+        // probeOne always passes this; the fallback reads the detail string so a hand-built
+        // probe in a test cannot silently default to the wrong mechanism.
+        val reason: Reason = reasonOf(connected, detail)
+    ) {
+        companion object {
+            internal fun reasonOf(connected: Boolean, detail: String): Reason = when {
+                connected -> Reason.ANSWERED
+                detail.startsWith("имя не разрешилось") -> Reason.UNRESOLVED
+                detail.startsWith("SocketTimeoutException") -> Reason.DROPPED
+                else -> Reason.REFUSED
+            }
+        }
+    }
 
     data class Report(
         val verdict: Verdict,
         val summary: String,
-        val probes: List<Probe>
+        val probes: List<Probe>,
+        /** Wall clock of the measurement: an old verdict about a different link is not a verdict. */
+        val measuredAtMs: Long = System.currentTimeMillis()
     ) {
         /** Addresses the network let through - the set a node has to live in to be dialable here. */
         val reachableLabels: List<String> get() = probes.filter { it.connected }.map { it.reference.label }
@@ -130,8 +169,15 @@ object YggNetworkFilterProbe {
                 is UnknownHostException -> "имя не разрешилось (${e.message ?: "нет ответа DNS"})"
                 else -> e.javaClass.simpleName + (e.message?.let { " • $it" } ?: "")
             }
-            Probe(reference, false, elapsed(startedAt), detail, stageOf(e))
+            Probe(reference, false, elapsed(startedAt), detail, stageOf(e), reasonOf(e))
         }
+    }
+
+    /** The mechanism the socket layer showed, read off the exception rather than its wording. */
+    private fun reasonOf(e: Throwable): Reason = when (e) {
+        is UnknownHostException -> Reason.UNRESOLVED
+        is SocketTimeoutException -> Reason.DROPPED
+        else -> Reason.REFUSED
     }
 
     /**
@@ -155,15 +201,19 @@ object YggNetworkFilterProbe {
      * filter, it is a link that carries nothing.
      */
     internal fun classify(probes: List<Probe>): Verdict {
+        if (probes.isEmpty()) return Verdict.NOT_MEASURED
         val connected = probes.filter { it.connected }
         if (connected.isEmpty()) {
-            // A link that resolves names but answers nothing is still a link with no internet;
-            // a link that refuses to even resolve is reported the same way, honestly.
-            return Verdict.NO_LINK
+            // Silence is not a refusal. When every connect ran out its timeout, nothing in the
+            // network ever answered - that is a route carrying nothing, which is a different thing
+            // to measure than an address space the network says no to. Neither one proves an
+            // allow-list, and neither one is a link a spare node can be dialled over.
+            return if (probes.all { it.reason == Reason.DROPPED }) Verdict.SILENTLY_DROPPED
+            else Verdict.NO_LINK
         }
         val nameProbes = probes.filter { it.reference.byName }
         val namesAllFailed = nameProbes.isNotEmpty() && nameProbes.none { it.connected } &&
-            nameProbes.all { it.detail.startsWith("имя не разрешилось") }
+            nameProbes.all { it.reason == Reason.UNRESOLVED }
         val literalsAnswered = connected.any { !it.reference.byName }
         if (connected.size == probes.size) return Verdict.OPEN
         // One silent destination is a fact about that destination, not about the link. Calling
@@ -199,16 +249,41 @@ object YggNetworkFilterProbe {
                 "Сеть фильтрует DNS: имена вне списка не разрешаются ($up из $total проходят по " +
                     "адресу). Узел должен быть доступен адресом из белого списка, а не доменом."
             Verdict.NO_LINK ->
-                "Ни один из $total контрольных адресов не отвечает: по этой связи нет выхода " +
-                    "в интернет, классифицировать фильтр невозможно."
+                "Ни один из $total контрольных адресов не отвечает (${answerNote(refused)}): по этой " +
+                    "связи нет выхода в интернет, классифицировать фильтр невозможно."
+            Verdict.SILENTLY_DROPPED ->
+                "Молчание вместо ответа: все $total контрольных адресов не ответили за " +
+                    "${CONNECT_TIMEOUT_MS} мс, и ни один не был отклонён явно. Для приложения это " +
+                    "наблюдение неотличимо от связи без маршрута: ответа нет, и по одному лишь " +
+                    "таймауту нельзя утверждать ни белый список, ни то, что запрос вообще вышел за " +
+                    "пределы телефона. Резервные узлы на такой связи проверяются редко - не потому, " +
+                    "что надежда есть, а чтобы не тратить трафик на заведомо немой путь."
+            Verdict.NOT_MEASURED ->
+                "Контрольные адреса не проверялись: измерение не выполнено, поэтому об этой сети " +
+                    "не утверждается ничего."
         }
     }
 
     /** Per-address evidence, one line each, for the self-check report on the network screen. */
     fun evidenceLines(report: Report): List<String> = report.probes.map {
         "${if (it.connected) "проходит" else "не проходит"} • ${it.reference.label} " +
-            "${it.reference.host}:${it.reference.port} • ${it.detail} • ${it.elapsedMs} мс"
+            "${it.reference.host}:${it.reference.port} • ${it.detail} • ${it.elapsedMs} мс" +
+            (if (it.connected) "" else " • ${it.reason.labelRu}")
     }
+
+    /**
+     * How the network said no, in one clause - only for the verdicts where every address failed.
+     *
+     * The mechanisms are not interchangeable and the user should not have to guess which one the
+     * measurement actually saw: a refusal is an answer about an address, a timeout is no answer,
+     * and an unresolved name is a statement about DNS.
+     */
+    private fun answerNote(refused: List<Probe>): String =
+        refused.groupBy { it.reason }
+            .toSortedMap(compareBy { it.ordinal })
+            .entries.joinToString(", ") { (reason, probes) ->
+                "${probes.size} — ${reason.labelRu.lowercase()}"
+            }
 
     /**
      * Where the refusals landed, in one clause.

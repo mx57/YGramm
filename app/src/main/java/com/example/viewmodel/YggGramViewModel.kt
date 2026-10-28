@@ -159,7 +159,11 @@ data class AntiDpiConfigState(
     // refused handshake says something about the peer, and reading one as the other is how the
     // user ends up blaming the app for the carrier's filter.
     val networkFilterSummary: String = "",
-    val networkFilterEvidence: List<String> = emptyList()
+    val networkFilterEvidence: List<String> = emptyList(),
+    // A verdict describes the link it was measured on. Without the moment of measurement the
+    // screen would present an hour-old answer as if it were about the network in front of the
+    // user now, which is exactly how a killed hotspot reads as a permanent filter.
+    val networkFilterMeasuredAtMs: Long = 0L
 )
 
 data class DecentralizedUserProfile(
