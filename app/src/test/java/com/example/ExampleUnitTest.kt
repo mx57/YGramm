@@ -221,7 +221,7 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun hashcashAndFastCdcMerkle_produceValidOutputs() {
+    fun hashcashAndMerkleRoot_produceValidOutputs() {
         val pow = YggCryptoEngine.computeHashcashStamp(
             recipientIpv6 = "0201:8f4e:3b12:90a4:55d1:c209:7e11:44a8",
             payloadHashHex = "c0112233445566778899aabbccddeeff",
@@ -229,12 +229,13 @@ class ExampleUnitTest {
         )
         assertTrue(pow.startsWith("hc1:8:"))
 
-        val (chunks, merkleRoot) = YggCryptoEngine.estimateBackupChunkProfile(
-            fileName = "ygg_whitelist_bridges_ru.json.zst",
-            fileSizeBytes = 262_144L
-        )
-        assertEquals(4, chunks)
-        assertEquals(64, merkleRoot.length)
+        val pieces = (0 until 4).map { index ->
+            YggCryptoEngine.sha256Bytes(ByteArray(65_536) { byte -> (byte + index).toByte() })
+        }
+        val root = YggCryptoEngine.merkleRootOfPieceDigests(pieces)
+        assertEquals(64, root.length)
+        // A root over a different set of pieces must differ, or it proves nothing about a file.
+        assertNotEquals(YggCryptoEngine.merkleRootOfPieceDigests(pieces.drop(1)), root)
     }
 
     @Test

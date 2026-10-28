@@ -813,8 +813,9 @@ fun YggGramRootApp(
                                 onRegenerateIdentity = viewModel::regenerateNewSeedIdentity,
                                 onSyncDevicesNow = viewModel::triggerCrossPlatformSyncNow,
                                 onPairDevice = viewModel::pairNewDevice,
-                                onCreateBackup = viewModel::createEncryptedBackup,
-                                onVerifyOrRestoreBackup = viewModel::verifyOrRestoreBackup
+                                onExportDatabase = viewModel::exportEncryptedDatabase,
+                                onVerifyExportedArchive = viewModel::verifyExportedArchive,
+                                onRestoreFromArchive = viewModel::restoreFromArchive
                             )
 
                             YggNavTab.PROFILE_PRIVACY -> ProfilePrivacyScreen(

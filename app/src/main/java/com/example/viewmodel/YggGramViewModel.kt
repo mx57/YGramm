@@ -18,6 +18,7 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.sqlite.db.SimpleSQLiteQuery
 import com.example.data.BackupSnapshotEntity
 import com.example.data.CallLogEntity
 import com.example.data.ConversationEntity
@@ -29,6 +30,7 @@ import com.example.data.MessageEntity
 import com.example.data.P2PFileTransferEntity
 import com.example.data.UserProfileEntity
 import com.example.data.YggDatabase
+import com.example.data.YggEncryptedExport
 import com.example.data.YggPeerEntity
 import com.example.data.YggRepository
 import com.example.engine.CountryFilterOption
@@ -333,6 +335,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         // A muted peer still transmits encrypted silence, so this many seconds without a
         // single decrypted inbound frame can only mean the media path is dead.
         const val CALL_RX_STALL_SECONDS = 6
+
+        const val TAG_EXPORT = "YggExport"
+
+        /**
+         * Where the database key actually comes from. SQLCipher's own KDF parameters are read
+         * from PRAGMA at export time, so this line only states the custody of the passphrase.
+         */
+        const val KEY_CUSTODY_SPEC =
+            "Пароль базы: 32 байта из SecureRandom, обёрнут AES-GCM ключом Android Keystore"
     }
 
     private var activeCallJob: kotlinx.coroutines.Job? = null
@@ -756,15 +767,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } }
     )
 
-    val vaultIdentityController = VaultIdentityController(
-        application = application,
-        repository = repository,
-        networkEngine = networkEngine,
-        scope = viewModelScope,
-        onBannerMessage = { msg -> _uiState.update { it.copy(statusBannerMessage = msg) } },
-        onProfileUpdated = { applyUserProfileEntityToState(it) },
-        onSyncForegroundNotification = { syncForegroundServiceNotification() }
-    )
+    val vaultIdentityController = VaultIdentityController()
 
     init {
         YGrammUpdateController.attach(application)
@@ -4944,32 +4947,119 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun createEncryptedBackup(passphrase: String, isWebDavCloud: Boolean) {
-        val effectivePass = passphrase.ifBlank { _uiState.value.identity.backupMasterKeyFingerprint }
+    /**
+     * Copies the live SQLCipher file to a user-picked document and records what the written bytes
+     * actually hash to. An archive is only marked verified when the read-back copy matches the
+     * database file piece for piece.
+     */
+    fun exportEncryptedDatabase(uri: Uri) {
         viewModelScope.launch {
-            val snapshot = repository.createBackupSnapshot(
-                passphrase = effectivePass,
-                isWebDavCloud = isWebDavCloud
-            )
-            _uiState.update {
-                it.copy(
-                    statusBannerMessage = "Сохранён снимок метаданных ${snapshot.archiveFileName}. " +
-                        "Файла архива на диске нет: экспорт шифрованной базы ещё не реализован"
-                )
+            val app = getApplication<Application>()
+            val dbFile = app.getDatabasePath(YggDatabase.DATABASE_NAME)
+            if (!dbFile.exists() || dbFile.length() == 0L) {
+                setBanner("Экспорт не выполнен: файл шифрованной базы «${YggDatabase.DATABASE_NAME}» пуст или отсутствует")
+                return@launch
             }
+            val pendingJournal = java.io.File("${dbFile.absolutePath}-journal")
+            if (pendingJournal.exists() && pendingJournal.length() > 0L) {
+                setBanner("Экспорт не выполнен: в базе идёт незавершённая транзакция — подождите и повторите")
+                return@launch
+            }
+            val archiveName = readArchiveDisplayName(uri) ?: uri.lastPathSegment ?: YggDatabase.DATABASE_NAME
+            val outcome = runCatching {
+                withContext(Dispatchers.IO) {
+                    val cipherSpec = readSqlCipherSpec()
+                    YggEncryptedExport.copyAndProfile(
+                        sourceFile = dbFile,
+                        archiveFileName = archiveName,
+                        openSink = {
+                            app.contentResolver.openOutputStream(uri, "w")
+                                ?: error("Выбранный файл не открылся для записи")
+                        },
+                        readBackArchive = { app.contentResolver.openInputStream(uri) },
+                        cipherSpec = cipherSpec,
+                        keySpec = KEY_CUSTODY_SPEC
+                    )
+                }
+            }
+            outcome.fold(
+                onSuccess = { profile ->
+                    val snapshot = repository.recordDatabaseExport(profile)
+                    setBanner(
+                        if (profile.verified) {
+                            "Экспорт готов: ${archiveName}, ${profile.sizeBytes} байт, " +
+                                "${profile.pieceCount} кусков SHA-256, root совпал с базой"
+                        } else {
+                            "Архив ${archiveName} записан, но проверка не пройдена: " +
+                                "root файла ${profile.merkleRootHex.take(16)}… ≠ root базы " +
+                                "${profile.sourceRootHex.take(16)}… (${profile.sizeBytes} из ${profile.sourceSizeBytes} байт)"
+                        }
+                    )
+                    Log.i(TAG_EXPORT, "Export ${snapshot.snapshotId} verified=${profile.verified} bytes=${profile.sizeBytes}")
+                },
+                onFailure = { error ->
+                    setBanner("Экспорт не выполнен: ${error.javaClass.simpleName} — ${error.message}")
+                }
+            )
         }
     }
 
-    fun verifyOrRestoreBackup(snapshot: BackupSnapshotEntity, isRestore: Boolean) {
-        val msg = if (isRestore) {
-            "Восстановление из ${snapshot.archiveFileName} выполнено быть не может: реального архива нет, " +
-                "изменены только записи об этом снимке"
-        } else {
-            "Сводка ${snapshot.archiveFileName} посчитана по метаданным снимка: ни Poly1305, " +
-                "ни дерево Merkle от файла архива не проверялись — самого файла нет"
+    /** Re-hashes the archive the user points at and compares it with the recorded export. */
+    fun verifyExportedArchive(snapshot: BackupSnapshotEntity, uri: Uri) {
+        viewModelScope.launch {
+            val app = getApplication<Application>()
+            val mismatch = withContext(Dispatchers.IO) {
+                val stream = runCatching { app.contentResolver.openInputStream(uri) }
+                    .onFailure { return@withContext "Файл не открылся для чтения: ${it.message}" }
+                    .getOrNull()
+                YggEncryptedExport.checkAgainstSnapshot(stream, snapshot)
+            }
+            repository.recordSnapshotCheck(snapshot, mismatch == null)
+            setBanner(
+                if (mismatch == null) {
+                    "Проверка пройдена: ${snapshot.archiveFileName} весит ${snapshot.sizeBytes} байт " +
+                        "и даёт тот же Merkle root, что был записан при экспорте"
+                } else {
+                    "Проверка не пройдена: $mismatch"
+                }
+            )
         }
-        _uiState.update { it.copy(statusBannerMessage = msg) }
     }
+
+    fun restoreFromArchive(snapshot: BackupSnapshotEntity) {
+        setBanner(YggEncryptedExport.restoreRefusalReason(snapshot.archiveFileName))
+    }
+
+    private fun setBanner(message: String) {
+        _uiState.update { it.copy(statusBannerMessage = message) }
+    }
+
+    private fun readArchiveDisplayName(uri: Uri): String? {
+        val app = getApplication<Application>()
+        if (uri.scheme != "content") return null
+        return runCatching {
+            app.contentResolver.query(uri, arrayOf(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst() && cursor.columnCount > 0) cursor.getString(0) else null
+                }
+        }.getOrNull()
+    }
+
+    /**
+     * Asks SQLCipher what it actually runs. The answer comes from PRAGMA on the open database, so
+     * an export log cannot drift from the cipher this build was linked against.
+     */
+    private fun readSqlCipherSpec(): String = runCatching {
+        val db = database.openHelper.writableDatabase
+        val version = db.query(SimpleSQLiteQuery("PRAGMA cipher_version"))
+            .use { if (it.moveToFirst()) it.getString(0) else "версия не прочиталась" }
+        val params = db.query(SimpleSQLiteQuery("PRAGMA cipher")).use { cursor ->
+            if (!cursor.moveToFirst()) ""
+            else (0 until minOf(cursor.columnCount, cursor.columnNames.size))
+                .joinToString(", ") { index -> "${cursor.columnNames[index]}=${cursor.getString(index)}" }
+        }
+        if (params.isBlank()) "SQLCipher $version" else "SQLCipher $version: $params"
+    }.getOrElse { "SQLCipher: параметры прочитались не полностью (${it.javaClass.simpleName})" }
 
     fun updateDecentralizedProfile(
         displayName: String,

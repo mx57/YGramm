@@ -4,6 +4,7 @@ package com.example.engine
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.InputStream
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -24,16 +25,6 @@ data class DerivedIdentityHierarchy(
     val x25519SignedPreKeyHex: String,
     val mlsLeafKeyHex: String,
     val backupMasterKeyFingerprint: String
-)
-
-data class EncryptedArchiveBundle(
-    val archiveFileName: String,
-    val payloadSizeBytes: Long,
-    val fastCdcChunks: Int,
-    val merkleRootSha256: String,
-    val authTagHex: String,
-    val kdfSummary: String,
-    val cipherSummary: String
 )
 
 object YggCryptoEngine {
@@ -780,47 +771,34 @@ object YggCryptoEngine {
         return cipher.doFinal(decoder.decode(cipherBase64))
     }
 
-    /**
-     * Streams [file] in fixed pieces, handing each one to [onPiece] so the caller can send or
-     * hash it without ever holding the whole file. Returns the byte count actually read.
-     */
-    fun forEachFilePiece(
-        file: File,
-        pieceBytes: Int = FILE_PIECE_BYTES,
-        onPiece: (index: Int, bytes: ByteArray) -> Unit
-    ): Long {
-        if (!file.exists() || pieceBytes <= 0) return 0L
-        var total = 0L
-        FileInputStream(file).use { input ->
-            val buffer = ByteArray(pieceBytes)
-            var index = 0
-            while (true) {
-                var filled = 0
-                while (filled < pieceBytes) {
-                    val read = input.read(buffer, filled, pieceBytes - filled)
-                    if (read < 0) break
-                    filled += read
-                }
-                if (filled == 0) break
-                onPiece(index, buffer.copyOf(filled))
-                total += filled
-                index++
-                if (filled < pieceBytes) break
-            }
-        }
-        return total
-    }
-
     data class PieceProfile(val pieceCount: Int, val totalBytes: Long, val merkleRootHex: String)
 
     /** Real SHA-256 Merkle root over the file's own piece digests. Null if the file is unreadable. */
     fun pieceProfileOf(file: File, pieceBytes: Int = FILE_PIECE_BYTES): PieceProfile? {
         if (!file.exists() || !file.isFile) return null
+        return FileInputStream(file).use { pieceProfileOfStream(it, pieceBytes) }
+    }
+
+    /**
+     * Same profile over a stream, for bytes that only exist behind a content Uri or a socket.
+     * A short final read is the end of the stream, not a truncated piece.
+     */
+    fun pieceProfileOfStream(source: InputStream, pieceBytes: Int = FILE_PIECE_BYTES): PieceProfile {
+        require(pieceBytes > 0) { "Piece size must be positive" }
         val digests = mutableListOf<ByteArray>()
+        val buffer = ByteArray(pieceBytes)
         var bytes = 0L
-        forEachFilePiece(file, pieceBytes) { _, piece ->
-            digests += sha256Bytes(piece)
-            bytes += piece.size
+        while (true) {
+            var filled = 0
+            while (filled < pieceBytes) {
+                val read = source.read(buffer, filled, pieceBytes - filled)
+                if (read < 0) break
+                filled += read
+            }
+            if (filled == 0) break
+            digests += sha256Bytes(buffer.copyOf(filled))
+            bytes += filled
+            if (filled < pieceBytes) break
         }
         return PieceProfile(
             pieceCount = digests.size,
@@ -1013,51 +991,5 @@ object YggCryptoEngine {
             nonce++
         }
         return "hc1:$difficultyBits:$timestampSec:$nonce:0000"
-    }
-
-    /**
-     * Chunk count and root for the backup *estimate* only: nothing is read from a file here, the
-     * numbers describe a hypothetical archive built from row counts. Real transfers use
-     * [pieceProfileOf], which hashes the bytes.
-     */
-    fun estimateBackupChunkProfile(fileName: String, fileSizeBytes: Long): Pair<Int, String> {
-        val avgChunkSize = 64 * 1024L // 64 KB content-defined chunks
-        val chunks = ((fileSizeBytes + avgChunkSize - 1) / avgChunkSize).toInt().coerceAtLeast(1)
-        val leafHashes = (0 until chunks.coerceAtMost(64)).map { idx ->
-            sha256Hex("$fileName:$fileSizeBytes:chunk=$idx")
-        }
-        val combinedLeaves = leafHashes.joinToString(":")
-        val merkleRoot = sha256Hex(combinedLeaves)
-        return chunks to merkleRoot
-    }
-
-    /**
-     * Builds a verified Zero-Knowledge backup snapshot metadata bundle using Argon2id + XChaCha20-Poly1305.
-     */
-    fun buildEncryptedBackupContainer(
-        passphrase: String,
-        conversationsCount: Int,
-        messagesCount: Int,
-        keysCount: Int,
-        isWebDavCloud: Boolean
-    ): EncryptedArchiveBundle {
-        val now = System.currentTimeMillis()
-        val saltHex = sha256Hex("salt:$now:$passphrase").take(32)
-        val derivedKeyHex = sha256Hex("argon2id:m=65536,t=4,p=4:$saltHex:$passphrase")
-        val estimatedBytes = (conversationsCount * 4096L) + (messagesCount * 1536L) + (keysCount * 2048L) + 32768L
-        val prefix = if (isWebDavCloud) "ygg_webdav_zk" else "ygg_vault_local"
-        val fileName = "${prefix}_${now / 1000}.yggbak"
-        val (chunkCount, merkleRoot) = estimateBackupChunkProfile(fileName, estimatedBytes)
-        val authTag = sha256Hex("$derivedKeyHex:$merkleRoot:$estimatedBytes").take(32)
-
-        return EncryptedArchiveBundle(
-            archiveFileName = fileName,
-            payloadSizeBytes = estimatedBytes,
-            fastCdcChunks = chunkCount,
-            merkleRootSha256 = merkleRoot,
-            authTagHex = authTag,
-            kdfSummary = "Argon2id (m=64MB, t=4, p=4)",
-            cipherSummary = "XChaCha20-Poly1305 + FastCDC/Zstd"
-        )
     }
 }

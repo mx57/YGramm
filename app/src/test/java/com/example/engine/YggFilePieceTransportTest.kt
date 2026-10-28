@@ -7,6 +7,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayInputStream
 import java.io.File
 
 /**
@@ -117,37 +118,29 @@ class YggFilePieceTransportTest {
     }
 
     @Test
-    fun `every byte of the file is read exactly once`() {
-        val body = ByteArray(27) { (it * 3).toByte() }
-        val lengths = mutableListOf<Int>()
-        var indexSum = 0
-
-        val covered = YggCryptoEngine.forEachFilePiece(tempFile(body), pieceBytes = 10) { index, piece ->
-            indexSum += index
-            lengths += piece.size
-        }
-
-        assertEquals(27L, covered)
-        assertEquals(listOf(10, 10, 7), lengths)
-        assertEquals(3, indexSum) // 0 + 1 + 2
-    }
-
-    @Test
     fun `an absent file has no profile instead of a fabricated root`() {
         assertNull(YggCryptoEngine.pieceProfileOf(File("ygg_does_not_exist.bin")))
-        assertEquals(0L, YggCryptoEngine.forEachFilePiece(File("ygg_does_not_exist.bin")) { _, _ -> })
     }
 
     @Test
-    fun `the real root differs from the estimate built from a name and a size`() {
-        val file = tempFile(ByteArray(12 * 1024 * 3) { 7 })
+    fun `a stream of the same bytes hashes exactly like the file`() {
+        val body = ByteArray(12 * 1024 * 3) { 7 }
+        val file = tempFile(body)
         val real = YggCryptoEngine.pieceProfileOf(file)
         requireNotNull(real)
 
-        val estimate = YggCryptoEngine.estimateBackupChunkProfile(file.name, real.totalBytes)
+        val streamed = ByteArrayInputStream(body).use { YggCryptoEngine.pieceProfileOfStream(it) }
 
-        assertNotEquals(estimate.second, real.merkleRootHex)
-        assertTrue(real.merkleRootHex.length == 64)
+        assertEquals(real.merkleRootHex, streamed.merkleRootHex)
+        assertEquals(real.pieceCount, streamed.pieceCount)
+        assertEquals(64, streamed.merkleRootHex.length)
+
+        // A storage provider that hands back one byte less is a different archive: the old
+        // backup path could not notice, because it never read bytes at all.
+        val short = ByteArrayInputStream(body.copyOfRange(0, body.size - 1))
+            .use { YggCryptoEngine.pieceProfileOfStream(it) }
+        assertNotEquals(real.merkleRootHex, short.merkleRootHex)
+        assertEquals(body.size - 1L, short.totalBytes)
     }
 
     private fun assertEqualsBytes(expected: ByteArray, actual: ByteArray) {

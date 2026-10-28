@@ -2394,32 +2394,29 @@ class YggRepository(
         dao.upsertLinkedDevice(dev)
     }
 
-    suspend fun createBackupSnapshot(
-        passphrase: String,
-        isWebDavCloud: Boolean
-    ): BackupSnapshotEntity {
-        val convCount = dao.countConversations()
-        val keysCount = dao.getCryptoKeysNow().size
-        val bundle = YggCryptoEngine.buildEncryptedBackupContainer(
-            passphrase = passphrase,
-            conversationsCount = convCount,
-            messagesCount = 0,
-            keysCount = keysCount,
-            isWebDavCloud = isWebDavCloud
-        )
+    /**
+     * Records an export that already happened on disk. The numbers come from the archive bytes,
+     * never from row counts, and isVerified is only true when the read-back archive hashed the
+     * same as the database file.
+     */
+    suspend fun recordDatabaseExport(profile: YggEncryptedExport.ArchiveProfile): BackupSnapshotEntity {
         val entity = BackupSnapshotEntity(
             snapshotId = "bak_${UUID.randomUUID().toString().take(8)}",
-            archiveFileName = bundle.archiveFileName,
+            archiveFileName = profile.archiveFileName,
             createdAt = System.currentTimeMillis(),
-            sizeBytes = bundle.payloadSizeBytes,
-            chunkCountFastCdc = bundle.fastCdcChunks,
-            kdfSpec = bundle.kdfSummary,
-            cipherSpec = bundle.cipherSummary,
-            merkleRootHex = bundle.merkleRootSha256,
-            destination = if (isWebDavCloud) "WEBDAV_CLOUD_ZERO_KNOWLEDGE" else "LOCAL_ENCRYPTED_CONTAINER",
-            isVerified = true
+            sizeBytes = profile.sizeBytes,
+            chunkCountFastCdc = profile.pieceCount,
+            kdfSpec = profile.keySpec,
+            cipherSpec = profile.cipherSpec,
+            merkleRootHex = profile.merkleRootHex,
+            destination = "SQLCIPHER_DB_FILE_COPY",
+            isVerified = profile.verified
         )
         dao.upsertBackupSnapshot(entity)
         return entity
+    }
+
+    suspend fun recordSnapshotCheck(snapshot: BackupSnapshotEntity, verified: Boolean) {
+        dao.upsertBackupSnapshot(snapshot.copy(isVerified = verified))
     }
 }
