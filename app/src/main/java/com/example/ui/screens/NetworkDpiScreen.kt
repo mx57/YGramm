@@ -136,6 +136,7 @@ fun NetworkDpiScreen(
     onImportCustomPeers: (String) -> Unit = {},
     onProbeCoverMask: () -> Unit = {},
     onProbeNetworkFilter: () -> Unit = {},
+    onCheckVoiceCodec: () -> Unit = {},
     onClearPacketLogs: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -281,6 +282,7 @@ fun NetworkDpiScreen(
                 onSelectPreset = onSelectPreset,
                 onProbeCoverMask = onProbeCoverMask,
                 onProbeNetworkFilter = onProbeNetworkFilter,
+                onCheckVoiceCodec = onCheckVoiceCodec,
                 onSwitchToExpertMode = { viewMode = NetworkViewMode.EXPERT }
             )
         } else {
@@ -1729,6 +1731,7 @@ private fun SimpleNetworkShieldContent(
     onSelectPreset: (CensorshipPreset) -> Unit,
     onProbeCoverMask: () -> Unit,
     onProbeNetworkFilter: () -> Unit,
+    onCheckVoiceCodec: () -> Unit,
     onSwitchToExpertMode: () -> Unit
 ) {
     val cfg = uiState.antiDpiConfig
@@ -2174,7 +2177,67 @@ private fun SimpleNetworkShieldContent(
             }
         }
 
-        // --- 4. EXPERT MODE INVITATION CARD ---
+        // --- 4. VOICE CODEC MEASUREMENT ---
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Голосовые: сжатие Opus",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Запись хранится как есть и сжимается только на выходе, да ещё по адресу, " +
+                            "который сам назвал Opus в подтверждении доставки. Собеседник со старой " +
+                            "сборкой получает обычный WAV и ничего не теряет.\n" +
+                            "Не делается: сжатие в групповых записях и в голосе во время звонка.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedButton(
+                        onClick = onCheckVoiceCodec,
+                        enabled = !cfg.isCheckingVoiceCodec,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("check_voice_codec_button")
+                    ) {
+                        Text(
+                            text = if (cfg.isCheckingVoiceCodec) {
+                                "Идёт замер на этом телефоне..."
+                            } else {
+                                "Проверить кодек на этом устройстве"
+                            }
+                        )
+                    }
+                    if (cfg.voiceCodecSummary.isNotBlank()) {
+                        cfg.voiceCodecSummary.lines().forEach { line ->
+                            Text(
+                                text = line,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        Text(
+                            text = rememberFilterAgeLabel(cfg.voiceCodecMeasuredAtMs),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+
+        // --- 5. EXPERT MODE INVITATION CARD ---
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),

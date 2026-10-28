@@ -49,6 +49,7 @@ import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
+import com.example.engine.YggVoiceCodec
 import com.example.viewmodel.controllers.ChatConversationController
 import com.example.viewmodel.controllers.NetworkDpiController
 import com.example.viewmodel.controllers.VaultIdentityController
@@ -165,7 +166,12 @@ data class AntiDpiConfigState(
     // A verdict describes the link it was measured on. Without the moment of measurement the
     // screen would present an hour-old answer as if it were about the network in front of the
     // user now, which is exactly how a killed hotspot reads as a permanent filter.
-    val networkFilterMeasuredAtMs: Long = 0L
+    val networkFilterMeasuredAtMs: Long = 0L,
+    // Measured on this device, by this app: which codec it really found and what one note
+    // actually costs there. A number copied from a codec brochure would be a guess.
+    val voiceCodecSummary: String = "",
+    val voiceCodecMeasuredAtMs: Long = 0L,
+    val isCheckingVoiceCodec: Boolean = false
 )
 
 data class DecentralizedUserProfile(
@@ -734,6 +740,14 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         onProfileRelayPacketHandled = { profileId, _ ->
             viewModelScope.launch {
                 repository.incrementProfileRelayedPackets(profileId, 1)
+            }
+        },
+        // A peer that advertises Opus in its own ACK can encode and decode it, because that is
+        // exactly the condition our build applies before it writes an advertisement. The dialog
+        // stores the proof, and only then does a note leave this device compressed to it.
+        onPeerVoiceCodecsReceived = { chatId, ackSenderKey, voiceCodecsCsv ->
+            viewModelScope.launch {
+                repository.rememberPeerCapabilities(chatId, ackSenderKey, "", voiceCodecsCsv)
             }
         },
         // A streamed piece is only decryptable with the key derived from this conversation's
@@ -2148,6 +2162,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentBase64 = memberAttachment,
                 voiceDurationSec = msg.voiceDurationSec,
                 voiceWaveformCsv = msg.voiceWaveformCsv,
+                // Groups never get a compressed note (one payload serves every member), but the
+                // marker still describes the file rather than the send decision.
+                voiceCodec = wireVoiceCodec(msg.attachmentType, msg.attachmentUri),
                 replyToMessageId = msg.replyToMessageId,
                 forwardedFrom = msg.forwardedFrom,
                 senderAvatarHash = state.userProfile.avatarHashHex,
@@ -2279,12 +2296,21 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentType = msg.attachmentType,
                         attachmentUri = msg.attachmentUri,
                         voiceDurationSec = msg.voiceDurationSec,
-                        voiceWaveformCsv = msg.voiceWaveformCsv
+                        voiceWaveformCsv = msg.voiceWaveformCsv,
+                        allowVoiceOpus = voiceOpusAllowed(conv)
                     )
                 } else {
                     null
                 }
                 val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
+                // A queued note is re-prepared on its way out, so the codec marker and the size
+                // describe the bytes this attempt actually carries, not what was stored.
+                val wireVoiceCodecName = wireVoiceCodec(msg.attachmentType, prepared?.first ?: msg.attachmentUri)
+                val wireSizeBytes = if (wireVoiceCodecName.isNotEmpty()) {
+                    localAttachmentBytes(prepared?.first).takeIf { it > 0L } ?: msg.attachmentSizeBytes
+                } else {
+                    msg.attachmentSizeBytes
+                }
                 // A content:// source has to travel as the app's own copy: a piece stream reads the
                 // file back from disk, and the picked Uri is not guaranteed to still resolve.
                 val attachmentUri = prepared?.first ?: msg.attachmentUri
@@ -2338,7 +2364,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         cipherPayloadHex = msg.cipherPayloadHex,
                         hashcashToken = msg.hashcashPowToken,
                         attachmentName = msg.attachmentName,
-                        attachmentSizeBytes = msg.attachmentSizeBytes,
+                        attachmentSizeBytes = wireSizeBytes,
                         candidatePeers = candidateExternalPeers,
                         allowLanFallback = _uiState.value.privacyMatrix.allowDirectLanDiscovery,
                         attachmentType = msg.attachmentType,
@@ -2346,6 +2372,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         attachmentBase64 = sealedAttachment,
                         voiceDurationSec = msg.voiceDurationSec,
                         voiceWaveformCsv = msg.voiceWaveformCsv,
+                        voiceCodec = wireVoiceCodecName,
                         senderAvatarHash = _uiState.value.userProfile.avatarHashHex,
                         senderAvatarBase64 = YggAvatarCodec
                             .base64OfStoredFile(_uiState.value.userProfile.avatarUri).orEmpty()
@@ -2550,6 +2577,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             // Prepare local copy and binary Base64 payload for real P2P transfer
             var resolvedLocalUri = attachmentUri
             var resolvedSizeBytes = attachmentSizeBytes
+            var resolvedVoiceCodec = ""
             var attachmentBase64: String? = null
 
             if (effectiveType != null) {
@@ -2559,7 +2587,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     attachmentType = effectiveType,
                     attachmentUri = attachmentUri,
                     voiceDurationSec = voiceDurationSec.coerceAtLeast(1),
-                    voiceWaveformCsv = voiceWaveformCsv
+                    voiceWaveformCsv = voiceWaveformCsv,
+                    allowVoiceOpus = voiceOpusAllowed(targetConv)
                 )
                 resolvedLocalUri = localSavedUri
                 attachmentBase64 = encodedB64.takeIf { it.isNotBlank() }
@@ -2573,13 +2602,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         return@launch
                     }
                 }
-                if (resolvedSizeBytes <= 0L && !localSavedUri.isNullOrBlank()) {
-                    try {
-                        val path = android.net.Uri.parse(localSavedUri).path
-                        if (!path.isNullOrBlank()) {
-                            resolvedSizeBytes = java.io.File(path).length()
-                        }
-                    } catch (_: Throwable) {
+                // The wire marker comes from the bytes that were actually written, not from the
+                // intent to compress — a refused compression still leaves a WAV here.
+                resolvedVoiceCodec = wireVoiceCodec(effectiveType, localSavedUri)
+                if (resolvedSizeBytes <= 0L || resolvedVoiceCodec.isNotEmpty()) {
+                    val onDiskBytes = localAttachmentBytes(localSavedUri)
+                    if (onDiskBytes > 0L) {
+                        resolvedSizeBytes = onDiskBytes
                     }
                 }
             }
@@ -2712,6 +2741,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 attachmentBase64 = sealedAttachment,
                 voiceDurationSec = voiceDurationSec,
                 voiceWaveformCsv = voiceWaveformCsv,
+                voiceCodec = resolvedVoiceCodec,
                 replyToMessageId = wireQuoteId,
                 forwardedFrom = forwardedFrom,
                 senderAvatarHash = currentState.userProfile.avatarHashHex,
@@ -4248,6 +4278,30 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
+     * Opus compression is offered only to a one-to-one dialog whose peer proved it runs the
+     * codec, and only while this device still finds an encoder for it. A group frame carries one
+     * payload for every member, so one member's proof cannot authorize it for the rest.
+     */
+    private fun voiceOpusAllowed(conv: ConversationEntity?): Boolean =
+        conv != null &&
+            conv.chatType != "GROUP" &&
+            conv.peerVoiceOpusProven &&
+            YggVoiceCodec.capability().canEncodeOpus
+
+    /**
+     * The wire codec marker, read from the bytes that are about to leave rather than from the
+     * decision to compress: a compression that did not happen still sends a WAV.
+     */
+    private fun wireVoiceCodec(attachmentType: String?, localSavedUri: String?): String =
+        if (attachmentType == "VOICE" &&
+            YggAudioMediaEngine.voiceCodecOf(localSavedUri) == YggVoiceCodec.NAME_OPUS
+        ) {
+            YggVoiceCodec.NAME_OPUS
+        } else {
+            ""
+        }
+
+    /**
      * `prepareAttachmentForP2P` returns an empty payload for both an unreadable file and one over
      * the inline ceiling, and it keeps the local copy either way. The second case is no longer a
      * refusal: the bridge carries those bytes as separately encrypted pieces, so this only reports
@@ -4297,13 +4351,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     attachmentType = message.attachmentType,
                     attachmentUri = message.attachmentUri,
                     voiceDurationSec = message.voiceDurationSec,
-                    voiceWaveformCsv = message.voiceWaveformCsv
+                    voiceWaveformCsv = message.voiceWaveformCsv,
+                    allowVoiceOpus = voiceOpusAllowed(conv)
                 )
             } else {
                 null
             }
             val attachmentBase64 = prepared?.second?.takeIf { it.isNotBlank() }
             val attachmentUri = prepared?.first ?: message.attachmentUri
+            val wireVoiceCodecName = wireVoiceCodec(message.attachmentType, attachmentUri)
+            val wireSizeBytes = if (wireVoiceCodecName.isNotEmpty()) {
+                localAttachmentBytes(attachmentUri).takeIf { it > 0L } ?: message.attachmentSizeBytes
+            } else {
+                message.attachmentSizeBytes
+            }
             val refusal = if (attachmentBase64 == null) attachmentRefusalReason(attachmentUri) else null
             if (wantsAttachment && refusal != null) {
                 _uiState.update { it.copy(statusBannerMessage = refusal) }
@@ -4359,14 +4420,15 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     cipherPayloadHex = sealedText,
                     hashcashToken = message.hashcashPowToken,
                     attachmentName = message.attachmentName,
-                    attachmentSizeBytes = message.attachmentSizeBytes,
+                    attachmentSizeBytes = wireSizeBytes,
                     candidatePeers = candidatePeers,
                     allowLanFallback = allowManualLan,
                     attachmentType = message.attachmentType,
                     attachmentUri = attachmentUri,
                     attachmentBase64 = sealedAttachment,
                     voiceDurationSec = message.voiceDurationSec,
-                    voiceWaveformCsv = message.voiceWaveformCsv
+                    voiceWaveformCsv = message.voiceWaveformCsv,
+                    voiceCodec = wireVoiceCodecName
                 )
                 if (overlayRes.delivered) {
                     if (!overlayRes.endToEndConfirmed) {
@@ -4825,6 +4887,51 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     fun probeNetworkFilter() {
         networkDpiController.probeNetworkFilter()
+    }
+
+    /**
+     * Runs the whole voice path on this device — encoder, container, decoder — against a tone
+     * this code generates itself, and writes down what came back. The card must be able to say
+     * "no codec here", because that is the honest state of a phone whose system image has no
+     * Opus encoder, and a note the peer cannot open is worse than a note five times bigger.
+     */
+    fun checkVoiceCodec() {
+        if (_uiState.value.antiDpiConfig.isCheckingVoiceCodec) return
+        _uiState.update { state ->
+            state.copy(
+                antiDpiConfig = state.antiDpiConfig.copy(
+                    isCheckingVoiceCodec = true,
+                    voiceCodecSummary = ""
+                )
+            )
+        }
+        viewModelScope.launch {
+            val check = withContext(Dispatchers.IO) { YggVoiceCodec.selfCheck(seconds = 3) }
+            val summary = buildString {
+                append("Кодер: ").append(check.encoder ?: "не найден")
+                append(" • декодер: ").append(check.decoder ?: "не найден")
+                append('\n')
+                append("Замер: ").append(check.pcmBytes).append(" байт PCM → ")
+                append(check.payloadBytes).append(" байт на проводе (")
+                append(check.payloadPercent).append("%)")
+                check.snrDb?.let { append(" • тон сохранился, SNR ~").append(it.toInt()).append(" дБ") }
+                append('\n')
+                append(if (check.passed) {
+                    "Сжатие включается только собеседнику, сам назвавшему Opus в подтверждении доставки."
+                } else {
+                    check.verdict
+                })
+            }
+            _uiState.update { state ->
+                state.copy(
+                    antiDpiConfig = state.antiDpiConfig.copy(
+                        isCheckingVoiceCodec = false,
+                        voiceCodecSummary = summary,
+                        voiceCodecMeasuredAtMs = System.currentTimeMillis()
+                    )
+                )
+            }
+        }
     }
 
     fun addCustomPeer(

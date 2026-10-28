@@ -86,6 +86,7 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import com.example.data.YggRepository
 import com.example.engine.YggAudioMediaEngine
+import com.example.engine.YggVoiceCodec
 import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
@@ -378,6 +379,16 @@ fun VoiceMessagePlayerCard(
     val context = LocalContext.current
     var isPlaying by rememberSaveable(messageId) { mutableStateOf(false) }
     var progressFraction by rememberSaveable(messageId) { mutableFloatStateOf(0f) }
+    var playFailure by rememberSaveable(messageId) { mutableStateOf<String?>(null) }
+
+    // Read off the file's own bytes, so the caption describes the audio that is actually here
+    // rather than what the sender intended to send.
+    val codecLabel = remember(attachmentUri) {
+        when (YggAudioMediaEngine.voiceCodecOf(attachmentUri)) {
+            YggVoiceCodec.NAME_OPUS -> "Opus 16k моно"
+            else -> "WAV/PCM 16kHz"
+        }
+    }
 
     val bars = remember(waveformCsv) {
         val raw = waveformCsv?.split(",")?.mapNotNull { it.trim().toFloatOrNull() }.orEmpty()
@@ -404,6 +415,7 @@ fun VoiceMessagePlayerCard(
             YggAudioMediaEngine.stopVoiceNotePlayback()
         } else {
             isPlaying = true
+            playFailure = null
             YggAudioMediaEngine.startPlayingVoiceNote(
                 context = context,
                 messageId = messageId,
@@ -416,6 +428,9 @@ fun VoiceMessagePlayerCard(
                 onComplete = {
                     isPlaying = false
                     progressFraction = 0f
+                },
+                onPlaybackFailure = { reason ->
+                    playFailure = reason
                 }
             )
         }
@@ -500,9 +515,13 @@ fun VoiceMessagePlayerCard(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isPlaying) "$formattedTime • Звук активен" else "$formattedTime • WAV/PCM 16kHz",
+                            text = when {
+                                playFailure != null -> playFailure!!
+                                isPlaying -> "$formattedTime • Звук активен"
+                                else -> "$formattedTime • $codecLabel"
+                            },
                             style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                            color = if (isPlaying) AmberShieldTertiary else EmeraldPrimary
+                            color = if (playFailure != null || isPlaying) AmberShieldTertiary else EmeraldPrimary
                         )
                     }
                     Text(

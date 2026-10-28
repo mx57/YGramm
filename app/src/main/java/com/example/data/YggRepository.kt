@@ -11,6 +11,7 @@ import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
 import com.example.engine.YggProfilePayload
+import com.example.engine.YggVoiceCodec
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
@@ -1228,8 +1229,22 @@ class YggRepository(
         chatId: String,
         ackSenderKey: String,
         advertisedCsv: String
+    ): Boolean = rememberPeerCapabilities(chatId, ackSenderKey, advertisedCsv, "")
+
+    /**
+     * What the peer itself said it can do, learned from a frame addressed to this device: which
+     * envelope versions it opens and which voice codecs it carries. Both are evidence, both are
+     * one-way flags, and neither is a preference the app is allowed to assume.
+     */
+    suspend fun rememberPeerCapabilities(
+        chatId: String,
+        ackSenderKey: String,
+        acceptedEnvelopeVersions: String,
+        voiceCodecsCsv: String
     ): Boolean {
-        if (!YggCryptoEngine.peerAcceptsEnvelopeVersion(advertisedCsv, 3)) return false
+        val provesEnvelope = YggCryptoEngine.peerAcceptsEnvelopeVersion(acceptedEnvelopeVersions, 3)
+        val provesVoice = YggVoiceCodec.advertises(voiceCodecsCsv)
+        if (!provesEnvelope && !provesVoice) return false
         val conv = dao.getConversationById(chatId) ?: return false
         // A group message is acknowledged by one member, and it is that member's personal dialog
         // row — the one the fan-out seals against — that has to carry the proof.
@@ -1244,8 +1259,12 @@ class YggRepository(
         } else {
             conv.takeUnless { isSelfChatId(it.chatId) }
         } ?: return false
-        if (target.peerEnvelopeV3Proven) return true
-        dao.upsertConversation(target.copy(peerEnvelopeV3Proven = true))
+        val updated = target.copy(
+            peerEnvelopeV3Proven = target.peerEnvelopeV3Proven || provesEnvelope,
+            peerVoiceOpusProven = target.peerVoiceOpusProven || provesVoice
+        )
+        if (updated == target) return true
+        dao.upsertConversation(updated)
         return true
     }
 
@@ -2280,7 +2299,19 @@ class YggRepository(
                 // writing v3 back to it. A group frame proves only that some member wrote it,
                 // so the flag travels through the member's own dialog instead, from their ACK.
                 peerEnvelopeV3Proven = conv.peerEnvelopeV3Proven ||
-                    (resolvedEnvelopeVersion == 3 && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId))
+                    (resolvedEnvelopeVersion == 3 && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId)),
+                // A YGO1 payload this device read off the disk is stronger evidence than the
+                // sender's claim field: only a build that found both an Opus encoder and a decoder
+                // in its codec list could have written those bytes, and that is exactly what our
+                // own send rule requires. So compressing back to this peer is not a guess.
+                // A group frame is excluded for the same reason as the envelope flag — it proves
+                // only that some member wrote it, and the member's own dialog gets the proof
+                // through their ACK.
+                peerVoiceOpusProven = conv.peerVoiceOpusProven ||
+                    (packet.attachmentType == "VOICE" &&
+                        YggAudioMediaEngine.voiceCodecOf(resolvedAttachmentUri) == YggVoiceCodec.NAME_OPUS &&
+                        conv.chatType != "GROUP" &&
+                        !isSelfChatId(conv.chatId))
             )
         )
         return conv.chatId

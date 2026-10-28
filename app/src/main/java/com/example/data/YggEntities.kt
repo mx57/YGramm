@@ -80,7 +80,11 @@ data class ConversationEntity(
     val peerLastSeenAt: Long = 0,
     // True only after this peer sent an envelope this device opened as v3. Outgoing traffic
     // uses v3 toward a peer that proved it, so the flag is evidence, not a preference.
-    val peerEnvelopeV3Proven: Boolean = false
+    val peerEnvelopeV3Proven: Boolean = false,
+    // Same rule for the voice codec: an Opus note is only sent to a peer that showed it can make
+    // or open one. A receiver that cannot decode the container gets silence from a file it cannot
+    // read, which is worse than a note five times the size.
+    val peerVoiceOpusProven: Boolean = false
 )
 
 @Entity(

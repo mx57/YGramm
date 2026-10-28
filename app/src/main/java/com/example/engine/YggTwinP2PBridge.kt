@@ -70,6 +70,10 @@ data class IncomingTwinPacket(
     val streamedAttachmentRoot: String = "",
     val voiceDurationSec: Int = 0,
     val voiceWaveformCsv: String? = null,
+    // "opus" when the voice payload is a YGO1 container, empty when it is the WAV the app
+    // wrote before any codec existed. The receiver plays what the bytes say; this is only the
+    // claim the sender made, which is what proves the sender's own codec to the other side.
+    val voiceCodec: String = "",
     // Wire id of the message this one quotes, and the original author for forwards.
     val replyToMessageId: String = "",
     val forwardedFrom: String = "",
@@ -363,7 +367,12 @@ class YggTwinP2PBridge(
     private val onTypingReceived: suspend (chatId: String, senderNodeLabel: String, senderIpv6: String) -> Unit = { _, _, _ -> },
     private val onIncomingCallSignalReceived: suspend (IncomingCallSignalPacket) -> Unit = {},
     private val onCallAudioFrameReceived: suspend (IncomingCallAudioPacket) -> Unit = {},
-    private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> }
+    private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> },
+    /**
+     * What the peer's own ACK said about its voice codec. Unknown means "never proven", which is
+     * the same as "send PCM": a note the other side cannot open is not a smaller note.
+     */
+    private val onPeerVoiceCodecsReceived: suspend (chatId: String, ackSenderPubKeyHex: String, voiceCodecsCsv: String) -> Unit = { _, _, _ -> }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
@@ -947,6 +956,19 @@ class YggTwinP2PBridge(
 
     private fun avatarAdvertKey(chatId: String, peerIpv6: String, group: Boolean = false): String =
         (if (group) "group:" else "peer:") + chatId + "|" + peerIpv6.trim().lowercase()
+
+    /**
+     * The voice codecs this device can actually run, as advertised in an ACK. A system without an
+     * Opus encoder advertises nothing, and then the peer keeps sending the WAV it always sent.
+     */
+    private fun voiceCodecAdvert(): String =
+        if (YggVoiceCodec.capability().canEncodeOpus) YggVoiceCodec.NAME_OPUS else ""
+
+    private suspend fun reportPeerVoiceCodecs(chatId: String, ackSenderKey: String, ackFrame: Map<String, String>) {
+        val advertised = ackFrame["voiceCodecs"].orEmpty()
+        if (advertised.isBlank()) return
+        onPeerVoiceCodecsReceived(chatId, ackSenderKey, advertised)
+    }
 
     /**
      * Base64url of a JPEG capped at [YggAvatarCodec.MAX_JPEG_BYTES], plus the frame's own
@@ -2450,7 +2472,11 @@ class YggTwinP2PBridge(
                         // Which envelope versions this build can open. The sender reads it as
                         // the peer's own statement about its code, and only then starts writing
                         // v3 to it; a peer that never answers this way keeps receiving v2.
-                        "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS
+                        "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS,
+                        // The same argument for the voice codec: this device only names Opus if
+                        // MediaCodec really shows it an encoder, so the peer's compressed note
+                        // arrives somewhere it can be opened.
+                        "voiceCodecs" to voiceCodecAdvert()
                     )
                 )
                 if (seenBefore) {
@@ -2521,6 +2547,7 @@ class YggTwinP2PBridge(
                     streamedAttachmentRoot = streamedFile?.merkleRootHex ?: "",
                     voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                     voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
+                    voiceCodec = map["voiceCodec"].orEmpty(),
                     replyToMessageId = map["replyToMessageId"].orEmpty(),
                     forwardedFrom = map["forwardedFrom"].orEmpty(),
                     senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
@@ -2616,6 +2643,7 @@ class YggTwinP2PBridge(
                         senderPubKeyHex,
                         map["envVersions"].orEmpty()
                     )
+                    reportPeerVoiceCodecs(map["chatId"] ?: "", senderPubKeyHex, map)
                     logPacket(
                         direction = "ACK <- YGG",
                         summary = "ACK получен через оверлей Yggdrasil (RTT: $rtt мс)",
@@ -3103,6 +3131,7 @@ class YggTwinP2PBridge(
                         streamedAttachmentRoot = lanStreamFile?.merkleRootHex ?: "",
                         voiceDurationSec = map["voiceDurationSec"]?.toIntOrNull() ?: 0,
                         voiceWaveformCsv = map["voiceWaveformCsv"]?.takeIf { it.isNotEmpty() },
+                        voiceCodec = map["voiceCodec"].orEmpty(),
                         replyToMessageId = map["replyToMessageId"].orEmpty(),
                         forwardedFrom = map["forwardedFrom"].orEmpty(),
                         senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
@@ -3120,7 +3149,8 @@ class YggTwinP2PBridge(
                             "messageId" to msgId,
                             "chatId" to incoming.targetChatId,
                             "sentAt" to sentAt.toString(),
-                            "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS
+                            "envVersions" to YggCryptoEngine.ACCEPTED_ENVELOPE_VERSIONS,
+                            "voiceCodecs" to voiceCodecAdvert()
                         )
                     )
                     val viaInfo = if (routedViaPeer.isNotBlank()) {
@@ -3806,6 +3836,7 @@ class YggTwinP2PBridge(
         attachmentBase64: String? = null,
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
+        voiceCodec: String = "",
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
@@ -4094,6 +4125,7 @@ class YggTwinP2PBridge(
             },
             "voiceDurationSec" to voiceDurationSec.toString(),
             "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
+            "voiceCodec" to voiceCodec,
             "replyToMessageId" to replyToMessageId,
             "forwardedFrom" to forwardedFrom,
             "senderAvatarHash" to senderAvatarHash,
@@ -4348,6 +4380,7 @@ class YggTwinP2PBridge(
         attachmentBase64: String? = null,
         voiceDurationSec: Int = 0,
         voiceWaveformCsv: String? = null,
+        voiceCodec: String = "",
         replyToMessageId: String = "",
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
@@ -4418,6 +4451,7 @@ class YggTwinP2PBridge(
                         "attachmentBase64" to (attachmentBase64 ?: ""),
                         "voiceDurationSec" to voiceDurationSec.toString(),
                         "voiceWaveformCsv" to (voiceWaveformCsv ?: ""),
+                        "voiceCodec" to voiceCodec,
                         "replyToMessageId" to replyToMessageId,
                         "forwardedFrom" to forwardedFrom,
                         "senderAvatarHash" to senderAvatarHash,
@@ -4450,6 +4484,7 @@ class YggTwinP2PBridge(
                         val rtt = (System.currentTimeMillis() - now).coerceAtLeast(1L)
                         onTwinReachableChanged(true)
                         onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6, ackMap["envVersions"].orEmpty())
+                        reportPeerVoiceCodecs(chatId, peerIpv6, ackMap)
                         if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
                             advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] = senderAvatarHash
                         }
@@ -5607,6 +5642,7 @@ class YggTwinP2PBridge(
                     // This socket proves nothing about who answered, so the frame carries no
                     // sender key and a group message is not attributed to a member here.
                     onDeliveryAckReceived(chatId, messageId, rtt, "", ackMap?.get("envVersions").orEmpty())
+                    if (ackMap != null) reportPeerVoiceCodecs(chatId, "", ackMap)
                     logPacket(
                         direction = "ACK <- PEER",
                         summary = "Доставка подтверждена ACK через ${targetSocket.hostString}:${targetSocket.port} (RTT: $rtt мс)",

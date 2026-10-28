@@ -802,6 +802,7 @@ fun YggGramRootApp(
                                 onImportCustomPeers = viewModel::importCustomPeersFromText,
                                 onProbeCoverMask = viewModel::probeCoverMask,
                                 onProbeNetworkFilter = viewModel::probeNetworkFilter,
+                                onCheckVoiceCodec = viewModel::checkVoiceCodec,
                                 onClearPacketLogs = viewModel::clearPacketLogs
                             )
 

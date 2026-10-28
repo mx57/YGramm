@@ -27,7 +27,7 @@ import java.io.FileInputStream
         GroupMemberEntity::class,
         MessageDeletionEntity::class
     ],
-    version = 14,
+    version = 15,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -189,6 +189,16 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Compressed voice only goes to a peer that proved it can open it, so the choice
+                // of codec is a measurement of the other side, not a guess about it.
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN peerVoiceOpusProven INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -214,7 +224,8 @@ abstract class YggDatabase : RoomDatabase() {
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
                 .addMigrations(
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14
+                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
+                    MIGRATION_14_15
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
