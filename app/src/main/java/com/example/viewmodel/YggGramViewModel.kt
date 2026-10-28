@@ -62,6 +62,7 @@ import com.example.service.YggNotificationCenter
 import com.example.service.YggPopupNotificationItem
 import com.example.service.YggQuickReplyBus
 import com.example.ui.components.PendingProfileSwitchRequest
+import com.example.update.ApkRelayRequest
 import com.example.update.YGrammUpdateController
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -762,6 +763,18 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         },
         onFileTransferProgress = { progress ->
             repository.recordFileTransferProgress(progress)
+        },
+        // A carried APK never becomes a chat row: it is handed to the updater, which is the only
+        // place holding this device's own manifest and the pinned signing key to judge it by.
+        onApkRelayOutcome = { transferId, localPath, refusalReason ->
+            if (localPath != null) {
+                YGrammUpdateController.onRelayApkDelivered(transferId, localPath)
+            } else {
+                YGrammUpdateController.onRelayHandshakeFailed(refusalReason)
+            }
+        },
+        onApkRelayProgress = { transferId, doneBytes, totalBytes ->
+            YGrammUpdateController.relayProgress(transferId, doneBytes, totalBytes)
         }
     )
 
@@ -835,6 +848,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         YGrammUpdateController.attach(application)
+        viewModelScope.launch {
+            // A relay reply has to name this node with something a human chose, not a key hash.
+            _uiState.map { it.userProfile.displayName }.distinctUntilChanged().collect { name ->
+                networkEngine.localProfileLabel = name.ifBlank { "Мой узел Yggdrasil" }
+            }
+        }
         viewModelScope.launch {
             networkDpiController.antiDpiConfig.collect { cfg ->
                 _uiState.update { it.copy(antiDpiConfig = cfg) }
@@ -4932,6 +4951,70 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }
+    }
+
+    /**
+     * Asks one personal-contact peer to carry the release APK over the overlay. The hash the peer
+     * is asked for is the one this device read from GitHub (or that the user pasted in) - never a
+     * number the peer supplies, so a willing peer cannot pick which build lands here.
+     */
+    fun requestApkFromPeer(chatId: String) {
+        val manifest = YGrammUpdateController.localManifest()
+        if (manifest == null) {
+            YGrammUpdateController.onRelayHandshakeFailed(
+                "Спрашивать не с чем: на этом устройстве нет своего манифеста релиза. " +
+                    "Нужна одна успешная проверка на GitHub или манифест, вставленный вручную"
+            )
+            return
+        }
+        val conv = conversations.value.firstOrNull { it.chatId == chatId && it.chatType != "GROUP" }
+        if (conv == null) {
+            YGrammUpdateController.onRelayHandshakeFailed("Нет личного диалога с этим собеседником — спросить не у кого")
+            return
+        }
+        val transferId = "apk_" + System.currentTimeMillis().toString(36) +
+            java.util.UUID.randomUUID().toString().take(8)
+        val request = ApkRelayRequest(
+            transferId = transferId,
+            chatId = chatId,
+            apkAssetName = manifest.apkAssetName,
+            sha256Hex = manifest.sha256Hex,
+            versionCode = manifest.versionCode
+        )
+        // The order is registered before anything is looked up: from this moment the device is
+        // waiting for exactly this transfer id and refuses any other APK stream.
+        if (!YGrammUpdateController.beginRelayRequest(transferId, manifest)) return
+        viewModelScope.launch {
+            val peerIdentity = repository.resolvePeerNodeIdentity(conv)
+            val peerIpv6 = peerIdentity.yggIpv6Address.ifBlank { conv.yggIpv6Address }
+            if (peerIpv6.isBlank()) {
+                networkEngine.forgetApkRelayOrder(transferId)
+                YGrammUpdateController.onRelayHandshakeFailed(
+                    "У диалога «${conv.title}» нет адреса узла — кадр адресовать нечем"
+                )
+                return@launch
+            }
+            val identity = _uiState.value.identity
+            val answer = networkEngine.requestApkRelay(
+                request = request,
+                peerIpv6 = peerIpv6,
+                senderIpv6 = identity.yggIpv6Address,
+                senderPubKeyHex = identity.yggNodePublicKeyHex,
+                recipientNodePubKeyHex = peerIdentity.publicKeyHex
+            )
+            if (answer.first) YGrammUpdateController.onRelayServing(conv.title)
+            else YGrammUpdateController.onRelayHandshakeFailed(answer.second)
+        }
+    }
+
+    fun cancelApkRelay() {
+        val transferId = YGrammUpdateController.state.value.relayTransferId
+        if (transferId.isNotBlank()) networkEngine.forgetApkRelayOrder(transferId)
+        YGrammUpdateController.cancelRelay()
+    }
+
+    fun importReleaseManifest(rawText: String) {
+        YGrammUpdateController.importManifestFromText(rawText)
     }
 
     fun addCustomPeer(

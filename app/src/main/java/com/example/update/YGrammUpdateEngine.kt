@@ -85,9 +85,15 @@ object YGrammUpdateEngine {
     fun updateDir(context: Context): File =
         File(context.filesDir, "update").apply { if (!exists()) mkdirs() }
 
-    /** Removes a previously downloaded APK so a stale file can never be offered for install. */
+    /**
+     * Removes previously downloaded APKs so a stale file can never be offered for install. The
+     * local manifest survives: it is this device's own record of what GitHub said, and without it
+     * a later transfer from a peer has nothing to be checked against.
+     */
     fun clearDownloadedApk(context: Context) {
-        updateDir(context).listFiles()?.forEach { it.delete() }
+        updateDir(context).listFiles()?.forEach {
+            if (it.name != YGrammPeerRelay.LOCAL_MANIFEST_FILE) it.delete()
+        }
     }
 
     /**

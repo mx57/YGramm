@@ -6,6 +6,10 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.Settings
 import com.example.data.UserProfileEntity
+import com.example.update.ApkRelayRequest
+import com.example.update.YGrammPeerRelay
+import com.example.update.YGrammRelayDecision
+import com.example.update.YGrammUpdateCodec
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -372,7 +376,14 @@ class YggTwinP2PBridge(
      * What the peer's own ACK said about its voice codec. Unknown means "never proven", which is
      * the same as "send PCM": a note the other side cannot open is not a smaller note.
      */
-    private val onPeerVoiceCodecsReceived: suspend (chatId: String, ackSenderPubKeyHex: String, voiceCodecsCsv: String) -> Unit = { _, _, _ -> }
+    private val onPeerVoiceCodecsReceived: suspend (chatId: String, ackSenderPubKeyHex: String, voiceCodecsCsv: String) -> Unit = { _, _, _ -> },
+    /**
+     * A peer finished carrying a release APK that this device asked for. `localPath` is the file
+     * on disk, or null when the stream was dropped; the updater — not this bridge — decides
+     * whether the bytes are the release, because the anchors live in its records.
+     */
+    private val onApkRelayOutcome: suspend (transferId: String, localPath: String?, refusalReason: String) -> Unit = { _, _, _ -> },
+    private val onApkRelayProgress: suspend (transferId: String, doneBytes: Long, totalBytes: Long) -> Unit = { _, _, _ -> }
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var tcpServerSocket: ServerSocket? = null
@@ -395,6 +406,10 @@ class YggTwinP2PBridge(
 
     var localTcpPort: Int = 51921
         private set
+
+    // The name this node signs its own frames with. The ViewModel sets it once from the stored
+    // profile; a relay reply has to carry something other than a bare key hash.
+    var localProfileLabel: String = "Мой узел Yggdrasil"
 
     val localUdpPort: Int
         get() = localTcpPort
@@ -437,6 +452,15 @@ class YggTwinP2PBridge(
     private val outgoingStreamVerified = ConcurrentHashMap<String, Boolean>()
     private val outgoingStreamRefusal = ConcurrentHashMap<String, String>()
     private val streamAckWaiters = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Int>>()
+
+    // APK relay. Outbound orders are keyed by the transfer id this device invented: an incoming
+    // APK stream is opened only for an id that appears here, so no node can push an installer into
+    // this device's update folder without being asked. The sha of a served file is cached per
+    // (path, size, mtime) because hashing tens of megabytes on every request would be pointless.
+    private val apkRelayOrders = ConcurrentHashMap<String, Long>()
+    private val apkRelayAckWaiters =
+        ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>>()
+    private val servedApkShaCache = ConcurrentHashMap<String, Triple<Long, Long, String>>()
 
     private data class CallMediaSession(
         val callId: String,
@@ -1973,6 +1997,9 @@ class YggTwinP2PBridge(
 
     private fun pruneFileStreams() {
         val cutoff = System.currentTimeMillis() - FILE_STREAM_TTL_MS
+        apkRelayOrders.entries.toList().forEach { entry ->
+            if (entry.value < cutoff) apkRelayOrders.remove(entry.key)
+        }
         incomingFileStreams.entries.toList().forEach { entry ->
             if (entry.value.startedAtMs < cutoff) {
                 incomingFileStreams.remove(entry.key)
@@ -2008,6 +2035,28 @@ class YggTwinP2PBridge(
         val pieceCount = map["pieceCount"]?.toIntOrNull() ?: 0
         val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
         pruneFileStreams()
+
+        // An installer is the one file kind this device never accepts unasked: the stream is
+        // opened only for a transfer id this device itself put into a request frame.
+        if (map["attachmentType"] == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE &&
+            !apkRelayOrders.containsKey(transferId)
+        ) {
+            reply(
+                streamAckFrame(
+                    "refused",
+                    transferId,
+                    0,
+                    sentAt,
+                    refusalReason = "этот APK-поток устройство не запрашивало"
+                )
+            )
+            logPacket(
+                direction = "ERR • RELAY",
+                summary = "Входящий поток APK отклонён: запроса на него не было",
+                details = "transferId=${transferId.take(12)} • узел $senderPubKeyHex"
+            )
+            return
+        }
 
         val existing = incomingFileStreams[transferId]
         if (existing != null && existing.declaredRoot == declaredRoot && existing.totalBytes == totalBytes) {
@@ -2222,20 +2271,26 @@ class YggTwinP2PBridge(
         if (reportPrefix) {
             val doneBytes = stream.writtenBytes
             val elapsed = System.currentTimeMillis() - stream.startedAtMs
-            scope.launch {
-                onFileTransferProgress(
-                    FileTransferProgress(
-                        chatId = stream.chatId,
-                        transferId = transferId,
-                        fileName = stream.fileName,
-                        doneBytes = doneBytes,
-                        totalBytes = stream.totalBytes,
-                        elapsedMs = elapsed,
-                        merkleRootHex = stream.declaredRoot,
-                        isOutgoing = false,
-                        state = "STREAMING"
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                // A relay is not a chat attachment: it must not create a message or a transfer
+                // row, only move the updater's own progress line.
+                onApkRelayProgress(transferId, doneBytes, stream.totalBytes)
+            } else {
+                scope.launch {
+                    onFileTransferProgress(
+                        FileTransferProgress(
+                            chatId = stream.chatId,
+                            transferId = transferId,
+                            fileName = stream.fileName,
+                            doneBytes = doneBytes,
+                            totalBytes = stream.totalBytes,
+                            elapsedMs = elapsed,
+                            merkleRootHex = stream.declaredRoot,
+                            isOutgoing = false,
+                            state = "STREAMING"
+                        )
                     )
-                )
+                }
             }
         }
     }
@@ -2271,6 +2326,15 @@ class YggTwinP2PBridge(
             incomingFileStreams.remove(transferId)
             stream.partFile.delete()
             reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                apkRelayOrders.remove(transferId)
+                onApkRelayOutcome(
+                    transferId,
+                    null,
+                    "пира не устроил целый файл: кусков собрано ${orderedDigests.size} из ${stream.pieceCount}"
+                )
+                return
+            }
             val failedBytes = stream.writtenBytes
             val totalBytesForReport = stream.totalBytes
             val root = stream.declaredRoot
@@ -2299,6 +2363,25 @@ class YggTwinP2PBridge(
         incomingFileStreams.remove(transferId)
         if (!moved) {
             reply(streamAckFrame("done", transferId, stream.nextIndex, sentAt, false))
+            if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+                apkRelayOrders.remove(transferId)
+                onApkRelayOutcome(transferId, null, "собранный файл не удалось записать на диск")
+            }
+            return
+        }
+        if (stream.fileType == YGrammPeerRelay.RELAY_ATTACHMENT_TYPE) {
+            // Transport integrity proved the pieces match what the peer sent - nothing more.
+            // Whether those pieces are the release is the updater's call, made against this
+            // device's own manifest and the pinned signing key.
+            apkRelayOrders.remove(transferId)
+            reply(streamAckFrame("done", transferId, stream.pieceCount, sentAt, true))
+            logPacket(
+                direction = "RX <- RELAY",
+                summary = "Файл обновления доехал через пира: ${finalFile.name}",
+                details = "${stream.totalBytes / (1024 * 1024)} МБ • ${stream.pieceCount} кусков • " +
+                    "проверка по локальному манифесту впереди"
+            )
+            onApkRelayOutcome(transferId, finalFile.absolutePath, "")
             return
         }
         val uri = android.net.Uri.fromFile(finalFile).toString()
@@ -2335,6 +2418,184 @@ class YggTwinP2PBridge(
             delay(250L)
         }
         return completedFileStreams[transferId]
+    }
+
+    /**
+     * Asks one known peer to carry the release APK this device's own manifest describes. The
+     * answer only says whether the peer will start streaming; the bytes that follow travel as an
+     * ordinary piece stream and are judged by the updater, never here.
+     */
+    suspend fun requestApkRelay(
+        request: ApkRelayRequest,
+        peerIpv6: String,
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        recipientNodePubKeyHex: String
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()] ?: ""
+        if (senderProfileId.isBlank() || !initializedNativeProfiles.contains(senderProfileId)) {
+            return@withContext false to "нода этого профиля не запущена — запрос некуда отправить"
+        }
+        val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
+        if (recipientKeyHex.isBlank()) {
+            return@withContext false to "неизвестен Ed25519-ключ собеседника: кадр нечем запечатать"
+        }
+        if (!isRealNetworkAvailable()) return@withContext false to "интернета нет — оверлей не отправляет кадры"
+        val livePeers = awaitLivePeer(senderProfileId, waitMs = 6000L)
+        if (livePeers <= 0) return@withContext false to "у ноды нет живых пиров: запрос не ушёл в сеть"
+
+        val frame = encodeWireFrame(
+            YGrammPeerRelay.requestFields(request) + mapOf(
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "recipientIpv6" to peerIpv6,
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+        val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>()
+        apkRelayAckWaiters[request.transferId] = deferred
+        apkRelayOrders[request.transferId] = System.currentTimeMillis()
+        var sendAttempted = false
+        for (attempt in 1..2) {
+            if (!sendOverlayFrame(senderProfileId, recipientKeyHex, frame, "APKREQ")) break
+            sendAttempted = true
+            val answer = kotlinx.coroutines.withTimeoutOrNull(
+                streamAckTimeout(FILE_PIECE_ACK_TIMEOUT_MS * 2)
+            ) { deferred.await() }
+            if (answer != null) {
+                apkRelayAckWaiters.remove(request.transferId, deferred)
+                logPacket(
+                    direction = if (answer.first) "ACK <- YGG" else "ERR • RELAY",
+                    summary = if (answer.first) {
+                        "Собеседник подтвердил, что начнёт передачу APK"
+                    } else {
+                        "Собеседник отказал в передаче APK: ${answer.second}"
+                    },
+                    details = "${request.apkAssetName} • sha256 ${request.sha256Hex.take(16)}… • " +
+                        "transferId=${request.transferId.take(12)} • узел $peerIpv6"
+                )
+                return@withContext answer
+            }
+        }
+        apkRelayAckWaiters.remove(request.transferId, deferred)
+        if (!sendAttempted) {
+            apkRelayOrders.remove(request.transferId)
+            return@withContext false to "оверлей отклонил кадр запроса"
+        }
+        apkRelayOrders.remove(request.transferId)
+        false to "собеседник молчит: ответа на запрос нет. Либо у него сборка, которая не знает " +
+            "этого кадра, либо до него не доходят кадры"
+    }
+
+    /** Cancels an order so pieces that are still travelling are refused instead of assembled. */
+    fun forgetApkRelayOrder(transferId: String) {
+        if (transferId.isNotBlank()) apkRelayOrders.remove(transferId)
+    }
+
+    /**
+     * The file this device is willing to hand over: a release APK it downloaded and verified
+     * itself, with the digest cached per (size, mtime). Null means there is nothing to share;
+     * a null digest inside a non-null pair means the file exists but cannot be read to the end.
+     */
+    private suspend fun verifiedApkHeldHere(
+        apkAssetName: String
+    ): Pair<File, String?>? = withContext(Dispatchers.IO) {
+        val storage = context ?: return@withContext null
+        val file = File(storage.filesDir, "update").let { dir -> File(dir, apkAssetName) }
+        if (!file.isFile || file.length() <= 0L) return@withContext null
+        val size = file.length()
+        val modified = file.lastModified()
+        servedApkShaCache[file.absolutePath]?.let { cached ->
+            if (cached.first == size && cached.second == modified) return@withContext file to cached.third
+        }
+        val digest = try {
+            YGrammUpdateCodec.sha256HexOfFile(file)
+        } catch (_: Throwable) {
+            null
+        }
+        if (digest != null) servedApkShaCache[file.absolutePath] = Triple(size, modified, digest)
+        file to digest
+    }
+
+    private suspend fun handleApkRelayRequest(
+        profileId: String,
+        senderPubKeyHex: String,
+        map: Map<String, String>,
+        reply: (String) -> Unit
+    ) {
+        val transferId = map["transferId"]?.trim().orEmpty()
+        // Without an id the answer has nowhere to go, so the request is dropped in silence: the
+        // sender never made one up that this device could echo back.
+        if (transferId.isBlank()) return
+        val sentAt = map["sentAt"] ?: System.currentTimeMillis().toString()
+        val requesterIpv6 = map["senderIpv6"].orEmpty()
+        val request = YGrammPeerRelay.parseRequest(map)
+        val storage = context
+        val offerEnabled = storage?.getSharedPreferences("ygggram_ui_prefs", Context.MODE_PRIVATE)
+            ?.getBoolean(YGrammPeerRelay.PREF_OFFER_ENABLED, false) == true
+        // The dialog is checked before the file is hashed: a stranger cannot make this device read
+        // tens of megabytes, and a piece stream without a local dialog could not be verified anyway.
+        val dialogChatId = if (offerEnabled && request != null) {
+            resolveIncomingDialogChatId(profileId, senderPubKeyHex, requesterIpv6)
+        } else {
+            null
+        }
+        val held = if (dialogChatId != null && request != null) {
+            verifiedApkHeldHere(request.apkAssetName)
+        } else {
+            null
+        }
+        val decision = YGrammPeerRelay.decideServe(
+            request = request,
+            offerEnabled = offerEnabled,
+            hasDialogWithRequester = !dialogChatId.isNullOrBlank(),
+            heldFile = held?.first,
+            heldFileSha256Hex = held?.second
+        )
+        val identity = mapOf(
+            "sentAt" to sentAt,
+            "senderIpv6" to (ipv6ToProfileIdMap.entries.firstOrNull { it.value == profileId }?.key ?: ""),
+            "senderPubKeyHex" to profileIdToPubKeyMap[profileId].orEmpty()
+        )
+        if (decision is YGrammRelayDecision.Refuse) {
+            reply(
+                encodeWireFrame(
+                    YGrammPeerRelay.replyFields(transferId, serving = false, decision.reason) + identity
+                )
+            )
+            logPacket(
+                direction = "ERR • RELAY",
+                summary = "Запрос на APK отклонён: ${decision.reason}",
+                details = "transferId=${transferId.take(12)} • узел $requesterIpv6"
+            )
+            return
+        }
+        val file = held?.first ?: return
+        reply(encodeWireFrame(YGrammPeerRelay.replyFields(transferId, serving = true) + identity))
+        logPacket(
+            direction = "TX -> STREAM",
+            summary = "Собеседнику передан файл обновления: ${file.name}",
+            details = "${file.length() / (1024 * 1024)} МБ • sha256 ${held.second?.take(16)}… • " +
+                "проситель $requesterIpv6 • диалог ${dialogChatId?.take(16)}…"
+        )
+        val localIpv6 = identity["senderIpv6"].orEmpty()
+        val localKeyHex = profileIdToPubKeyMap[profileId].orEmpty()
+        val chatId = dialogChatId.orEmpty()
+        scope.launch {
+            streamFileOverOverlay(
+                senderProfileId = profileId,
+                recipientKeyHex = senderPubKeyHex.trim().lowercase(),
+                transferId = transferId,
+                chatId = chatId,
+                sourceFile = file,
+                attachmentName = file.name,
+                attachmentType = YGrammPeerRelay.RELAY_ATTACHMENT_TYPE,
+                peerIpv6 = requesterIpv6,
+                senderIpv6 = localIpv6,
+                senderPubKeyHex = localKeyHex,
+                senderNodeLabel = localProfileLabel
+            ) { frame, kind -> sendOverlayFrame(profileId, senderPubKeyHex, frame, kind) }
+        }
     }
 
     /**
@@ -2580,6 +2841,17 @@ class YggTwinP2PBridge(
                     }
                     return
                 }
+                if (map["apkReply"] != null) {
+                    val transferId = map["transferId"]?.trim().orEmpty()
+                    val answer = YGrammPeerRelay.parseReply(map)
+                    if (transferId.isBlank() || answer == null) return
+                    map["sentAt"]?.toLongOrNull()?.let {
+                        observedOverlayAckRttMs.set((System.currentTimeMillis() - it).coerceAtLeast(1L))
+                    }
+                    if (!answer.first) apkRelayOrders.remove(transferId)
+                    apkRelayAckWaiters.remove(transferId)?.complete(answer)
+                    return
+                }
                 if (map["fileStreamAck"] != null) {
                     val transferId = map["transferId"] ?: ""
                     if (transferId.isBlank()) return
@@ -2791,6 +3063,12 @@ class YggTwinP2PBridge(
                 onTwinReachableChanged(true)
                 handleFileDone(map) { frame ->
                     sendOverlayFrame(profileId, senderPubKeyHex, frame, "STREAM_ACK")
+                }
+            }
+            "APKREQ" -> {
+                onTwinReachableChanged(true)
+                handleApkRelayRequest(profileId, senderPubKeyHex, map) { frame ->
+                    sendOverlayFrame(profileId, senderPubKeyHex, frame, "APK_ACK")
                 }
             }
             "ATTACH_CHUNK" -> {

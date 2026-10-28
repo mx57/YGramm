@@ -59,11 +59,14 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -94,6 +97,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.ConversationEntity
 import com.example.data.UserProfileEntity
 import com.example.engine.ParsedYggContactQr
 import com.example.service.YggAlertCategory
@@ -162,7 +166,11 @@ fun ProfilePrivacyScreen(
     onPickProfileAvatar: (Uri) -> Unit = {},
     onClearProfileAvatar: () -> Unit = {},
     onRefreshStorage: () -> Unit = {},
-    onPurgeOrphanedFiles: () -> Unit = {}
+    onPurgeOrphanedFiles: () -> Unit = {},
+    conversations: List<ConversationEntity> = emptyList(),
+    onRequestApkFromPeer: (String) -> Unit = {},
+    onCancelApkRelay: () -> Unit = {},
+    onImportReleaseManifest: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
@@ -1240,6 +1248,9 @@ fun ProfilePrivacyScreen(
         item {
             val updateState by YGrammUpdateController.state.collectAsState()
             val available = updateState.available
+            var peerPickerOpen by rememberSaveable { mutableStateOf(false) }
+            var manifestDraft by rememberSaveable { mutableStateOf("") }
+            val relayPeers = conversations.filter { it.chatType != "GROUP" }
             Card(
                 modifier = Modifier.fillMaxWidth().testTag("auto_update_card"),
                 shape = RoundedCornerShape(18.dp),
@@ -1341,6 +1352,166 @@ fun ProfilePrivacyScreen(
                                 "при нажатии «Установить» откроются системные настройки."
                             else
                                 "\nУстановку выполняет системный установщик Android, приложение не ставит APK само.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Default.Hub,
+                            contentDescription = null,
+                            tint = CyberTealSecondary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "APK через знакомый узел",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Когда GitHub недоступен, тот же самый APK можно попросить у собеседника " +
+                            "в оверлее. Пир только переносит байты и ничего не решает: файл принимается " +
+                            "исключительно когда его sha256 и подпись совпадают с манифестом, который это " +
+                            "устройство видело само, — с GitHub или вставленным вручную ниже.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = updateState.localManifestLabel,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (updateState.localManifestLabel.startsWith("Своего манифеста"))
+                            Color(0xFFEF4444) else EmeraldPrimary
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        YggSwitch(
+                            checked = updateState.relayOfferEnabled,
+                            onCheckedChange = { enabled ->
+                                YGrammUpdateController.setRelayOfferEnabled(context, enabled)
+                            },
+                            modifier = Modifier.testTag("relay_offer_switch")
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Раздавать свой APK собеседникам из личных диалогов",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = manifestDraft,
+                        onValueChange = { manifestDraft = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("relay_manifest_field"),
+                        label = { Text("Свой блок манифеста релиза") },
+                        placeholder = {
+                            Text("Вставь сюда блок ygramm-update из описания релиза — " +
+                                "это устройство сохранит его как якорь, не спрашивая пира")
+                        },
+                        minLines = 3,
+                        maxLines = 8,
+                        textStyle = MaterialTheme.typography.bodySmall,
+                        shape = RoundedCornerShape(14.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                onImportReleaseManifest(manifestDraft)
+                                manifestDraft = ""
+                            },
+                            enabled = manifestDraft.isNotBlank(),
+                            modifier = Modifier.testTag("relay_import_button")
+                        ) {
+                            Text("Принять этот манифест")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Box {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { peerPickerOpen = true },
+                                enabled = !updateState.relayBusy && relayPeers.isNotEmpty(),
+                                modifier = Modifier.testTag("relay_request_button")
+                            ) {
+                                Text(if (updateState.relayBusy) "Пир несёт файл…" else "Спросить APK у пира")
+                            }
+                            if (updateState.relayBusy) {
+                                OutlinedButton(
+                                    onClick = { onCancelApkRelay() },
+                                    modifier = Modifier.testTag("relay_cancel_button")
+                                ) {
+                                    Text("Отменить")
+                                }
+                            }
+                        }
+                        DropdownMenu(
+                            expanded = peerPickerOpen,
+                            onDismissRequest = { peerPickerOpen = false }
+                        ) {
+                            relayPeers.forEach { peer ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text(peer.title.ifBlank { "Без имени" })
+                                            Text(
+                                                text = peer.yggIpv6Address,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    },
+                                    onClick = {
+                                        peerPickerOpen = false
+                                        onRequestApkFromPeer(peer.chatId)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    if (relayPeers.isEmpty()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Личных диалогов нет — спросить не у кого. Сначала нужен контакт, " +
+                                "с которым уже идёт переписка по оверлею.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (updateState.relayBusy && updateState.relayPercent >= 0) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LinearProgressIndicator(
+                            progress = { updateState.relayPercent / 100f },
+                            modifier = Modifier.fillMaxWidth().testTag("relay_progress"),
+                            trackColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    }
+                    if (updateState.relayStatusLine.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        val relayLine = updateState.relayStatusLine
+                        val relayIsGood = relayLine.startsWith("APK от собеседника совпал") ||
+                            relayLine.startsWith("Запрос на") ||
+                            relayLine.startsWith("Пир передаёт") ||
+                            relayLine.startsWith("Проверяю принятый") ||
+                            relayLine.startsWith("Раздача включена")
+                        Text(
+                            text = relayLine,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (relayIsGood) EmeraldPrimary else Color(0xFFEF4444)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "По оверлею идёт тот же зашифрованный потоковый транспорт файлов, что и " +
+                            "для вложений: куски в AEAD-контейнере, корень Меркла проверяется по всему " +
+                            "файлу. Приём чужого установщика невозможен: запрос на APK это устройство " +
+                            "изобретает само, и без своего потока передачи оно ничего не принимает.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

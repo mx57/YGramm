@@ -843,7 +843,11 @@ fun YggGramRootApp(
                                 onPickProfileAvatar = viewModel::setProfileAvatar,
                                 onClearProfileAvatar = viewModel::clearProfileAvatar,
                                 onRefreshStorage = viewModel::refreshStorageBreakdown,
-                                onPurgeOrphanedFiles = viewModel::purgeOrphanedFiles
+                                onPurgeOrphanedFiles = viewModel::purgeOrphanedFiles,
+                                conversations = conversations,
+                                onRequestApkFromPeer = viewModel::requestApkFromPeer,
+                                onCancelApkRelay = viewModel::cancelApkRelay,
+                                onImportReleaseManifest = viewModel::importReleaseManifest
                             )
                         }
                     }
