@@ -8,12 +8,15 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.engine.YggAvatarCodec
 
 enum class YggAlertCategory {
     INCOMING_CALL,
@@ -36,6 +39,9 @@ data class YggPopupNotificationItem(
     val messagePreview: String,
     val voiceDurationSec: Int = 0,
     val callId: String = "",
+    // The chat's own picture as this device stores it. Empty until a frame carrying it has
+    // actually arrived — a notification then has no large icon rather than an invented one.
+    val chatAvatarUri: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )
 
@@ -148,6 +154,17 @@ object YggNotificationCenter {
         )
     }
 
+    /**
+     * The chat's own picture, decoded for a notification's large icon.
+     *
+     * Nothing is decoded unless the file the row points at is really on this device, so a chat
+     * whose avatar never arrived posts with no icon. Guessing one from a cache or from another
+     * contact would put a face on a lock screen that belongs to nobody in this conversation.
+     */
+    internal fun notificationLargeIcon(avatarUri: String): Bitmap? =
+        YggAvatarCodec.fileFor(avatarUri)
+            ?.let { file -> runCatching { BitmapFactory.decodeFile(file.absolutePath) }.getOrNull() }
+
     fun postSystemHeadsUpNotification(
         context: Context,
         item: YggPopupNotificationItem
@@ -201,6 +218,8 @@ object YggNotificationCenter {
                 .setWhen(item.timestamp)
                 .setShowWhen(true)
                 .setContentIntent(contentIntent)
+
+            notificationLargeIcon(item.chatAvatarUri)?.let { builder.setLargeIcon(it) }
 
             if (item.category == YggAlertCategory.INCOMING_CALL) {
                 val answerIntent = pendingIntent(context, item, ACTION_ANSWER_CALL, 1)

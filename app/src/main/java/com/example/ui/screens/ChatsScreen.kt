@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -188,6 +189,7 @@ fun ChatsScreen(
     onCreateGroup: (String, List<String>) -> Unit = { _, _ -> },
     onAddContactsToGroup: (String, List<String>) -> Unit = { _, _ -> },
     onRenameGroup: (String, String) -> Unit = { _, _ -> },
+    onSetGroupAvatar: (String, Uri) -> Unit = { _, _ -> },
     onRemoveGroupMember: (String, String) -> Unit = { _, _ -> },
     onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
@@ -368,6 +370,7 @@ fun ChatsScreen(
                                 onAddContactsToGroup(activeConversation.chatId, ids)
                             },
                             onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                            onSetGroupAvatar = { uri -> onSetGroupAvatar(activeConversation.chatId, uri) },
                             onRemoveGroupMember = { ipv6 ->
                                 onRemoveGroupMember(activeConversation.chatId, ipv6)
                             },
@@ -439,6 +442,7 @@ fun ChatsScreen(
                         onAddContactsToGroup(activeConversation.chatId, ids)
                     },
                     onRenameGroup = { title -> onRenameGroup(activeConversation.chatId, title) },
+                    onSetGroupAvatar = { uri -> onSetGroupAvatar(activeConversation.chatId, uri) },
                     onRemoveGroupMember = { ipv6 -> onRemoveGroupMember(activeConversation.chatId, ipv6) },
                     onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
                     rejectedDraft = uiState.rejectedDraft
@@ -1506,6 +1510,7 @@ private fun ChatDetailPane(
     groupContactCandidates: List<ConversationEntity> = emptyList(),
     onAddContactsToGroup: (List<String>) -> Unit = {},
     onRenameGroup: (String) -> Unit = {},
+    onSetGroupAvatar: (Uri) -> Unit = {},
     onRemoveGroupMember: (String) -> Unit = {},
     onLeaveGroup: () -> Unit = {},
     rejectedDraft: String? = null,
@@ -1534,6 +1539,13 @@ private fun ChatDetailPane(
     var forwardTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     var deleteTarget by remember(conversation.chatId) { mutableStateOf<MessageEntity?>(null) }
     val isSelfChat = YggRepository.isSelfChatId(conversation.chatId)
+    // The same picker and the same codec a profile picture uses: a cover that will not fit one
+    // frame is refused here instead of arriving torn at a peer's device.
+    val groupAvatarPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) onSetGroupAvatar(uri)
+    }
     val wireIdIndex = remember(messages) {
         buildMap {
             messages.forEach { msg ->
@@ -2227,6 +2239,43 @@ private fun ChatDetailPane(
                                 .testTag("group_rename_confirm")
                         ) {
                             Text("Переименовать")
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            YggAvatar(
+                                avatarUri = conversation.avatarUri,
+                                name = conversation.title,
+                                size = 40.dp
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Обложка группы",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                // What this app does not have: a role that owns the group. Saying
+                                // so is the honest version of "who can change this".
+                                Text(
+                                    text = "Заменить может любой участник. Новая картинка уйдёт " +
+                                        "остальным с первым вашим сообщением в группу.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Button(
+                                onClick = {
+                                    groupAvatarPickerLauncher.launch(
+                                        PickVisualMediaRequest(
+                                            ActivityResultContracts.PickVisualMedia.ImageOnly
+                                        )
+                                    )
+                                },
+                                modifier = Modifier.testTag("group_avatar_pick_button")
+                            ) {
+                                Text("Выбрать")
+                            }
                         }
                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                         Text(

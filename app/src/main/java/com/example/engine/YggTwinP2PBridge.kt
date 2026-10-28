@@ -78,6 +78,11 @@ data class IncomingTwinPacket(
     // data is only present on the first message after the sender changes it.
     val senderAvatarHash: String = "",
     val senderAvatarData: String = "",
+    // The group's own picture. It rides the same frames as the roster because a group has no
+    // server to hold its cover: any member can change it, and the others learn the new one from
+    // the next message they receive.
+    val groupAvatarHash: String = "",
+    val groupAvatarData: String = "",
     // Group identity and roster, advertised by every group message. A member learns who
     // else is in the group from the messages themselves, so a group needs no separate
     // sync channel and no server: one frame from any member is enough to rebuild it.
@@ -927,22 +932,29 @@ class YggTwinP2PBridge(
     /**
      * Avatar advertisement bookkeeping.
      *
-     * [advertisedAvatarHashes] holds, per chat, the last picture the recipient has been
+     * [advertisedAvatarHashes] holds, per recipient, the last picture that peer has been
      * CONFIRMED to hold — an ACK, nothing less. Until that confirmation arrives every
-     * message to the chat repeats the bytes, so a torn or undelivered frame cannot leave
-     * a contact permanently faceless. [pendingAvatarAdverts] maps an in-flight message to
-     * what it carried, so whichever transport finally returns the ACK can record it.
+     * message repeats the bytes, so a torn or undelivered frame cannot leave a contact
+     * permanently faceless. [pendingAvatarAdverts] maps an in-flight message to everything
+     * it carried, so whichever transport finally returns the ACK can record all of it.
+     *
+     * The key names the recipient rather than the chat, because a group fan-out writes the
+     * same chat row for every member: keyed by chat, the first member to ACK would silence
+     * the picture for all the others, and they would store a hash with no bytes to match it.
      */
     private val advertisedAvatarHashes = ConcurrentHashMap<String, String>()
-    private val pendingAvatarAdverts = ConcurrentHashMap<String, Pair<String, String>>()
+    private val pendingAvatarAdverts = ConcurrentHashMap<String, List<Pair<String, String>>>()
+
+    private fun avatarAdvertKey(chatId: String, peerIpv6: String, group: Boolean = false): String =
+        (if (group) "group:" else "peer:") + chatId + "|" + peerIpv6.trim().lowercase()
 
     /**
      * Base64url of a JPEG capped at [YggAvatarCodec.MAX_JPEG_BYTES], plus the frame's own
      * overhead. Anything longer did not come from this codec and is dropped before it can
      * displace the message it rode in on.
      */
-    private fun avatarDataOf(frame: Map<String, String>): String =
-        frame["senderAvatarData"].orEmpty().takeIf {
+    private fun avatarDataOf(frame: Map<String, String>, field: String = "senderAvatarData"): String =
+        frame[field].orEmpty().takeIf {
             it.length <= YggAvatarCodec.MAX_JPEG_BYTES * 2 && it.all { c -> c.isLetterOrDigit() || c == '-' || c == '_' }
         }.orEmpty()
 
@@ -970,8 +982,8 @@ class YggTwinP2PBridge(
             .orEmpty()
 
     private fun markAvatarAdvertised(messageId: String) {
-        pendingAvatarAdverts.remove(messageId)?.let { (chatId, hash) ->
-            advertisedAvatarHashes[chatId] = hash
+        pendingAvatarAdverts.remove(messageId)?.forEach { (advertKey, hash) ->
+            advertisedAvatarHashes[advertKey] = hash
         }
     }
     // Reaction ACKs must never be confused with message ACKs: a reaction frame carries
@@ -2509,6 +2521,8 @@ class YggTwinP2PBridge(
                     forwardedFrom = map["forwardedFrom"].orEmpty(),
                     senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
                     senderAvatarData = avatarDataOf(map),
+                    groupAvatarHash = map["groupAvatarHash"].orEmpty().trim().lowercase(),
+                    groupAvatarData = avatarDataOf(map, "groupAvatarData"),
                     groupId = groupIdOf(map),
                     groupTitle = map["groupTitle"].orEmpty().trim().take(80),
                     groupMembersCsv = rosterOf(map),
@@ -3083,6 +3097,8 @@ class YggTwinP2PBridge(
                         forwardedFrom = map["forwardedFrom"].orEmpty(),
                         senderAvatarHash = map["senderAvatarHash"].orEmpty().trim().lowercase(),
                         senderAvatarData = avatarDataOf(map),
+                        groupAvatarHash = map["groupAvatarHash"].orEmpty().trim().lowercase(),
+                        groupAvatarData = avatarDataOf(map, "groupAvatarData"),
                         groupId = groupIdOf(map),
                         groupTitle = map["groupTitle"].orEmpty().trim().take(80),
                         groupMembersCsv = rosterOf(map)
@@ -3783,6 +3799,8 @@ class YggTwinP2PBridge(
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
         senderAvatarBase64: String = "",
+        groupAvatarHash: String = "",
+        groupAvatarBase64: String = "",
         groupId: String = "",
         groupTitle: String = "",
         groupMembersCsv: String = ""
@@ -4035,7 +4053,13 @@ class YggTwinP2PBridge(
         // 12 KB on every message forever, and an unconfirmed one must not be forgotten.
         val avatarRidesAlong = senderAvatarHash.isNotBlank() &&
             senderAvatarBase64.isNotBlank() &&
-            advertisedAvatarHashes[chatId] != senderAvatarHash
+            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] != senderAvatarHash
+        // A member relaying a group cover carries it to each peer separately: whoever's device
+        // holds the newest picture is the one that tells the others, and it keeps telling them
+        // until every one of them has ACKed the bytes.
+        val groupAvatarRidesAlong = groupAvatarHash.isNotBlank() &&
+            groupAvatarBase64.isNotBlank() &&
+            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6, group = true)] != groupAvatarHash
         val messageFields = linkedMapOf(
             "type" to "MSG",
             "chatId" to chatId,
@@ -4063,6 +4087,8 @@ class YggTwinP2PBridge(
             "forwardedFrom" to forwardedFrom,
             "senderAvatarHash" to senderAvatarHash,
             "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+            "groupAvatarHash" to groupAvatarHash,
+            "groupAvatarData" to (if (groupAvatarRidesAlong) groupAvatarBase64 else ""),
             "groupId" to groupId,
             "groupTitle" to groupTitle,
             "groupMembers" to groupMembersCsv,
@@ -4087,7 +4113,13 @@ class YggTwinP2PBridge(
         val totalOutboundBytes = wirePayload.length.toLong() + (attachmentBase64?.length ?: 0)
 
         var ackDeferred: kotlinx.coroutines.CompletableDeferred<Long>? = null
-        if (avatarRidesAlong) pendingAvatarAdverts[messageId] = chatId to senderAvatarHash
+        val carriedAdverts = buildList {
+            if (avatarRidesAlong) add(avatarAdvertKey(chatId, peerIpv6) to senderAvatarHash)
+            if (groupAvatarRidesAlong) {
+                add(avatarAdvertKey(chatId, peerIpv6, group = true) to groupAvatarHash)
+            }
+        }
+        if (carriedAdverts.isNotEmpty()) pendingAvatarAdverts[messageId] = carriedAdverts
         if (overlayReady) {
             logPacket(
                 direction = "TX -> YGG",
@@ -4309,6 +4341,8 @@ class YggTwinP2PBridge(
         forwardedFrom: String = "",
         senderAvatarHash: String = "",
         senderAvatarBase64: String = "",
+        groupAvatarHash: String = "",
+        groupAvatarBase64: String = "",
         groupId: String = "",
         groupTitle: String = "",
         groupMembersCsv: String = ""
@@ -4378,8 +4412,16 @@ class YggTwinP2PBridge(
                         "senderAvatarHash" to senderAvatarHash,
                         "senderAvatarData" to (
                             if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank() &&
-                                advertisedAvatarHashes[chatId] != senderAvatarHash
+                                advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] != senderAvatarHash
                             ) senderAvatarBase64 else ""
+                            ),
+                        "groupAvatarHash" to groupAvatarHash,
+                        "groupAvatarData" to (
+                            if (groupAvatarHash.isNotBlank() && groupAvatarBase64.isNotBlank() &&
+                                advertisedAvatarHashes[
+                                    avatarAdvertKey(chatId, peerIpv6, group = true)
+                                ] != groupAvatarHash
+                            ) groupAvatarBase64 else ""
                             ),
                         "groupId" to groupId,
                         "groupTitle" to groupTitle,
@@ -4398,7 +4440,12 @@ class YggTwinP2PBridge(
                         onTwinReachableChanged(true)
                         onDeliveryAckReceived(chatId, messageId, rtt, peerIpv6)
                         if (senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()) {
-                            advertisedAvatarHashes[chatId] = senderAvatarHash
+                            advertisedAvatarHashes[avatarAdvertKey(chatId, peerIpv6)] = senderAvatarHash
+                        }
+                        if (groupAvatarHash.isNotBlank() && groupAvatarBase64.isNotBlank()) {
+                            advertisedAvatarHashes[
+                                avatarAdvertKey(chatId, peerIpv6, group = true)
+                            ] = groupAvatarHash
                         }
                         logPacket(
                             direction = "ACK <- PEER",

@@ -521,6 +521,50 @@ class YggRepository(
 
     // ── Groups ──────────────────────────────────────────────────────────────────────
 
+    /**
+     * The two pictures a group frame can carry, applied to the two rows they belong to.
+     *
+     * The cover goes on the group; the speaking member's own face goes on that member's
+     * contact dialog. Writing both onto the group row would let any member's selfie
+     * overwrite the picture the group is named by, and the member's own dialog would stay
+     * faceless however many frames they sent.
+     */
+    suspend fun storeIncomingGroupAvatars(
+        groupChatId: String,
+        senderIpv6: String,
+        ownerProfileId: String,
+        groupAvatarHash: String,
+        groupAvatarData: String,
+        senderAvatarHash: String,
+        senderAvatarData: String
+    ) {
+        storeIncomingAvatar(groupChatId, groupAvatarHash, groupAvatarData)
+        val peerChatId = findConversationIdByPeerIpv6(senderIpv6, ownerProfileId) ?: return
+        storeIncomingAvatar(peerChatId, senderAvatarHash, senderAvatarData)
+    }
+
+    /**
+     * Installing a cover picture for a group.
+     *
+     * Any member may set one: a group here is a roster of mesh addresses with no owner and no
+     * server to arbitrate, so whoever's hash arrives last is what every device shows. The new
+     * picture then rides that member's group messages until each other member's node ACKs the
+     * bytes, which is the same gossip the roster itself travels on.
+     *
+     * @return the updated row, or null when the chat is not a group or the picture will not
+     *         fit a frame; the previous cover is kept in that case.
+     */
+    suspend fun setGroupAvatar(chatId: String, source: Uri): ConversationEntity? {
+        val context = appContext ?: return null
+        val existing = dao.getConversationById(chatId)?.takeIf { it.chatType == "GROUP" } ?: return null
+        val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
+        if (stored.hashHex != existing.avatarHashHex) {
+            YggAvatarCodec.forget(context, existing.avatarUri)
+            dao.updateConversationAvatar(chatId, stored.localUri, stored.hashHex)
+        }
+        return dao.getConversationById(chatId)
+    }
+
     fun observeGroupMembers(chatId: String): Flow<List<GroupMemberEntity>> =
         dao.observeGroupMembers(chatId)
 

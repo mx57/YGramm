@@ -748,6 +748,7 @@ fun YggGramRootApp(
                                 onCreateGroup = viewModel::createGroup,
                                 onAddContactsToGroup = viewModel::addContactsToGroup,
                                 onRenameGroup = viewModel::renameGroup,
+                                onSetGroupAvatar = viewModel::setGroupAvatar,
                                 onRemoveGroupMember = viewModel::removeGroupMember,
                                 onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,

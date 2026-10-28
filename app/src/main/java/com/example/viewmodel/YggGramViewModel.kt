@@ -427,7 +427,19 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 )
                 // After the message, so the conversation row this writes onto already
                 // exists; the picture is checked against its own hash inside the codec.
-                repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
+                if (packet.groupId.isNotBlank()) {
+                    repository.storeIncomingGroupAvatars(
+                        groupChatId = chatId,
+                        senderIpv6 = packet.senderIpv6,
+                        ownerProfileId = targetProfile?.profileId ?: currentPrimaryId,
+                        groupAvatarHash = packet.groupAvatarHash,
+                        groupAvatarData = packet.groupAvatarData,
+                        senderAvatarHash = packet.senderAvatarHash,
+                        senderAvatarData = packet.senderAvatarData
+                    )
+                } else {
+                    repository.storeIncomingAvatar(chatId, packet.senderAvatarHash, packet.senderAvatarData)
+                }
 
                 val targetProfileName = targetProfile?.displayName
                 val profileSuffix = if (targetProfile != null && targetProfile.profileId != currentPrimaryId) {
@@ -1114,6 +1126,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (!privacy.inAppNotificationsEnabled && !privacy.systemNotificationsEnabled) return
 
         val app = getApplication<Application>()
+        // The chat's own picture — the contact's for a dialog, the cover for a group. Taken from
+        // the row rather than passed in, so no caller can pair a name with someone else's face;
+        // a picture that has not reached this device yet simply produces no icon.
+        val chatAvatarUri = conversations.value
+            .firstOrNull { it.chatId == chatId }?.avatarUri
+            .orEmpty()
         val item = YggPopupNotificationItem(
             notificationId = "notif_${UUID.randomUUID().toString().take(8)}",
             category = category,
@@ -1128,6 +1146,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             messagePreview = messagePreview,
             voiceDurationSec = voiceDurationSec,
             callId = callId,
+            chatAvatarUri = chatAvatarUri,
             timestamp = System.currentTimeMillis()
         )
         if (privacy.inAppNotificationsEnabled && appIsForeground) {
@@ -2059,6 +2078,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val rosterCsv = roster.joinToString(",") { "${it.first}|${it.second}" }
         val candidatePeers = buildCandidateExternalPeersList()
         val avatarBase64 = YggAvatarCodec.base64OfStoredFile(state.userProfile.avatarUri).orEmpty()
+        // A group has no server holding its cover, so the cover travels from the row of whoever
+        // is speaking: each member's device repeats it to each peer until that peer ACKs it.
+        val groupAvatarBase64 = YggAvatarCodec.base64OfStoredFile(conv.avatarUri).orEmpty()
 
         var acked = 0
         var routed = 0
@@ -2126,6 +2148,8 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 forwardedFrom = msg.forwardedFrom,
                 senderAvatarHash = state.userProfile.avatarHashHex,
                 senderAvatarBase64 = avatarBase64,
+                groupAvatarHash = conv.avatarHashHex,
+                groupAvatarBase64 = groupAvatarBase64,
                 groupId = conv.groupId,
                 groupTitle = conv.title,
                 groupMembersCsv = rosterCsv
@@ -5296,6 +5320,29 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         statusBannerMessage = "Фото не подходит: нужен файл, из которого получится квадрат до ${YggAvatarCodec.MAX_JPEG_BYTES / 1000} КБ"
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * Setting a group's cover from the gallery.
+     *
+     * There is no node to push it to: a group is a roster, so the cover leaves this device on the
+     * next message written into the group, and the banner says so instead of implying the other
+     * members already see it.
+     */
+    fun setGroupAvatar(chatId: String, source: Uri) {
+        viewModelScope.launch {
+            val updated = repository.setGroupAvatar(chatId, source)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (updated != null) {
+                        "Обложка группы сохранена: участники получат её со следующим сообщением в группу"
+                    } else {
+                        "Фото не подходит: нужен файл, из которого получится квадрат до " +
+                            "${YggAvatarCodec.MAX_JPEG_BYTES / 1000} КБ"
+                    }
+                )
             }
         }
     }
