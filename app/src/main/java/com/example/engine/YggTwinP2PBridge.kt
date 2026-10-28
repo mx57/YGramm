@@ -127,6 +127,41 @@ data class DeleteDispatchResult(
 )
 
 /**
+ * A peer's account of itself, arriving as one sealed conversation envelope.
+ *
+ * [profileEnvelope] is the ciphertext; the fields inside it are only read after this device's own
+ * key opens it, which is what separates a contact's name from a stranger's claim about one.
+ * The avatar bytes ride beside the envelope unencrypted, exactly as they do on a message frame,
+ * and the hash that authorises them lives inside the sealed body.
+ */
+data class IncomingProfilePacket(
+    val chatId: String,
+    val senderIpv6: String,
+    val senderPubKeyHex: String,
+    val recipientProfileId: String,
+    val profileEnvelope: String,
+    val senderAvatarHash: String,
+    val senderAvatarData: String,
+    val rttMs: Long
+)
+
+data class ProfileDispatchResult(
+    val delivered: Boolean,
+    val transport: String = "",
+    val rttMs: Long = -1L,
+    val errorDetail: String? = null,
+    /**
+     * What the receiving node did with the frame, as it said in its own ACK: `applied`, a refusal
+     * code, or empty from an older node that ACKs without a verdict.
+     *
+     * The transport ACK alone cannot say the contact's card changed - the receiver may have had no
+     * dialog to write into, or opened a body older than what it stores - and counting that as
+     * "confirmed" would be a delivery claim with nothing behind it.
+     */
+    val verdict: String = ""
+)
+
+/**
  * One frame of a streamed large-file transfer. Each piece is its own AEAD message keyed by the
  * conversation and bound to its index, so a piece that does not decrypt is dropped rather than
  * written; the transfer only completes when the Merkle root over the pieces actually written
@@ -300,6 +335,12 @@ class YggTwinP2PBridge(
     private val onLanNodeDiscovered: (DiscoveredLanNode) -> Unit = {},
     private val onReactionReceived: suspend (IncomingReactionPacket) -> Unit = {},
     private val onDeleteForEveryoneReceived: suspend (IncomingDeletePacket) -> Unit = {},
+    /**
+     * A peer rewrote its own name, handle, status or picture; the repository decides if it sticks.
+     * The returned string is that decision, echoed back to the sender in the ACK, because "the
+     * frame arrived" and "the contact's card changed" are two different claims.
+     */
+    private val onProfileReceived: suspend (IncomingProfilePacket) -> String = { "" },
     /**
      * Gives the AEAD key for one streamed file transfer: the repository derives it from the
      * conversation's pinned peer X25519 key and the local profile's own private key, so a piece
@@ -940,6 +981,11 @@ class YggTwinP2PBridge(
     // A delete is keyed by its own event id, exactly like a reaction: the ACK for a delete of
     // message X must not be read as the delivery ACK of message X.
     private val pendingDeleteAcks = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Long>>()
+    // A profile refresh is keyed by the sender's own version stamp: the ACK that comes back for
+    // profile version N must not be read as the delivery ACK of a message that happens to share
+    // an id, and must not complete a different version's waiter either.
+    private val pendingProfileAcks =
+        ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Pair<Long, String>>>()
     private val profileIdToPubKeyMap = ConcurrentHashMap<String, String>() // profileId -> Ed25519 node pubkey hex
     private val pubKeyToProfileIdMap = ConcurrentHashMap<String, String>() // Ed25519 node pubkey hex -> profileId
     // What the running node reported about itself, kept across profile syncs: the stored
@@ -2257,6 +2303,106 @@ class YggTwinP2PBridge(
         return completedFileStreams[transferId]
     }
 
+    /**
+     * Handles one PROFILE frame from either transport.
+     *
+     * Both paths must reach the same decision: refuse what this device cannot authenticate,
+     * hand the sealed body to the store exactly once, and answer with what the store actually
+     * did. Writing it twice is how an overlay copy and a LAN copy of the same profile end up
+     * applied in different orders on two devices.
+     */
+    private suspend fun handleProfileFrame(
+        profileId: String,
+        senderPubKeyHex: String,
+        frame: Map<String, String>,
+        transportNote: String,
+        sendAck: suspend (String) -> Unit
+    ) {
+        val versionTag = frame["profileVersion"].orEmpty().trim()
+        val envelope = frame["profileEnvelope"].orEmpty()
+        // The sender picks the correlation tag and this device echoes it back unchanged. Using the
+        // version alone would be wrong: one profile edit fans out to every peer at the same
+        // version, so two pending ACKs would land on the same key and one of them would never
+        // resolve - the sender would then report a profile it actually delivered as undelivered.
+        val ackTag = frame["profileAckKey"].orEmpty().trim().ifBlank { versionTag }
+        val senderIpv6 = frame["senderIpv6"] ?: ""
+        val targetIpv6 = frame["recipientIpv6"] ?: ""
+        val resolvedProfileId = profileId.ifBlank {
+            ipv6ToProfileIdMap[targetIpv6.lowercase()] ?: ""
+        }
+        if (versionTag.isBlank() || envelope.isBlank()) {
+            // A profile frame without a version cannot be de-duplicated, and one without a
+            // sealed body has nothing this device can authenticate. Neither is a partial
+            // profile - it is not a profile.
+            logPacket(
+                direction = "ERR <- PRF",
+                summary = "Профиль-кадр отклонён: нет ни версии, ни запечатанного тела",
+                details = "От узла $senderIpv6 • ноды ${senderPubKeyHex.take(16)}..."
+            )
+            return
+        }
+        val ownAddress = senderIpv6.trim().lowercase()
+        val ownKey = senderPubKeyHex.trim().lowercase()
+        if ((ownAddress.isNotBlank() && ipv6ToProfileIdMap.containsKey(ownAddress)) ||
+            (ownKey.isNotBlank() && pubKeyToProfileIdMap.containsKey(ownKey))
+        ) {
+            // A frame claiming to come from an address this process owns is our own copy coming
+            // back through the mesh. Answering it would hand the sender an acknowledgement that
+            // reads "the peer confirmed my profile" while nobody outside this device read it.
+            logPacket(
+                direction = "ERR <- PRF",
+                summary = "Профиль-кадр от собственного адреса сброшен: подтверждения нет",
+                details = "Заявленный отправитель $senderIpv6 • версия $versionTag • этот адрес принадлежит данному узлу"
+            )
+            return
+        }
+        pruneRecentIncomingOverlayMessages()
+        val seenBefore = recentIncomingOverlayMessages.putIfAbsent(
+            "prf:${senderPubKeyHex.lowercase()}:$versionTag",
+            System.currentTimeMillis()
+        ) != null
+        val verdict = if (seenBefore) {
+            logPacket(
+                direction = "RX <- YGG",
+                summary = "Дубликат профиля версии $versionTag пропущен (ретрай отправителя)",
+                details = "Вердикт повторного ACK: duplicate $transportNote"
+            )
+            "duplicate"
+        } else {
+            logPacket(
+                direction = "RX <- YGG",
+                summary = "Принят профиль узла версии $versionTag $transportNote",
+                details = "От узла $senderIpv6 • запечатанное тело ${envelope.take(24)}..."
+            )
+            onProfileReceived(
+                IncomingProfilePacket(
+                    chatId = frame["chatId"] ?: "",
+                    senderIpv6 = senderIpv6,
+                    senderPubKeyHex = senderPubKeyHex.trim().lowercase(),
+                    recipientProfileId = resolvedProfileId,
+                    profileEnvelope = envelope,
+                    senderAvatarHash = frame["senderAvatarHash"].orEmpty().trim().lowercase(),
+                    senderAvatarData = avatarDataOf(frame),
+                    rttMs = (System.currentTimeMillis() -
+                        (frame["sentAt"]?.toLongOrNull() ?: System.currentTimeMillis())).coerceAtLeast(1L)
+                )
+            )
+        }
+        // The ACK goes out only after the store has answered, and it carries that answer: the
+        // sender's "confirmed" can then mean the contact's card changed, not merely that one
+        // datagram landed.
+        sendAck(
+            encodeWireFrame(
+                mapOf(
+                    "type" to "ACK",
+                    "profileAck" to ackTag,
+                    "profileVerdict" to verdict,
+                    "sentAt" to (frame["sentAt"] ?: System.currentTimeMillis().toString())
+                )
+            )
+        )
+    }
+
     private suspend fun handleOverlayFrame(profileId: String, payload: ByteArray, senderPubKeyHex: String) {
         val map = decodeWireFrame(String(payload, StandardCharsets.UTF_8))
         val senderIpv6 = map["senderIpv6"] ?: ""
@@ -2418,11 +2564,16 @@ class YggTwinP2PBridge(
                 val messageId = map["messageId"] ?: ""
                 val reactionId = map["reactionId"] ?: ""
                 val deleteId = map["deleteId"] ?: ""
+                val profileAck = map["profileAck"] ?: ""
                 val sentAt = map["sentAt"]?.toLongOrNull() ?: 0L
                 val rtt = if (sentAt > 0) (System.currentTimeMillis() - sentAt).coerceAtLeast(1L) else 1L
                 observedOverlayAckRttMs.set(rtt)
                 onTwinReachableChanged(true)
-                if (deleteId.isNotBlank()) {
+                if (profileAck.isNotBlank()) {
+                    pendingProfileAcks.remove(profileAck)?.complete(
+                        rtt to map["profileVerdict"].orEmpty().trim().lowercase()
+                    )
+                } else if (deleteId.isNotBlank()) {
                     pendingDeleteAcks.remove(deleteId)?.complete(rtt)
                     logPacket(
                         direction = "ACK <- YGG",
@@ -2545,6 +2696,16 @@ class YggTwinP2PBridge(
                         )
                     )
                 }
+            }
+            "PROFILE" -> {
+                onTwinReachableChanged(true)
+                handleProfileFrame(
+                    profileId = profileId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    frame = map,
+                    transportNote = "через оверлей Yggdrasil",
+                    sendAck = { ackFrame -> sendOverlayFrame(profileId, senderPubKeyHex, ackFrame, "ACK") }
+                )
             }
             "READ_RECEIPT" -> {
                 onTwinReachableChanged(true)
@@ -3072,6 +3233,17 @@ class YggTwinP2PBridge(
                             )
                         )
                     }
+                }
+                "PROFILE" -> {
+                    onTwinReachableChanged(true)
+                    val senderKeyFromFrame = map["senderPubKeyHex"].orEmpty().trim().lowercase()
+                    handleProfileFrame(
+                        profileId = recipientProfileId,
+                        senderPubKeyHex = senderKeyFromFrame,
+                        frame = map,
+                        transportNote = "по LAN $remoteIp",
+                        sendAck = { ackFrame -> writer.println(ackFrame) }
+                    )
                 }
                 "READ_RECEIPT" -> {
                     onTwinReachableChanged(true)
@@ -4569,6 +4741,197 @@ class YggTwinP2PBridge(
             rttMs = -1L,
             errorDetail = reason
         )
+    }
+
+    /**
+     * Offers this device's profile to one peer. [profileEnvelope] is the sealed body - the same
+     * conversation AEAD used for messages - produced for that peer's key. Without it the frame is
+     * refused here, because an open profile would let any node on the path rename itself as a
+     * saved contact.
+     *
+     * Delivery is confirmed only by that peer's ACK, so a profile that reached the overlay but was
+     * never read reports "не подтверждён" instead of pretending the contact's card changed.
+     */
+    suspend fun dispatchProfileFrame(
+        chatId: String,
+        profileEnvelope: String,
+        profileVersion: Long,
+        peerIpv6: String,
+        directEndpointHint: String,
+        senderIpv6: String,
+        senderPubKeyHex: String = "",
+        recipientNodePubKeyHex: String = "",
+        senderAvatarHash: String = "",
+        senderAvatarBase64: String = "",
+        allowLanFallback: Boolean = allowDirectLanRouting
+    ): ProfileDispatchResult = withContext(Dispatchers.IO) {
+        if (profileEnvelope.isBlank()) {
+            return@withContext ProfileDispatchResult(
+                delivered = false,
+                errorDetail = "Нет ключа собеседника: профиль нечем запечатать"
+            )
+        }
+        if (profileVersion <= 0L) {
+            // A frame the receiver cannot order against what it already stored would either
+            // overwrite a newer profile or be silently dropped - neither is honest.
+            return@withContext ProfileDispatchResult(
+                delivered = false,
+                errorDetail = "Профиль без отметки времени не отправляется: приёмник не смог бы " +
+                    "отличить его от более свежей версии"
+            )
+        }
+        if (directEndpointHint.isNotBlank()) {
+            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
+        }
+        val ackKey = "$chatId:$profileVersion"
+        val senderProfileId = ipv6ToProfileIdMap[senderIpv6.trim().lowercase()] ?: ""
+        val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
+        val directAddress = resolveDirectSocketAddress(
+            peerIpv6 = peerIpv6,
+            directHint = directEndpointHint,
+            senderIpv6 = senderIpv6,
+            allowPassiveLan = allowLanFallback
+        )
+        val hasInternet = isRealNetworkAvailable()
+        val senderCoreReady = senderProfileId.isNotBlank() && initializedNativeProfiles.contains(senderProfileId)
+        val senderPort = activeProfilePortMap[senderProfileId] ?: localTcpPort
+        // The avatar travels as a separate field and its hash is inside the sealed body, so the
+        // receiver checks the bytes against what the key confirmed. Unlike a message, a profile
+        // rewrite is rare and self-limiting: the sender stops including the bytes as soon as the
+        // hash arrives ACKed.
+        val avatarRidesAlong = senderAvatarHash.isNotBlank() && senderAvatarBase64.isNotBlank()
+        val wirePayload = encodeWireFrame(
+            mapOf(
+                "type" to "PROFILE",
+                "chatId" to chatId,
+                "profileEnvelope" to profileEnvelope,
+                "profileVersion" to profileVersion.toString(),
+                "profileAckKey" to ackKey,
+                "senderIpv6" to senderIpv6,
+                "senderPubKeyHex" to senderPubKeyHex,
+                "senderTcpPort" to senderPort.toString(),
+                "recipientIpv6" to peerIpv6,
+                "senderAvatarHash" to senderAvatarHash,
+                "senderAvatarData" to (if (avatarRidesAlong) senderAvatarBase64 else ""),
+                "sentAt" to System.currentTimeMillis().toString()
+            )
+        )
+
+        var overlayPossible = hasInternet && senderCoreReady && recipientKeyHex.isNotBlank()
+        var livePeers = 0
+        if (overlayPossible) {
+            livePeers = awaitLivePeer(senderProfileId, waitMs = if (directAddress != null) 3500L else 6000L)
+            if (livePeers <= 0) overlayPossible = false
+        }
+        if (overlayPossible) {
+            logPacket(
+                direction = "TX -> YGG",
+                summary = "Профиль направлен в оверлей Yggdrasil",
+                details = "К получателю $peerIpv6 • версия $profileVersion • Живых пиров: $livePeers",
+                mirror = true
+            )
+            val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Long, String>>()
+            pendingProfileAcks[ackKey] = deferred
+            for (attempt in 1..2) {
+                if (!sendOverlayFrame(senderProfileId, recipientKeyHex, wirePayload, "PROFILE")) break
+                val ack = kotlinx.coroutines.withTimeoutOrNull(
+                    if (directAddress != null) 2500L else 4000L
+                ) { deferred.await() }
+                if (ack != null) {
+                    val (ackRtt, verdict) = ack
+                    pendingProfileAcks.remove(ackKey, deferred)
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- YGG",
+                        summary = "Профиль версии $profileVersion подтверждён адресатом через оверлей Yggdrasil (RTT: $ackRtt мс)",
+                        details = "Узел $peerIpv6 • вердикт приёмника: ${describeVerdict(verdict)}" +
+                            if (avatarRidesAlong) " • аватар ехал рядом" else "",
+                        mirror = true
+                    )
+                    return@withContext ProfileDispatchResult(
+                        delivered = true,
+                        transport = "YGG_OVERLAY",
+                        rttMs = ackRtt,
+                        verdict = verdict
+                    )
+                }
+            }
+            pendingProfileAcks.remove(ackKey, deferred)
+        }
+
+        if (directAddress != null) {
+            logPacket(
+                direction = "TX -> LAN",
+                summary = "Профиль направлен напрямую по LAN",
+                details = "${directAddress.hostString}:${directAddress.port} • версия $profileVersion"
+            )
+            try {
+                val startedAt = System.currentTimeMillis()
+                var lanRtt: Long? = null
+                var lanVerdict = ""
+                Socket().use { socket ->
+                    socket.soTimeout = 5000
+                    socket.connect(directAddress, 3500)
+                    val writer = PrintWriter(OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+                    writer.println(wirePayload)
+                    val reply = reader.readLine()?.let { decodeWireFrame(it) }
+                    if (reply?.get("type") == "ACK" && reply["profileAck"].orEmpty() == ackKey) {
+                        lanRtt = (System.currentTimeMillis() - startedAt).coerceAtLeast(1L)
+                        lanVerdict = reply["profileVerdict"].orEmpty().trim().lowercase()
+                    }
+                }
+                val confirmedRtt = lanRtt
+                if (confirmedRtt != null) {
+                    onTwinReachableChanged(true)
+                    logPacket(
+                        direction = "ACK <- PEER",
+                        summary = "Профиль подтверждён адресатом по LAN (ACK)",
+                        details = "Адресат: $peerIpv6 • ${directAddress.hostString}:${directAddress.port} • вердикт приёмника: ${describeVerdict(lanVerdict)}"
+                    )
+                    return@withContext ProfileDispatchResult(
+                        delivered = true,
+                        transport = "LAN_DIRECT",
+                        rttMs = confirmedRtt,
+                        verdict = lanVerdict
+                    )
+                }
+            } catch (e: Exception) {
+                logPacket(
+                    direction = "ERR • PRF",
+                    summary = "Профиль не доставлен по LAN (${e.javaClass.simpleName})",
+                    details = "Адресат $peerIpv6 • ${directAddress.hostString}:${directAddress.port}"
+                )
+            }
+        }
+
+        val reason = when {
+            !hasInternet && directAddress == null -> "Нет подключения к интернету, LAN-маршрут к получателю не задан"
+            recipientKeyHex.isBlank() && directAddress == null ->
+                "Неизвестен Ed25519-ключ получателя: профиль можно запечатать только для известного узла"
+            !senderCoreReady && directAddress == null -> "Нода Yggdrasil отправителя не активна"
+            !overlayPossible && livePeers <= 0 && directAddress == null -> "Нода Yggdrasil без живых пиров"
+            else -> "Оверлей Yggdrasil и LAN-маршрут не подтвердили приём профиля"
+        }
+        logPacket(
+            direction = "ERR • PRF",
+            summary = "Профиль не подтверждён",
+            details = "Причина: $reason • адресат $peerIpv6 • версия $profileVersion"
+        )
+        ProfileDispatchResult(delivered = false, transport = "", rttMs = -1L, errorDetail = reason)
+    }
+
+    /** The receiver's own word for what it did with a profile frame, spelled out for the log. */
+    private fun describeVerdict(verdict: String): String = when (verdict) {
+        "applied" -> "профиль применён"
+        "no_dialog" -> "диалога с этим узлом нет, не применён"
+        "key_mismatch" -> "ключ узла не сходится с его адресом, отклонён"
+        "unsealed" -> "тело не расшифровалось, отклонён"
+        "corrupt" -> "тело не читается, отклонён"
+        "out_of_date" -> "старше сохранённого, не применён"
+        "duplicate" -> "уже был обработан ранее"
+        "" -> "ACK без вердикта (узел старше 1.7.6)"
+        else -> verdict
     }
 
     /**

@@ -10,6 +10,7 @@ import com.example.engine.IncomingTwinPacket
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
 import com.example.engine.YggCryptoEngine
+import com.example.engine.YggProfilePayload
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
@@ -338,19 +339,31 @@ class YggRepository(
         dao.upsertProfile(existing.copy(relayedPacketsCount = existing.relayedPacketsCount + delta))
     }
 
+    /**
+     * Stamp for the next outgoing profile.
+     *
+     * The receiver only applies a profile newer than the one it stored, so a stamp that does not
+     * strictly increase turns the second edit of a burst into a silent no-op. Wall-clock time ties
+     * inside a millisecond and rolls back when the network corrects the clock; the +1 floor covers
+     * both.
+     */
+    private fun nextProfileVersion(previous: Long): Long =
+        maxOf(System.currentTimeMillis(), previous + 1L)
+
     suspend fun updateCurrentProfileMetadata(
         profileId: String,
         displayName: String,
         handle: String,
         bio: String,
-        statusText: String
+        socialStatus: String
     ): UserProfileEntity? {
         val existing = dao.getProfileById(profileId) ?: return null
         val updated = existing.copy(
             displayName = displayName.trim().ifBlank { existing.displayName },
             handle = handle.trim().ifBlank { existing.handle },
             bio = bio.trim(),
-            statusText = statusText.trim().ifBlank { existing.statusText }
+            socialStatus = socialStatus.trim().ifBlank { existing.socialStatus },
+            profileVersion = nextProfileVersion(existing.profileVersion)
         )
         dao.upsertProfile(updated)
         return updated
@@ -370,7 +383,12 @@ class YggRepository(
         val stored = YggAvatarCodec.storeFromUri(context, source) ?: return null
         if (stored.hashHex != existing.avatarHashHex) {
             YggAvatarCodec.forget(context, existing.avatarUri)
-            dao.updateProfileAvatar(profileId, stored.localUri, stored.hashHex)
+            dao.updateProfileAvatar(
+                profileId,
+                stored.localUri,
+                stored.hashHex,
+                nextProfileVersion(existing.profileVersion)
+            )
         }
         return dao.getProfileById(profileId)
     }
@@ -380,13 +398,106 @@ class YggRepository(
         val existing = dao.getProfileById(profileId) ?: return
         if (existing.avatarUri.isBlank() && existing.avatarHashHex.isBlank()) return
         YggAvatarCodec.forget(context, existing.avatarUri)
-        dao.updateProfileAvatar(profileId, "", "")
+        // The new version is what tells peers the picture is gone rather than merely unreached:
+        // a body with an empty hash is a deletion the receiver can order against the last one.
+        dao.updateProfileAvatar(profileId, "", "", nextProfileVersion(existing.profileVersion))
     }
 
     suspend fun profileAvatarBase64(profileId: String): String =
         dao.getProfileById(profileId)?.avatarUri
             ?.let(YggAvatarCodec::base64OfStoredFile)
             .orEmpty()
+
+    /**
+     * What this device did with an incoming PROFILE frame, named apart because each of these
+     * outcomes has to be sayable differently: "не доставлено", "отклонено" and "старая версия"
+     * are not the same event, and only the first is the sender's fault.
+     */
+    enum class ProfileApplyOutcome {
+        APPLIED,
+        NO_DIALOG,
+        KEY_MISMATCH,
+        UNSEALED,
+        CORRUPT,
+        OUT_OF_DATE
+    }
+
+    /**
+     * A contact's own profile applied to the dialog it belongs to.
+     *
+     * Every field arrives inside a conversation envelope sealed to this device, and the frame is
+     * refused unless the sender's node key reproduces the mesh address it claims. That is the whole
+     * security argument: without it, any node able to put one frame on the path could rename
+     * itself as a saved contact or hand over a picture to plant under their face.
+     *
+     * The dialog must already exist. A profile is something peers exchange because they write to
+     * each other; accepting one from a stranger would turn the chat list into an inbox of names
+     * chosen by whoever messages first.
+     */
+    suspend fun applyIncomingProfile(
+        senderIpv6: String,
+        senderPubKeyHex: String,
+        profileEnvelope: String,
+        avatarHashHex: String,
+        avatarBase64: String,
+        recipientProfileId: String = "",
+        currentPrimaryProfileId: String = DEFAULT_PROFILE_ID
+    ): ProfileApplyOutcome {
+        val verifiedSenderKey = senderPubKeyHex.trim().lowercase().takeIf {
+            isEd25519Hex(it) && YggCryptoEngine.addressMatchesEd25519Key(senderIpv6, it)
+        } ?: return ProfileApplyOutcome.KEY_MISMATCH
+
+        val allProfiles = dao.getAllProfilesNow()
+        val ownerProfileId = recipientProfileId.ifBlank { currentPrimaryProfileId }
+        val chatId = findConversationIdByPeerIpv6(senderIpv6, ownerProfileId)
+            ?: return ProfileApplyOutcome.NO_DIALOG
+        val conv = dao.getConversationById(chatId) ?: return ProfileApplyOutcome.NO_DIALOG
+
+        val recipientWords = allProfiles.find { it.profileId == ownerProfileId }
+            ?.mnemonicCsv?.split(" ")?.filter { it.isNotBlank() }.orEmpty()
+        val recipientXPriv = YggCryptoEngine.x25519PrivateKeyFromMnemonic(recipientWords)
+            .takeIf { recipientWords.isNotEmpty() }
+            ?: return ProfileApplyOutcome.UNSEALED
+        val opened = try {
+            YggCryptoEngine.openConversationEnvelope(
+                envelope = profileEnvelope,
+                recipientX25519PrivateKey = recipientXPriv,
+                senderEd25519PublicKeyHex = verifiedSenderKey
+            )
+        } catch (e: Exception) {
+            Log.w("YggGramProfile", "Профиль от $senderIpv6 не распечатан: ${e.javaClass.simpleName}")
+            return ProfileApplyOutcome.UNSEALED
+        }
+        val body = YggProfilePayload.decode(opened.plainText)
+            ?: return ProfileApplyOutcome.CORRUPT
+        if (body.version <= conv.peerProfileVersion) return ProfileApplyOutcome.OUT_OF_DATE
+
+        dao.updatePeerProfile(
+            chatId = chatId,
+            title = body.displayName.ifBlank { conv.title },
+            peerHandle = body.handle,
+            peerStatusText = body.statusText,
+            peerProfileVersion = body.version
+        )
+        // A body that says "no picture" is a removal the receiver can act on: the version already
+        // proved which side of the two states this is, and leaving the old face up would show the
+        // user a picture their contact deleted.
+        if (body.avatarHashHex.isBlank()) {
+            clearIncomingAvatar(chatId)
+        } else if (body.avatarHashHex == avatarHashHex.lowercase()) {
+            storeIncomingAvatar(chatId, avatarHashHex, avatarBase64)
+        }
+        dao.updatePeerLastSeen(chatId, System.currentTimeMillis())
+        return ProfileApplyOutcome.APPLIED
+    }
+
+    private suspend fun clearIncomingAvatar(chatId: String) {
+        val context = appContext ?: return
+        val conv = dao.getConversationById(chatId) ?: return
+        if (conv.avatarUri.isBlank() && conv.avatarHashHex.isBlank()) return
+        YggAvatarCodec.forget(context, conv.avatarUri)
+        dao.updateConversationAvatar(chatId, "", "")
+    }
 
     /**
      * Saving a contact's avatar received over the overlay.
@@ -1042,6 +1153,48 @@ class YggRepository(
 
     suspend fun conversationHasEndToEndKey(chatId: String): Boolean =
         dao.getConversationById(chatId)?.let { resolveSealingKeys(it) != null } ?: false
+
+    /**
+     * Everything one PROFILE frame needs for one dialog: the body sealed to that peer's key,
+     * the version stamped on the last edit, and the picture the hash refers to.
+     *
+     * Returns null when the chat has no key to seal under. There is no unsealed form of this
+     * frame — a profile that anybody could write is not a profile, it is a way for a stranger to
+     * pick the name shown in the user's chat list.
+     */
+    suspend fun profileOfferFor(
+        chatId: String,
+        profileId: String
+    ): ProfileOffer? {
+        val conv = dao.getConversationById(chatId) ?: return null
+        val profile = dao.getProfileById(profileId) ?: return null
+        if (profile.profileVersion <= 0L) return null
+        val plain = YggProfilePayload.encode(
+            YggProfilePayload.ProfileBody(
+                displayName = profile.displayName,
+                handle = profile.handle,
+                statusText = profile.socialStatus,
+                avatarHashHex = profile.avatarHashHex,
+                version = profile.profileVersion
+            )
+        )
+        val envelope = sealForConversation(conv, plain) ?: return null
+        return ProfileOffer(
+            envelope = envelope,
+            version = profile.profileVersion,
+            avatarHashHex = profile.avatarHashHex,
+            avatarBase64 = YggAvatarCodec.base64OfStoredFile(profile.avatarUri).orEmpty()
+        )
+    }
+
+    suspend fun directDialogsWithSealedKey(ownerProfileId: String): List<ConversationEntity> =
+        dao.getAllConversationsNow().filter {
+            it.ownerProfileId == ownerProfileId &&
+                !isSelfChatId(it.chatId) &&
+                it.chatType != "GROUP" &&
+                it.yggIpv6Address.isNotBlank() &&
+                resolveSealingKeys(it) != null
+        }
 
     suspend fun sendEncryptedMessage(
         chatId: String,
@@ -2420,3 +2573,11 @@ class YggRepository(
         dao.upsertBackupSnapshot(snapshot.copy(isVerified = verified))
     }
 }
+
+/** One peer's copy of this device's profile, ready to go on the wire as a PROFILE frame. */
+data class ProfileOffer(
+    val envelope: String,
+    val version: Long,
+    val avatarHashHex: String,
+    val avatarBase64: String
+)

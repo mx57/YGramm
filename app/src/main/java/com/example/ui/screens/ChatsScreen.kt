@@ -1676,6 +1676,24 @@ private fun ChatDetailPane(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (conversation.chatType != "GROUP" &&
+                            (conversation.peerHandle.isNotBlank() || conversation.peerStatusText.isNotBlank())
+                        ) {
+                            // Only what the peer sealed for this device is shown: a contact whose
+                            // profile never arrived has no line here at all, rather than a guess
+                            // built from the mesh address.
+                            Text(
+                                text = listOfNotNull(
+                                    conversation.peerHandle.takeIf { it.isNotBlank() },
+                                    conversation.peerStatusText.takeIf { it.isNotBlank() }
+                                ).joinToString(" • "),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CyberTealSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("peer_profile_line_text")
+                            )
+                        }
                         if (conversation.chatType == "GROUP") {
                             Text(
                                 // The roster is what the mesh actually told us, so an empty

@@ -38,7 +38,9 @@ import com.example.engine.DerivedIdentityHierarchy
 import com.example.engine.DiscoveredYggPeer
 import com.example.engine.IncomingCallAudioPacket
 import com.example.engine.IncomingCallSignalPacket
+import com.example.engine.IncomingProfilePacket
 import com.example.engine.OverlayProbeOutcome
+import com.example.engine.ProfileDispatchResult
 import com.example.engine.SelfYggdrasilRelayResult
 import com.example.engine.YggAudioMediaEngine
 import com.example.engine.YggAvatarCodec
@@ -172,6 +174,9 @@ data class DecentralizedUserProfile(
     val handle: String = "@node1.ygg",
     val bio: String = "Децентрализованный мессенджер в сети Yggdrasil 0200::/7 • Прямой P2P & Zero-Knowledge",
     val statusText: String = "В оверлее 200::/7 (Порт 51921)",
+    // The user's own status line — the one peers see. [statusText] holds the node's machine state
+    // and is rewritten by the app, so it can never be the text a person chose about themselves.
+    val socialStatus: String = "",
     val allocatedTcpPort: Int = 51921,
     val isActiveInBackground: Boolean = true,
     val nodeRelayRole: String = "PEER_RELAY",
@@ -646,6 +651,31 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         },
+        onProfileReceived = { packet ->
+            // Awaited, not launched: the bridge puts this answer into the ACK it sends back, and a
+            // coroutine started beside it would always report "not applied" before the store
+            // finished.
+            val outcome = repository.applyIncomingProfile(
+                senderIpv6 = packet.senderIpv6,
+                senderPubKeyHex = packet.senderPubKeyHex,
+                profileEnvelope = packet.profileEnvelope,
+                avatarHashHex = packet.senderAvatarHash,
+                avatarBase64 = packet.senderAvatarData,
+                recipientProfileId = packet.recipientProfileId,
+                currentPrimaryProfileId = _uiState.value.currentProfileId
+            )
+            android.util.Log.i(
+                "YGG-SEND",
+                "RX <- PRF • ${packet.senderIpv6} • ${describeProfileOutcome(outcome)}"
+            )
+            if (outcome != YggRepository.ProfileApplyOutcome.APPLIED) {
+                // An applied profile changes the chat list by itself - the dialog row now
+                // carries the new name. Announcing every one of those would bury the user in
+                // banners each time a contact edits their status.
+                _uiState.update { it.copy(statusBannerMessage = describeProfileOutcome(outcome)) }
+            }
+            profileVerdictCode(outcome)
+        },
         onReadReceiptReceived = { chatId, ids ->
             viewModelScope.launch {
                 // A group has no reader-of-record: one member's receipt would mark the
@@ -997,6 +1027,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     handle = profileEntity.handle,
                     bio = profileEntity.bio,
                     statusText = profileEntity.statusText,
+                    socialStatus = profileEntity.socialStatus,
                     allocatedTcpPort = profileEntity.allocatedTcpPort,
                     isActiveInBackground = profileEntity.isActiveInBackground,
                     nodeRelayRole = profileEntity.nodeRelayRole,
@@ -2685,6 +2716,16 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         )
                     )
                 }
+                // A peer that has never sent a profile is a dialog this device has never been
+                // introduced in: the message carries the avatar bytes but not the name or status.
+                // One offer per dialog per run, and it is retried on the next message only if this
+                // one went unacknowledged.
+                if (targetConv != null && targetConv.chatType != "GROUP" &&
+                    !YggRepository.isSelfChatId(chatId) && targetConv.peerProfileVersion == 0L &&
+                    profileOfferedChats.add(chatId)
+                ) {
+                    launch { broadcastProfileToPeers(announce = false, onlyChatId = chatId) }
+                }
             } else {
                 repository.updateConversationRouteStatus(
                     chatId = chatId,
@@ -2867,7 +2908,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                         result.delivered ->
                             "Реакция $emoji доставлена адресату по LAN (ACK)"
                         else -> "Реакция $emoji сохранена локально, но адресат её не подтвердил: " +
-                            (result.errorDetail ?: "нет подтвержденного маршрута")
+                            (result.errorDetail ?: "нет подтверждённого маршрута")
                     }
                 )
             }
@@ -3007,7 +3048,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             "Запрос приняли $acked из ${targets.size} собеседников; остальные подтверждения не прислали"
                         else ->
                             "Удалено на этом устройстве$freedPart, но собеседник не подтвердил: " +
-                                (failure ?: "нет подтвержденного маршрута") +
+                                (failure ?: "нет подтверждённого маршрута") +
                                 " — запрос останется в очереди и уйдёт, когда связь появится"
                     }
                 )
@@ -5078,7 +5119,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 displayName = displayName,
                 handle = handle,
                 bio = bio,
-                statusText = statusText
+                socialStatus = statusText
             )
             if (updatedEntity != null) {
                 applyUserProfileEntityToState(updatedEntity)
@@ -5092,24 +5133,155 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             displayName = displayName.trim().ifBlank { it.userProfile.displayName },
                             handle = handle.trim().ifBlank { it.userProfile.handle },
                             bio = bio.trim(),
-                            statusText = statusText.trim(),
+                            socialStatus = statusText.trim(),
                             profileFingerprintHex = "sha256_fp:${sigHash.take(44)}"
                         )
                     )
                 }
             }
-            _uiState.update {
-                it.copy(statusBannerMessage = "Профиль сохранён • отпечаток вычислен по ключу узла")
-            }
+            broadcastProfileToPeers(announce = true)
         }
+    }
+
+    /** The wire word for this decision - the sender prints it in its own log instead of guessing. */
+    private fun profileVerdictCode(outcome: YggRepository.ProfileApplyOutcome): String =
+        when (outcome) {
+            YggRepository.ProfileApplyOutcome.APPLIED -> "applied"
+            YggRepository.ProfileApplyOutcome.NO_DIALOG -> "no_dialog"
+            YggRepository.ProfileApplyOutcome.KEY_MISMATCH -> "key_mismatch"
+            YggRepository.ProfileApplyOutcome.UNSEALED -> "unsealed"
+            YggRepository.ProfileApplyOutcome.CORRUPT -> "corrupt"
+            YggRepository.ProfileApplyOutcome.OUT_OF_DATE -> "out_of_date"
+        }
+
+    private fun describeProfileOutcome(outcome: YggRepository.ProfileApplyOutcome): String =        when (outcome) {
+            YggRepository.ProfileApplyOutcome.APPLIED ->
+                "Профиль собеседника принят: имя, статус и фото обновлены в его диалоге"
+            YggRepository.ProfileApplyOutcome.NO_DIALOG ->
+                "Профиль пришёл от узла, с которым нет диалога — не применён"
+            YggRepository.ProfileApplyOutcome.KEY_MISMATCH ->
+                "Профиль отклонён: ключ узла не соответствует его адресу в сети"
+            YggRepository.ProfileApplyOutcome.UNSEALED ->
+                "Профиль отклонён: тело не расшифровалось ключом этого устройства"
+            YggRepository.ProfileApplyOutcome.CORRUPT ->
+                "Профиль отклонён: расшифрованное тело не читается"
+            YggRepository.ProfileApplyOutcome.OUT_OF_DATE ->
+                "Профиль старше сохранённого — ничего не изменено"
+        }
+
+    /**
+     * Dialogs this run has already introduced the current profile to. In-RAM on purpose: after a
+     * restart a fresh offer is cheap and it is the profile's version, not this set, that decides
+     * whether the receiver applies anything.
+     */
+    private val profileOfferedChats: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * Offers this device's profile to the dialogs that have a key to seal it under.
+     *
+     * There is no directory of profiles and no way to search the mesh for one, so "отправлен
+     * всем" would be a claim this transport cannot support: the only recipients are peers this
+     * user already writes to. Each one answers with its own ACK, and the banner counts those ACKs
+     * rather than the frames handed to the socket.
+     */
+    private suspend fun broadcastProfileToPeers(announce: Boolean, onlyChatId: String? = null) {
+        val state = _uiState.value
+        val ownerProfile = repository.getAllProfilesNow().find { it.profileId == state.currentProfileId }
+        val senderIpv6 = ownerProfile?.yggIpv6Address ?: state.identity.yggIpv6Address
+        val senderPubKeyHex = ownerProfile?.yggPublicKeyHex ?: state.identity.yggNodePublicKeyHex
+        val dialogs = repository.directDialogsWithSealedKey(state.currentProfileId)
+            .let { all -> if (onlyChatId == null) all else all.filter { it.chatId == onlyChatId } }
+        if (dialogs.isEmpty()) {
+            if (announce && onlyChatId == null) {
+                _uiState.update {
+                    it.copy(
+                        statusBannerMessage = "Профиль сохранён на этом устройстве: ни с кем " +
+                            "нет диалога с ключом собеседника — запечатать не для кого"
+                    )
+                }
+            }
+            return
+        }
+        val results = withContext(Dispatchers.IO) {
+            dialogs.map { conv ->
+                async {
+                    val offer = repository.profileOfferFor(conv.chatId, state.currentProfileId)
+                    if (offer == null) {
+                        ProfileDispatchResult(
+                            delivered = false,
+                            errorDetail = "Профиль не отправлен: у диалога не осталось ключа собеседника"
+                        )
+                    } else {
+                        networkEngine.dispatchProfileFrame(
+                            chatId = conv.chatId,
+                            profileEnvelope = offer.envelope,
+                            profileVersion = offer.version,
+                            peerIpv6 = conv.yggIpv6Address,
+                            directEndpointHint = extractDirectEndpointHint(conv),
+                            senderIpv6 = senderIpv6,
+                            senderPubKeyHex = senderPubKeyHex,
+                            recipientNodePubKeyHex = conv.publicKeyHex,
+                            senderAvatarHash = offer.avatarHashHex,
+                            senderAvatarBase64 = offer.avatarBase64
+                        )
+                    }
+                }
+            }.awaitAll()
+        }
+        val acked = results.count { it.delivered }
+        // The ACK alone does not say the contact's card changed: the receiver answers with its own
+        // verdict, and a frame it refused (no dialog, older version, unreadable body) arrived
+        // without being applied. "Подтвердили" would count those; "приняли" must not.
+        val applied = results.count { it.verdict == "applied" }
+        val refused = results.filter { it.delivered && it.verdict.isNotEmpty() && it.verdict != "applied" }
+        val failure = results.firstOrNull { !it.delivered }?.errorDetail
+        // Remembered per dialog, not globally: an acknowledged offer needs no repeat on the next
+        // message, while an unacknowledged one stays eligible for exactly that retry.
+        dialogs.zip(results).forEach { (conv, result) ->
+            if (result.delivered) profileOfferedChats.add(conv.chatId) else profileOfferedChats.remove(conv.chatId)
+        }
+        android.util.Log.i(
+            "YGG-SEND",
+            "TX -> PRF • подтвердили $acked из ${dialogs.size}, применили $applied" +
+                (refused.firstOrNull()?.let { " • первый отказ: ${it.verdict}" } ?: "") +
+                (failure?.let { " • первая причина доставки: $it" } ?: "")
+        )
+        if (!announce || onlyChatId != null) return
+        _uiState.update {
+            it.copy(
+                statusBannerMessage = when {
+                    applied == dialogs.size -> "Профиль приняли все: $applied"
+                    applied > 0 -> "Профиль приняли $applied из ${dialogs.size}" +
+                        (refused.firstOrNull()?.let { " • ${describeProfileVerdict(it.verdict)}" } ?: "")
+                    acked > 0 && applied == 0 && refused.isNotEmpty() ->
+                        "Кадр дошёл до $acked, но ни один узел его не применил: " +
+                            describeProfileVerdict(refused.first().verdict)
+                    acked > 0 -> "Профиль дошёл до $acked из ${dialogs.size}, но никто из них не ответил, что применил его (узел старше 1.7.6 вердикт не присылает)"
+                    else -> "Профиль сохранён здесь, но ни один собеседник его не подтвердил: " +
+                        (failure ?: "нет подтверждённого маршрута")
+                }
+            )
+        }
+    }
+
+    /** The receiver's refusal, in the user's language, straight from the verdict it sent back. */
+    private fun describeProfileVerdict(verdict: String): String = when (verdict) {
+        "no_dialog" -> "у узла нет диалога с этим контактом"
+        "key_mismatch" -> "ключ узла не сходится с его адресом"
+        "unsealed" -> "тело профиля не расшифровалось"
+        "corrupt" -> "тело профиля не читается"
+        "out_of_date" -> "у узла уже лежит более свежая версия"
+        "duplicate" -> "этот кадр уже был обработан"
+        else -> "вердикт узла: $verdict"
     }
 
     /**
      * Setting the profile picture from the gallery.
      *
-     * Nothing is announced as changed unless the codec produced a file: the avatar travels
-     * inside the message frame, so a picture too large to fit there has no honest delivery
-     * path and must not quietly become a half-cropped one.
+     * Nothing is announced as changed unless the codec produced a file: a picture too large to fit
+     * in a frame must not quietly become a half-cropped one. When it does fit, the avatar goes out
+     * with the profile frame immediately, and the banner reports the ACKs that came back.
      */
     fun setProfileAvatar(source: Uri) {
         viewModelScope.launch {
@@ -5117,9 +5289,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             val updated = repository.setProfileAvatar(profileId, source)
             if (updated != null) {
                 applyUserProfileEntityToState(updated)
-                _uiState.update {
-                    it.copy(statusBannerMessage = "Фото профиля обновлено • будет передано при следующем сообщении")
-                }
+                broadcastProfileToPeers(announce = true)
             } else {
                 _uiState.update {
                     it.copy(
@@ -5133,10 +5303,20 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     fun clearProfileAvatar() {
         viewModelScope.launch {
             val profileId = _uiState.value.currentProfileId
+            val hadAvatar = repository.getAllProfilesNow()
+                .find { it.profileId == profileId }
+                ?.avatarHashHex?.isNotBlank() == true
             repository.clearProfileAvatar(profileId)
             repository.getAllProfilesNow().find { it.profileId == profileId }
                 ?.let { applyUserProfileEntityToState(it) }
-            _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
+            if (hadAvatar) {
+                // A removed picture has to reach peers as a removal: the sealed body now carries
+                // an empty hash, and the higher version is what makes the receiver erase the face
+                // rather than keep showing one the user deleted.
+                broadcastProfileToPeers(announce = true)
+            } else {
+                _uiState.update { it.copy(statusBannerMessage = "Фото профиля удалено") }
+            }
         }
     }
 

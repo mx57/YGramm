@@ -289,7 +289,9 @@ fun ProfilePrivacyScreen(
                                 )
                             }
                             Text(
-                                text = "${profile.handle} • ${profile.statusText}",
+                                text = listOf(profile.handle, profile.socialStatus)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString(" • "),
                                 style = MaterialTheme.typography.labelMedium,
                                 color = CyberTealSecondary
                             )
@@ -1462,7 +1464,7 @@ fun ProfilePrivacyScreen(
             initialName = profile.displayName,
             initialHandle = profile.handle,
             initialBio = profile.bio,
-            initialStatus = profile.statusText,
+            initialStatus = profile.socialStatus,
             onDismiss = { showEditProfileDialog = false },
             onSave = { name, handle, bio, status ->
                 onUpdateProfile(name, handle, bio, status)
@@ -1743,9 +1745,11 @@ private fun EditDecentralizedProfileModal(
                 OutlinedTextField(
                     value = status,
                     onValueChange = { status = it },
-                    label = { Text("Статус узла") },
+                    label = { Text("Статус — виден собеседникам") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("profile_status_input")
                 )
                 OutlinedTextField(
                     value = bio,
@@ -1753,6 +1757,16 @@ private fun EditDecentralizedProfileModal(
                     label = { Text("О себе / криптографические реквизиты") },
                     maxLines = 3,
                     modifier = Modifier.fillMaxWidth()
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Text(
+                    text = "Имя, @handle, статус и фото профиля уходят только тем, кому вы пишете, " +
+                        "и каждому — запечатанными его собственным ключом. Без этого кадра узел " +
+                        "на том конце не смог бы представиться вашим именем. Справочника профилей " +
+                        "и поиска по адресу в сети нет: сервера, который их держал бы, здесь нет. " +
+                        "Поле «О себе» остаётся на этом устройстве.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         },

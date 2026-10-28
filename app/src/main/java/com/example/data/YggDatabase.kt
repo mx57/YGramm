@@ -27,7 +27,7 @@ import java.io.FileInputStream
         GroupMemberEntity::class,
         MessageDeletionEntity::class
     ],
-    version = 13,
+    version = 14,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -160,6 +160,35 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // What a contact says about themselves used to reach this device only as a
+                // name in a message frame, applied when the dialog row was created and never
+                // again — a renamed peer left the chat titled with the old name forever. The
+                // PROFILE frame carries the fields, and the version is what lets a receiver
+                // refuse an older copy of somebody's identity.
+                db.execSQL("ALTER TABLE conversations ADD COLUMN peerHandle TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE conversations ADD COLUMN peerStatusText TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN peerProfileVersion INTEGER NOT NULL DEFAULT 0"
+                )
+                // The last moment a frame from this peer opened here. Presence is a timestamp,
+                // not a dot: a background socket dies, and nothing in the mesh says whether a
+                // person is at the phone right now.
+                db.execSQL("ALTER TABLE conversations ADD COLUMN peerLastSeenAt INTEGER NOT NULL DEFAULT 0")
+                // Set only by an envelope this device actually opened as v3, so an outgoing
+                // choice of key agreement rests on evidence rather than on a guess about the peer.
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN peerEnvelopeV3Proven INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL("ALTER TABLE ygg_profiles ADD COLUMN profileVersion INTEGER NOT NULL DEFAULT 0")
+                // The status line the person typed, kept apart from ygg_profiles.statusText: that
+                // column holds node-role bookkeeping written by the app itself, and it is what a
+                // peer would otherwise receive as somebody's "status".
+                db.execSQL("ALTER TABLE ygg_profiles ADD COLUMN socialStatus TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -185,7 +214,7 @@ abstract class YggDatabase : RoomDatabase() {
             return Room.databaseBuilder(context, YggDatabase::class.java, DATABASE_NAME)
                 .addMigrations(
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
-                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13
+                    MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
