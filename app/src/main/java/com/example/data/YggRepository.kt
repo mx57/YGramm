@@ -1869,6 +1869,12 @@ class YggRepository(
         }
     }
 
+    /**
+     * Records what a route check found. This is reachability of the node's TCP port on the
+     * overlay — nothing more, and in particular nothing about a person: a node answers while
+     * the phone is in a pocket. Presence has one source only, [peerLastSeenAt] on the row,
+     * and this method never touches it.
+     */
     suspend fun updateConversationRouteStatus(chatId: String, isOnline: Boolean, routeSummary: String) {
         val conv = dao.getConversationById(chatId) ?: return
         dao.upsertConversation(
@@ -1959,6 +1965,7 @@ class YggRepository(
         var resolvedPlainText = ""
         var authenticatedSenderX25519Pub = ""
         var resolvedEnvelopeVersion = 1
+        var envelopeOpened = false
         if (recipientXPriv != null && packet.cipherPayloadHex.isNotBlank()) {
             try {
                 val opened = YggCryptoEngine.openConversationEnvelope(
@@ -1969,6 +1976,7 @@ class YggRepository(
                 resolvedPlainText = opened.plainText
                 authenticatedSenderX25519Pub = opened.senderX25519PublicKeyHex
                 resolvedEnvelopeVersion = opened.version
+                envelopeOpened = true
             } catch (e: Exception) {
                 // Envelope did not verify under this profile's key; fall back to legacy text below.
                 Log.w(
@@ -2156,7 +2164,17 @@ class YggRepository(
                 lastMessagePreview = "$previewPrefix$firstLine".trim(),
                 lastTimestamp = packet.timestamp,
                 unreadCount = if (isCurrentlyViewing) 0 else conv.unreadCount + 1,
-                isOnlineInMesh = true
+                isOnlineInMesh = true,
+                // An envelope this device opened is the only presence evidence there is: the
+                // bytes arrived and the AEAD verified under this profile's key. A route check
+                // says the node answers TCP, not that anyone is there — so it stays away from
+                // this stamp, and a group chat never gets one because the frame proves only
+                // that some member wrote, not which one.
+                peerLastSeenAt = if (envelopeOpened && conv.chatType != "GROUP" && !isSelfChatId(conv.chatId)) {
+                    System.currentTimeMillis()
+                } else {
+                    conv.peerLastSeenAt
+                }
             )
         )
         return conv.chatId

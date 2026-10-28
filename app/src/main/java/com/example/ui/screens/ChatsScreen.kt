@@ -120,6 +120,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -898,7 +900,7 @@ private fun CallLogRow(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = formatCallLogTime(entry.startedAt),
+                    text = formatDayAwareTime(entry.startedAt),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -938,7 +940,7 @@ private fun CallLogRow(
     }
 }
 
-private fun formatCallLogTime(timestamp: Long): String {
+private fun formatDayAwareTime(timestamp: Long): String {
     val now = Calendar.getInstance()
     val then = Calendar.getInstance().apply { timeInMillis = timestamp }
     val sameDay = now.get(Calendar.YEAR) == then.get(Calendar.YEAR) &&
@@ -1339,12 +1341,22 @@ private fun ConversationRowCard(
                                 .clip(CircleShape)
                                 .background(
                                     if (conversation.isOnlineInMesh) {
-                                        EmeraldPrimary
+                                        CyberTealSecondary
                                     } else {
                                         MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                                     }
                                 )
-                                .testTag("conversation_online_dot_${conversation.chatId}")
+                                // A route check answers for the node, not for the person behind
+                                // it, so this dot is deliberately not the "online" green: it says
+                                // whether the overlay path was up when it was last measured.
+                                .semantics {
+                                    contentDescription = if (conversation.isOnlineInMesh) {
+                                        "Маршрут к узлу подтверждён"
+                                    } else {
+                                        "Маршрут к узлу не подтверждён"
+                                    }
+                                }
+                                .testTag("conversation_route_dot_${conversation.chatId}")
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
@@ -1676,6 +1688,25 @@ private fun ChatDetailPane(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (conversation.chatType != "GROUP" && !isSelfChat) {
+                            // The one presence fact this app has, stated as a past event: the
+                            // time the peer's frame last opened on this device. There is no
+                            // "now" to report — nothing on the overlay answers for a person. And
+                            // "не зафиксирован" rather than "не выходил": the stamp only exists
+                            // from 1.7.6, so an old dialog simply has no measurement yet.
+                            Text(
+                                text = if (conversation.peerLastSeenAt > 0L) {
+                                    "Выходил на связь: ${formatDayAwareTime(conversation.peerLastSeenAt)}"
+                                } else {
+                                    "Выход на связь не зафиксирован"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("peer_last_seen_line_text")
+                            )
+                        }
                         if (conversation.chatType != "GROUP" &&
                             (conversation.peerHandle.isNotBlank() || conversation.peerStatusText.isNotBlank())
                         ) {
