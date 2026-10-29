@@ -6,11 +6,7 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 
-/**
- * A byte-for-byte copy of the live SQLCipher file, plus what the copy actually contains.
- * Nothing here derives a number from row counts: size, piece count and Merkle root are read
- * back from the bytes that were written.
- */
+// The caller must freeze the source: matching hashes alone cannot make an active database consistent.
 object YggEncryptedExport {
 
     data class ArchiveProfile(

@@ -30,12 +30,10 @@ data class DerivedIdentityHierarchy(
 object YggCryptoEngine {
     private val secureRandom = SecureRandom()
 
-    private val defaultWordPool = listOf(
-        "obsidian", "cipher", "yggdrasil", "vector", "emerald", "quantum",
-        "ratchet", "bastion", "entropy", "merkle", "shadow", "vortex",
-        "cobalt", "beacon", "prism", "horizon", "lattice", "nomad",
-        "zenith", "paradox", "anchor", "kinetic", "solstice", "aurora"
-    )
+    private val mnemonicWordList by lazy {
+        YggCryptoEngine::class.java.getResourceAsStream("/bip39-english.txt")!!
+            .bufferedReader(StandardCharsets.US_ASCII).use { it.readLines() }
+    }
 
     // BigInteger field arithmetic caches for the curve implementations below.
     private val fieldP: BigInteger = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
@@ -460,14 +458,19 @@ object YggCryptoEngine {
         return sb.toString()
     }
 
-    fun generateFreshMnemonic12(): List<String> {
-        val picked = mutableListOf<String>()
-        val pool = defaultWordPool.toMutableList()
-        repeat(12) {
-            val idx = secureRandom.nextInt(pool.size)
-            picked.add(pool.removeAt(idx))
+    fun generateFreshMnemonic12(): List<String> =
+        mnemonic12FromEntropy(ByteArray(16).apply { secureRandom.nextBytes(this) })
+
+    internal fun mnemonic12FromEntropy(entropy: ByteArray): List<String> {
+        require(entropy.size == 16)
+        val bits = entropy + MessageDigest.getInstance("SHA-256").digest(entropy)[0]
+        return List(12) { wordIndex ->
+            val index = (0 until 11).fold(0) { value, bit ->
+                val position = wordIndex * 11 + bit
+                (value shl 1) or ((bits[position / 8].toInt() ushr (7 - position % 8)) and 1)
+            }
+            mnemonicWordList[index]
         }
-        return picked
     }
 
     private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, outputLength: Int): ByteArray {

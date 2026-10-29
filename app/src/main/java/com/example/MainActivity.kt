@@ -37,7 +37,6 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Hub
-import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.QrCodeScanner
@@ -314,7 +313,13 @@ fun YggGramRootApp(
 
     if (uiState.activeTab != YggNavTab.CHATS) {
         BackHandler {
-            viewModel.selectTab(YggNavTab.CHATS)
+            viewModel.selectTab(
+                when (uiState.activeTab) {
+                    YggNavTab.NETWORK_MAP -> YggNavTab.NETWORK_DPI
+                    YggNavTab.VAULT_SYNC -> YggNavTab.PROFILE_PRIVACY
+                    else -> YggNavTab.CHATS
+                }
+            )
         }
     }
 
@@ -326,8 +331,6 @@ fun YggGramRootApp(
     } else {
         peers.count { it.isConnected }
     }
-    val activeBgProfilesCount = userProfiles.count { it.isActiveInBackground || it.isCurrentPrimary }.coerceAtLeast(1)
-
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val useNavigationRail = maxWidth >= 720.dp
 
@@ -362,29 +365,19 @@ fun YggGramRootApp(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Surface(
-                                        color = if (uiState.isOfflineStoreAndForwardMode) {
-                                            MaterialTheme.colorScheme.tertiaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        },
-                                        shape = RoundedCornerShape(6.dp)
-                                    ) {
-                                        Text(
-                                            text = if (uiState.isOfflineStoreAndForwardMode) {
-                                                "OFFLINE S&F"
-                                            } else {
-                                                uiState.antiDpiConfig.activePreset.badge
-                                            },
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (uiState.isOfflineStoreAndForwardMode) {
-                                                AmberShieldTertiary
-                                            } else {
-                                                EmeraldPrimary
-                                            },
-                                            maxLines = 1,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
+                                    if (uiState.isOfflineStoreAndForwardMode) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                                            shape = RoundedCornerShape(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Отправка отложена",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                                maxLines = 1,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
                                     }
                                 }
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -400,7 +393,7 @@ fun YggGramRootApp(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "${uiState.userProfile.handle} (${uiState.identity.yggIpv6Address.take(14)}...)",
+                                        text = uiState.userProfile.handle,
                                         style = MaterialTheme.typography.labelSmall,
                                         color = CyberTealSecondary,
                                         maxLines = 1,
@@ -433,7 +426,7 @@ fun YggGramRootApp(
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = "${userProfiles.size}/$activeBgProfilesCount",
+                                        text = userProfiles.size.toString(),
                                         style = MaterialTheme.typography.labelMedium,
                                         color = CyberTealSecondary,
                                         fontWeight = FontWeight.Bold
@@ -480,25 +473,6 @@ fun YggGramRootApp(
                                 DropdownMenuItem(
                                     text = {
                                         Text(
-                                            text = "+ Создать новый профиль (одновременный P2P)",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = EmeraldPrimary
-                                        )
-                                    },
-                                    onClick = {
-                                        showProfileQuickMenu = false
-                                        viewModel.createNewProfile(
-                                            displayName = "Узел YGramm #${userProfiles.size + 1}",
-                                            handle = "@node${userProfiles.size + 1}.ygg",
-                                            bio = "Параллельный профиль Yggdrasil",
-                                            runSimultaneouslyInBackground = true,
-                                            switchImmediately = false
-                                        )
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
                                             text = "Управление профилями и фоновым сервисом...",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = CyberTealSecondary
@@ -512,6 +486,14 @@ fun YggGramRootApp(
                             }
                         }
 
+                        if (uiState.activeTab == YggNavTab.NETWORK_DPI) {
+                            IconButton(
+                                onClick = { viewModel.selectTab(YggNavTab.NETWORK_MAP) },
+                                modifier = Modifier.testTag("network_open_map_button")
+                            ) {
+                                Icon(Icons.Default.Map, contentDescription = "Открыть карту сети")
+                            }
+                        }
                         IconButton(
                             onClick = { showGlobalQrModal = true },
                             modifier = Modifier.testTag("top_bar_qr_button")
@@ -555,17 +537,7 @@ fun YggGramRootApp(
                         )
 
                         NavigationBarItem(
-                            selected = uiState.activeTab == YggNavTab.NETWORK_MAP,
-                            onClick = { viewModel.selectTab(YggNavTab.NETWORK_MAP) },
-                            icon = {
-                                Icon(Icons.Default.Map, contentDescription = "Карта сети")
-                            },
-                            label = { Text("Карта") },
-                            modifier = Modifier.testTag("nav_tab_network_map")
-                        )
-
-                        NavigationBarItem(
-                            selected = uiState.activeTab == YggNavTab.NETWORK_DPI,
+                            selected = uiState.activeTab == YggNavTab.NETWORK_DPI || uiState.activeTab == YggNavTab.NETWORK_MAP,
                             onClick = { viewModel.selectTab(YggNavTab.NETWORK_DPI) },
                             icon = {
                                 BadgedBox(
@@ -578,22 +550,12 @@ fun YggGramRootApp(
                                     Icon(Icons.Default.Hub, contentDescription = "Сеть и ТСПУ")
                                 }
                             },
-                            label = { Text(stringResource(R.string.nav_network)) },
+                            label = { Text("Сеть") },
                             modifier = Modifier.testTag("nav_tab_network")
                         )
 
                         NavigationBarItem(
-                            selected = uiState.activeTab == YggNavTab.VAULT_SYNC,
-                            onClick = { viewModel.selectTab(YggNavTab.VAULT_SYNC) },
-                            icon = {
-                                Icon(Icons.Default.Key, contentDescription = "Ключи и Синхронизация")
-                            },
-                            label = { Text(stringResource(R.string.nav_vault)) },
-                            modifier = Modifier.testTag("nav_tab_vault")
-                        )
-
-                        NavigationBarItem(
-                            selected = uiState.activeTab == YggNavTab.PROFILE_PRIVACY,
+                            selected = uiState.activeTab == YggNavTab.PROFILE_PRIVACY || uiState.activeTab == YggNavTab.VAULT_SYNC,
                             onClick = { viewModel.selectTab(YggNavTab.PROFILE_PRIVACY) },
                             icon = {
                                 BadgedBox(
@@ -608,7 +570,7 @@ fun YggGramRootApp(
                                     Icon(Icons.Default.Person, contentDescription = "Профиль и Приватность")
                                 }
                             },
-                            label = { Text(stringResource(R.string.nav_profile)) },
+                            label = { Text("Профиль") },
                             modifier = Modifier.testTag("nav_tab_profile")
                         )
                     }
@@ -633,31 +595,17 @@ fun YggGramRootApp(
                             modifier = Modifier.testTag("rail_tab_chats")
                         )
                         NavigationRailItem(
-                            selected = uiState.activeTab == YggNavTab.NETWORK_MAP,
-                            onClick = { viewModel.selectTab(YggNavTab.NETWORK_MAP) },
-                            icon = { Icon(Icons.Default.Map, contentDescription = "Карта сети") },
-                            label = { Text("Карта") },
-                            modifier = Modifier.testTag("rail_tab_network_map")
-                        )
-                        NavigationRailItem(
-                            selected = uiState.activeTab == YggNavTab.NETWORK_DPI,
+                            selected = uiState.activeTab == YggNavTab.NETWORK_DPI || uiState.activeTab == YggNavTab.NETWORK_MAP,
                             onClick = { viewModel.selectTab(YggNavTab.NETWORK_DPI) },
                             icon = { Icon(Icons.Default.Hub, contentDescription = "Сеть и ТСПУ") },
-                            label = { Text(stringResource(R.string.nav_network)) },
+                            label = { Text("Сеть") },
                             modifier = Modifier.testTag("rail_tab_network")
                         )
                         NavigationRailItem(
-                            selected = uiState.activeTab == YggNavTab.VAULT_SYNC,
-                            onClick = { viewModel.selectTab(YggNavTab.VAULT_SYNC) },
-                            icon = { Icon(Icons.Default.Key, contentDescription = "Ключи и Синхронизация") },
-                            label = { Text(stringResource(R.string.nav_vault)) },
-                            modifier = Modifier.testTag("rail_tab_vault")
-                        )
-                        NavigationRailItem(
-                            selected = uiState.activeTab == YggNavTab.PROFILE_PRIVACY,
+                            selected = uiState.activeTab == YggNavTab.PROFILE_PRIVACY || uiState.activeTab == YggNavTab.VAULT_SYNC,
                             onClick = { viewModel.selectTab(YggNavTab.PROFILE_PRIVACY) },
                             icon = { Icon(Icons.Default.Person, contentDescription = "Профиль") },
-                            label = { Text(stringResource(R.string.nav_profile)) },
+                            label = { Text("Профиль") },
                             modifier = Modifier.testTag("rail_tab_profile")
                         )
                     }
@@ -752,6 +700,7 @@ fun YggGramRootApp(
                                 onRemoveGroupMember = viewModel::removeGroupMember,
                                 onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,
+                                onToggleChatPin = viewModel::toggleChatPin,
                                 onClearChat = viewModel::clearChatHistory,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
                                 onOpenSelfYggdrasilChat = { runOverlayProbe ->
@@ -835,7 +784,17 @@ fun YggGramRootApp(
                                 onOpenChatWithProfile = viewModel::openChatWithSecondaryProfile,
                                 onToggleBackgroundService = viewModel::setBackgroundServiceEnabled,
                                 onUpdatePrivacy = viewModel::updatePrivacySetting,
-                                onUpdateNotifications = viewModel::updateNotificationPreferences,
+                                onUpdateNotifications = { inApp, system, suppressOpenChat, messages, voice, calls, hideContent ->
+                                    viewModel.updateNotificationPreferences(
+                                        inAppNotificationsEnabled = inApp,
+                                        systemNotificationsEnabled = system,
+                                        suppressNotificationsForOpenChat = suppressOpenChat,
+                                        hideNotificationContent = hideContent,
+                                        messageNotificationsEnabled = messages,
+                                        voiceNotificationsEnabled = voice,
+                                        callNotificationsEnabled = calls
+                                    )
+                                },
                                 onAddContactFromQr = { payload ->
                                     viewModel.addContactFromQrPayload(payload)
                                     viewModel.selectTab(YggNavTab.CHATS)
@@ -847,7 +806,8 @@ fun YggGramRootApp(
                                 conversations = conversations,
                                 onRequestApkFromPeer = viewModel::requestApkFromPeer,
                                 onCancelApkRelay = viewModel::cancelApkRelay,
-                                onImportReleaseManifest = viewModel::importReleaseManifest
+                                onImportReleaseManifest = viewModel::importReleaseManifest,
+                                onOpenKeys = { viewModel.selectTab(YggNavTab.VAULT_SYNC) }
                             )
                         }
                     }

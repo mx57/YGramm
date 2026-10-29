@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Radar
@@ -193,6 +194,7 @@ fun ChatsScreen(
     onRemoveGroupMember: (String, String) -> Unit = { _, _ -> },
     onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
+    onToggleChatPin: (String) -> Unit = {},
     onClearChat: (String) -> Unit = {},
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
@@ -213,7 +215,8 @@ fun ChatsScreen(
             val matchesQuery = uiState.searchQuery.isBlank() ||
                 conv.title.contains(uiState.searchQuery, ignoreCase = true) ||
                 conv.yggIpv6Address.contains(uiState.searchQuery, ignoreCase = true) ||
-                conv.publicKeyHex.contains(uiState.searchQuery, ignoreCase = true)
+                conv.publicKeyHex.contains(uiState.searchQuery, ignoreCase = true) ||
+                conv.peerHandle.contains(uiState.searchQuery, ignoreCase = true)
 
             val matchesFilter = when (uiState.selectedChatFilter) {
                 "DIRECT" -> !conv.chatId.startsWith("chat_self_ygg_node")
@@ -305,6 +308,7 @@ fun ChatsScreen(
                         onFilterChange = onFilterChange,
                         onToggleOfflineMode = onToggleOfflineMode,
                         onDeleteChat = onDeleteChat,
+                        onToggleChatPin = onToggleChatPin,
                         onStartVoiceCall = onStartVoiceCall,
                         onOpenNewChatDialog = { showNewChatDialog = true },
                         onOpenQrModal = { tab ->
@@ -463,6 +467,7 @@ fun ChatsScreen(
                     onFilterChange = onFilterChange,
                     onToggleOfflineMode = onToggleOfflineMode,
                     onDeleteChat = onDeleteChat,
+                    onToggleChatPin = onToggleChatPin,
                     onStartVoiceCall = onStartVoiceCall,
                     onOpenNewChatDialog = { showNewChatDialog = true },
                     onOpenQrModal = { tab ->
@@ -540,6 +545,7 @@ private fun ChatListPane(
     onFilterChange: (String) -> Unit,
     onToggleOfflineMode: () -> Unit,
     onDeleteChat: (String) -> Unit,
+    onToggleChatPin: (String) -> Unit = {},
     onStartVoiceCall: (String) -> Unit,
     onOpenNewChatDialog: () -> Unit,
     onOpenQrModal: (Int) -> Unit,
@@ -577,7 +583,7 @@ private fun ChatListPane(
                                 .testTag("search_chats_input"),
                             placeholder = {
                                 Text(
-                                    "Поиск по имени, IPv6 или ключу",
+                                    "Поиск по имени, @handle, IPv6 или ключу",
                                     style = MaterialTheme.typography.bodyMedium,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
@@ -697,7 +703,8 @@ private fun ChatListPane(
                             0
                         },
                         onClick = { onSelectChat(conv.chatId) },
-                        onDelete = { onDeleteChat(conv.chatId) }
+                        onDelete = { onDeleteChat(conv.chatId) },
+                        onTogglePin = { onToggleChatPin(conv.chatId) }
                     )
                 }
             }
@@ -1285,7 +1292,8 @@ private fun ConversationRowCard(
     isSelected: Boolean,
     groupMemberCount: Int = 0,
     onClick: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onTogglePin: () -> Unit = {}
 ) {
     var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
@@ -1379,6 +1387,15 @@ private fun ConversationRowCard(
                                 modifier = Modifier.size(15.dp)
                             )
                         }
+                        if (conversation.isPinned) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.PushPin,
+                                contentDescription = "Чат закреплён",
+                                tint = CyberTealSecondary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
                         if (conversation.chatType == "GROUP") {
                             Spacer(modifier = Modifier.width(5.dp))
                             Icon(
@@ -1437,6 +1454,27 @@ private fun ConversationRowCard(
                                 modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
                             )
                         }
+                    }
+                    IconButton(
+                        onClick = onTogglePin,
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("toggle_pin_icon_${conversation.chatId}")
+                    ) {
+                        Icon(
+                            Icons.Default.PushPin,
+                            contentDescription = if (conversation.isPinned) {
+                                "Открепить чат"
+                            } else {
+                                "Закрепить чат"
+                            },
+                            tint = if (conversation.isPinned) {
+                                EmeraldPrimary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f)
+                            },
+                            modifier = Modifier.size(16.dp)
+                        )
                     }
                     IconButton(
                         onClick = { showDeleteConfirm = true },

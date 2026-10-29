@@ -2350,6 +2350,10 @@ class YggRepository(
         dao.deleteConversation(chatId)
     }
 
+    suspend fun setConversationPinned(chatId: String, pinned: Boolean) {
+        dao.setConversationPinned(chatId, pinned)
+    }
+
     suspend fun createNewConversation(
         title: String,
         yggIpv6Input: String,

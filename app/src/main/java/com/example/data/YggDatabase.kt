@@ -7,6 +7,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
+import androidx.room.withTransaction
 import androidx.sqlite.db.SupportSQLiteDatabase
 import net.zetetic.database.sqlcipher.SQLiteDatabase
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
@@ -27,11 +28,36 @@ import java.io.FileInputStream
         GroupMemberEntity::class,
         MessageDeletionEntity::class
     ],
-    version = 15,
+    version = 16,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
     abstract fun yggDao(): YggDao
+
+    suspend fun createExportSnapshot(snapshotDirectory: File): File {
+        val snapshot = File.createTempFile("ygggram_export_", ".db", snapshotDirectory)
+        try {
+            withTransaction {
+                val db = openHelper.writableDatabase
+                // A rollback-journal transaction excludes writers; a WAL copy would omit committed pages.
+                val journalMode = db.query("PRAGMA journal_mode").use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else ""
+                }
+                check(journalMode.lowercase() in setOf("delete", "truncate", "persist")) {
+                    "Экспорт не выполнен: нужен дисковый rollback-журнал (DELETE, TRUNCATE или PERSIST), получен $journalMode"
+                }
+                val source = File(requireNotNull(db.path) { "База не хранится в файле" })
+                check(source.isFile && source.length() > 0L) {
+                    "Файл шифрованной базы пуст или отсутствует"
+                }
+                source.copyTo(snapshot, overwrite = true)
+            }
+            return snapshot
+        } catch (error: Throwable) {
+            snapshot.delete()
+            throw error
+        }
+    }
 
     companion object {
         const val DATABASE_NAME = "ygggram_encrypted_store.db"
@@ -199,6 +225,12 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE conversations ADD COLUMN isPinned INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -225,7 +257,7 @@ abstract class YggDatabase : RoomDatabase() {
                 .addMigrations(
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
                     MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                    MIGRATION_14_15
+                    MIGRATION_14_15, MIGRATION_15_16
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)

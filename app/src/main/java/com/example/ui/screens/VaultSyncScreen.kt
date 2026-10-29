@@ -29,9 +29,7 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Visibility
@@ -86,6 +84,8 @@ fun VaultSyncScreen(
     onRestoreFromArchive: (BackupSnapshotEntity) -> Unit
 ) {
     var showPairDeviceDialog by rememberSaveable { mutableStateOf(false) }
+    var showRegenerateIdentityDialog by remember(uiState.currentProfileId) { mutableStateOf(false) }
+    var showTechnicalKeyDetails by rememberSaveable { mutableStateOf(false) }
     // The snapshot being checked is remembered only while the picker is open: creating an
     // archive needs a write target, checking one needs to open the existing file, so the
     // two jobs cannot share a contract.
@@ -133,7 +133,7 @@ fun VaultSyncScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text(
-                                    text = "Встроенный Менеджер Ключей (BIP-39)",
+                                    text = "Ключи и экспорт",
                                     style = MaterialTheme.typography.titleMedium,
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis
@@ -170,7 +170,7 @@ fun VaultSyncScreen(
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(
-                                text = "Единая мнемоническая фраза BIP-39 (12 слов -> Ed25519 + X25519 + Backup):",
+                                text = "Фраза восстановления ключей",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -184,6 +184,13 @@ fun VaultSyncScreen(
                                 style = MaterialTheme.typography.titleSmall,
                                 color = if (uiState.isSeedPhraseRevealed) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Восстановление по фразе пока не реализовано. " +
+                                    "Она не заменяет ключ базы в Keystore.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
 
@@ -194,28 +201,43 @@ fun VaultSyncScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         OutlinedButton(
-                            onClick = onRegenerateIdentity,
+                            onClick = { showRegenerateIdentityDialog = true },
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("regenerate_seed_button")
                         ) {
-                            Text("Сгенерировать новый сид")
+                            Text("Создать новую фразу")
                         }
                     }
                 }
             }
         }
 
-        // Derived keys
         item {
-            Text(
-                text = "Дерево криптографических ключей (${cryptoKeys.size})",
-                style = MaterialTheme.typography.titleMedium
-            )
+            TextButton(
+                onClick = { showTechnicalKeyDetails = !showTechnicalKeyDetails },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("toggle_technical_key_details_button")
+            ) {
+                Column {
+                    Text("Технические сведения о ключах")
+                    Text(if (showTechnicalKeyDetails) "Свернуть" else "Развернуть")
+                }
+            }
         }
 
-        items(cryptoKeys, key = { it.keyId }) { keyRecord ->
-            CryptoKeyCard(keyRecord = keyRecord)
+        if (showTechnicalKeyDetails) {
+            item {
+                Text(
+                    text = "Дерево криптографических ключей (${cryptoKeys.size})",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            items(cryptoKeys, key = { it.keyId }) { keyRecord ->
+                CryptoKeyCard(keyRecord = keyRecord)
+            }
         }
 
         // 2. Cross-Platform Device Synchronization
@@ -238,11 +260,11 @@ fun VaultSyncScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text(
-                                    text = "Кроссплатформенная синхронизация",
+                                    text = "Список и обнаружение устройств",
                                     style = MaterialTheme.typography.titleMedium
                                 )
                                 Text(
-                                    text = "Windows • Android • Linux (Прямой P2P по LAN и Yggdrasil)",
+                                    text = "LAN-маяк обнаружения. История сообщений между устройствами не передаётся.",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = CyberTealSecondary
                                 )
@@ -252,29 +274,31 @@ fun VaultSyncScreen(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    Row(
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Button(
                             onClick = onSyncDevicesNow,
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                             modifier = Modifier
-                                .weight(1f)
+                                .fillMaxWidth()
                                 .testTag("sync_devices_now_button")
                         ) {
                             Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Синхронизировать", maxLines = 1)
+                            Text("Отправить маяк")
                         }
                         OutlinedButton(
                             onClick = { showPairDeviceDialog = true },
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                            modifier = Modifier.testTag("open_pair_device_dialog_button")
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("open_pair_device_dialog_button")
                         ) {
                             Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Связать")
+                            Text("Добавить устройство")
                         }
                     }
 
@@ -365,6 +389,42 @@ fun VaultSyncScreen(
                 }
             }
         }
+    }
+
+    if (showRegenerateIdentityDialog) {
+        AlertDialog(
+            onDismissRequest = { showRegenerateIdentityDialog = false },
+            modifier = Modifier.testTag("regenerate_identity_dialog"),
+            title = { Text("Создать новую фразу?") },
+            text = {
+                Text(
+                    "Текущая фраза и ключи профиля будут заменены, IPv6-адрес Yggdrasil изменится, " +
+                        "а эпоха ключей сбросится до 1. Сообщите контактам новый адрес и ключи: " +
+                        "по прежнему адресу этот профиль больше не будет доступен. " +
+                        "Чаты и сообщения не удаляются, ключ базы в Keystore не меняется. " +
+                        "Восстановление прежней фразы в приложении не реализовано."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showRegenerateIdentityDialog = false
+                        onRegenerateIdentity()
+                    },
+                    modifier = Modifier.testTag("confirm_regenerate_identity_button")
+                ) {
+                    Text("Заменить фразу и ключи")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showRegenerateIdentityDialog = false },
+                    modifier = Modifier.testTag("cancel_regenerate_identity_button")
+                ) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 
     if (showPairDeviceDialog) {
@@ -536,22 +596,26 @@ private fun BackupSnapshotCard(
                 color = if (snapshot.isVerified) EmeraldPrimary else MaterialTheme.colorScheme.error
             )
             Spacer(modifier = Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = onVerify,
-                    modifier = Modifier.testTag("verify_backup_${snapshot.snapshotId}")
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("verify_backup_${snapshot.snapshotId}")
                 ) {
                     Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(15.dp))
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Проверить архив")
                 }
-                Button(
+                TextButton(
                     onClick = onRestore,
-                    modifier = Modifier.testTag("restore_backup_${snapshot.snapshotId}")
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("restore_backup_${snapshot.snapshotId}")
                 ) {
-                    Icon(Icons.Default.Restore, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(15.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Восстановить")
+                    Text("Почему нельзя восстановить")
                 }
             }
         }
@@ -563,19 +627,20 @@ private fun PairCrossPlatformDeviceModal(
     onDismiss: () -> Unit,
     onPair: (String, String, String, String) -> Unit
 ) {
-    var name by rememberSaveable { mutableStateOf("Ноутбук Linux / Windows (YGramm Desktop)") }
-    var ipv6 by rememberSaveable { mutableStateOf("0201:6f22:a810:49c1:77e0:12b4:9081:33d2") }
-    var lan by rememberSaveable { mutableStateOf("192.168.1.25:51920 (Прямой LAN P2P)") }
+    var name by rememberSaveable { mutableStateOf("") }
+    var ipv6 by rememberSaveable { mutableStateOf("") }
+    var lan by rememberSaveable { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Связать новое устройство для P2P-синхронизации", style = MaterialTheme.typography.titleLarge) },
+        title = { Text("Добавить устройство", style = MaterialTheme.typography.titleLarge) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "Устройство добавляется в ваш список и получает LAN-маяк обнаружения. " +
-                        "Передача истории сообщений между устройствами по оверлею ещё не реализована: " +
-                        "сообщения, отправленные на этом узле, останутся только в его базе.",
+                    "Устройство добавляется только в локальный список. " +
+                        "Кнопка «Отправить маяк» отправляет LAN-маяк обнаружения. " +
+                        "Передача истории сообщений между устройствами не реализована: " +
+                        "сообщения этого узла остаются только в его базе.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -598,7 +663,7 @@ private fun PairCrossPlatformDeviceModal(
                 OutlinedTextField(
                     value = lan,
                     onValueChange = { lan = it },
-                    label = { Text("LAN адрес (опционально для локального ускорения)") },
+                    label = { Text("LAN-адрес (необязательно)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -613,7 +678,7 @@ private fun PairCrossPlatformDeviceModal(
                 },
                 modifier = Modifier.testTag("confirm_pair_device_button")
             ) {
-                Text("Связать и синхронизировать")
+                Text("Добавить устройство")
             }
         },
         dismissButton = {

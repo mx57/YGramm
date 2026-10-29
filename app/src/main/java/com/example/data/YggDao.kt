@@ -71,7 +71,7 @@ interface YggDao {
         wipeProfilesTable()
     }
 
-    @Query("SELECT * FROM conversations ORDER BY lastTimestamp DESC")
+    @Query("SELECT * FROM conversations ORDER BY isPinned DESC, lastTimestamp DESC")
     fun observeConversations(): Flow<List<ConversationEntity>>
 
     @Query("SELECT * FROM conversations WHERE chatId = :chatId LIMIT 1")
@@ -116,6 +116,11 @@ interface YggDao {
     // wipe fields another writer owns.
     @Query("UPDATE conversations SET peerLastSeenAt = :timestamp WHERE chatId = :chatId")
     suspend fun updatePeerLastSeen(chatId: String, timestamp: Long)
+
+    // Same partial-UPDATE rule as the two above: the pin is the user's local ordering choice and
+    // must survive incoming frames that re-save the conversation row.
+    @Query("UPDATE conversations SET isPinned = :pinned WHERE chatId = :chatId")
+    suspend fun setConversationPinned(chatId: String, pinned: Boolean)
 
     @Query(
         "UPDATE ygg_profiles SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex, " +
