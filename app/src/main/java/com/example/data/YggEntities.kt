@@ -84,7 +84,10 @@ data class ConversationEntity(
     // Same rule for the voice codec: an Opus note is only sent to a peer that showed it can make
     // or open one. A receiver that cannot decode the container gets silence from a file it cannot
     // read, which is worse than a note five times the size.
-    val peerVoiceOpusProven: Boolean = false
+    val peerVoiceOpusProven: Boolean = false,
+    // The user's own ordering choice for the chat list. Purely local: never leaves this device
+    // and says nothing about the peer.
+    val isPinned: Boolean = false
 )
 
 @Entity(

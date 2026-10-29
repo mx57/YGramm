@@ -66,6 +66,7 @@ import com.example.update.ApkRelayRequest
 import com.example.update.YGrammUpdateController
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -1970,6 +1971,22 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 it.copy(
                     statusBannerMessage = "Чат «${targetConv?.title ?: "Диалог"}» удалён: ${cleared.messagesRemoved} сообщ. " +
                         "и ${cleared.freedBytes / 1024} КБ файлов стёрто с устройства"
+                )
+            }
+        }
+    }
+
+    fun toggleChatPin(chatId: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId } ?: return@launch
+            repository.setConversationPinned(chatId, !targetConv.isPinned)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (targetConv.isPinned) {
+                        "Чат «${targetConv.title}» откреплён"
+                    } else {
+                        "Чат «${targetConv.title}» закреплён сверху"
+                    }
                 )
             }
         }
@@ -5210,39 +5227,29 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /**
-     * Copies the live SQLCipher file to a user-picked document and records what the written bytes
-     * actually hash to. An archive is only marked verified when the read-back copy matches the
-     * database file piece for piece.
-     */
     fun exportEncryptedDatabase(uri: Uri) {
         viewModelScope.launch {
             val app = getApplication<Application>()
-            val dbFile = app.getDatabasePath(YggDatabase.DATABASE_NAME)
-            if (!dbFile.exists() || dbFile.length() == 0L) {
-                setBanner("Экспорт не выполнен: файл шифрованной базы «${YggDatabase.DATABASE_NAME}» пуст или отсутствует")
-                return@launch
-            }
-            val pendingJournal = java.io.File("${dbFile.absolutePath}-journal")
-            if (pendingJournal.exists() && pendingJournal.length() > 0L) {
-                setBanner("Экспорт не выполнен: в базе идёт незавершённая транзакция — подождите и повторите")
-                return@launch
-            }
             val archiveName = readArchiveDisplayName(uri) ?: uri.lastPathSegment ?: YggDatabase.DATABASE_NAME
             val outcome = runCatching {
                 withContext(Dispatchers.IO) {
                     val cipherSpec = readSqlCipherSpec()
-                    YggEncryptedExport.copyAndProfile(
-                        sourceFile = dbFile,
-                        archiveFileName = archiveName,
-                        openSink = {
-                            app.contentResolver.openOutputStream(uri, "w")
-                                ?: error("Выбранный файл не открылся для записи")
-                        },
-                        readBackArchive = { app.contentResolver.openInputStream(uri) },
-                        cipherSpec = cipherSpec,
-                        keySpec = KEY_CUSTODY_SPEC
-                    )
+                    val stableSnapshot = database.createExportSnapshot(app.cacheDir)
+                    try {
+                        YggEncryptedExport.copyAndProfile(
+                            sourceFile = stableSnapshot,
+                            archiveFileName = archiveName,
+                            openSink = {
+                                app.contentResolver.openOutputStream(uri, "w")
+                                    ?: error("Выбранный файл не открылся для записи")
+                            },
+                            readBackArchive = { app.contentResolver.openInputStream(uri) },
+                            cipherSpec = cipherSpec,
+                            keySpec = KEY_CUSTODY_SPEC
+                        )
+                    } finally {
+                        stableSnapshot.delete()
+                    }
                 }
             }
             outcome.fold(
@@ -5251,16 +5258,17 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                     setBanner(
                         if (profile.verified) {
                             "Экспорт готов: ${archiveName}, ${profile.sizeBytes} байт, " +
-                                "${profile.pieceCount} кусков SHA-256, root совпал с базой"
+                                "${profile.pieceCount} кусков SHA-256, root совпал со снимком базы"
                         } else {
                             "Архив ${archiveName} записан, но проверка не пройдена: " +
-                                "root файла ${profile.merkleRootHex.take(16)}… ≠ root базы " +
+                                "root файла ${profile.merkleRootHex.take(16)}… ≠ root снимка " +
                                 "${profile.sourceRootHex.take(16)}… (${profile.sizeBytes} из ${profile.sourceSizeBytes} байт)"
                         }
                     )
                     Log.i(TAG_EXPORT, "Export ${snapshot.snapshotId} verified=${profile.verified} bytes=${profile.sizeBytes}")
                 },
                 onFailure = { error ->
+                    if (error is CancellationException) throw error
                     setBanner("Экспорт не выполнен: ${error.javaClass.simpleName} — ${error.message}")
                 }
             )
