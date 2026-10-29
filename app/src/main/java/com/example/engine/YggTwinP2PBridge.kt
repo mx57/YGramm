@@ -3865,10 +3865,32 @@ class YggTwinP2PBridge(
         }
 
         val isTls = endpointUri.startsWith("tls://", ignoreCase = true) ||
-            endpointUri.startsWith("wss://", ignoreCase = true) ||
-            endpointUri.startsWith("quic://", ignoreCase = true) ||
-            endpointUri.startsWith("shadowtls://", ignoreCase = true) ||
-            endpointUri.startsWith("vless+tls://", ignoreCase = true)
+            endpointUri.startsWith("wss://", ignoreCase = true)
+        // A QUIC peer is dialled over UDP by the core. This probe speaks TCP, and nothing in
+        // the build measures UDP yet, so answering "unreachable" here would be a false
+        // negative about a path that was never tried. Say which instrument is missing.
+        val overUdp = endpointUri.startsWith("quic://", ignoreCase = true)
+        if (overUdp) {
+            return@withContext PeerProbeResult(
+                endpointUri = endpointUri,
+                reachable = false,
+                rttMs = -1,
+                protocolUsed = "QUIC/UDP",
+                errorDetail = "quic:// идёт по UDP: TCP-рукопожатие этот путь не проверяет. " +
+                    "Пир можно добавить, жив он или нет скажет только ядро по рукопожатию оверлея."
+            )
+        }
+        val schemeKnown = isTls || endpointUri.startsWith("tcp://", ignoreCase = true)
+        if (!schemeKnown) {
+            return@withContext PeerProbeResult(
+                endpointUri = endpointUri,
+                reachable = false,
+                rttMs = -1,
+                protocolUsed = "INVALID",
+                errorDetail = "yggdrasil v0.5.14 не набирает эту схему; ядро знает tcp, tls, " +
+                    "wss, quic, unix и socks"
+            )
+        }
 
         val startNs = System.nanoTime()
         var txCount = 0L

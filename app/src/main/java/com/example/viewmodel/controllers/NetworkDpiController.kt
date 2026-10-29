@@ -347,7 +347,6 @@ class NetworkDpiController(
                     endpointUri = candidate.endpointUri,
                     transportType = candidate.transportType,
                     sniDomain = candidate.sniDomain,
-                    utlsFingerprint = candidate.utlsFingerprint,
                     regionLabel = "${candidate.countryFlag} ${candidate.countryCode} • ${candidate.cityRu} [Автопилот]",
                     latencyMs = probe.rttMs,
                     isConnected = true,
@@ -595,14 +594,6 @@ class NetworkDpiController(
         return if (parts.isEmpty()) "" else " • " + parts.joinToString(" • ")
     }
 
-    fun selectUtlsFingerprint(fingerprint: String) {
-        _antiDpiConfig.update { state ->
-            state.copy(
-                utlsProfile = fingerprint,
-                lastProbeReport = "Профиль uTLS сохранён: $fingerprint (ядро его не применяет)"
-            )
-        }
-    }
 
     fun toggleAntiDpiFlag(flagName: String) {
         _antiDpiConfig.update { state ->
@@ -785,7 +776,6 @@ class NetworkDpiController(
                 endpointUri = scanned.endpointUri,
                 transportType = scanned.transportType,
                 sniDomain = scanned.sniDomain,
-                utlsFingerprint = scanned.utlsFingerprint,
                 regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
                 latencyMs = if (probe.reachable) probe.rttMs else -1,
                 isConnected = probe.reachable,
@@ -850,7 +840,6 @@ class NetworkDpiController(
                     endpointUri = scanned.endpointUri,
                     transportType = scanned.transportType,
                     sniDomain = scanned.sniDomain,
-                    utlsFingerprint = scanned.utlsFingerprint,
                     regionLabel = "${scanned.countryFlag} ${scanned.countryCode} • ${scanned.cityRu}",
                     latencyMs = scanned.latencyMs,
                     isConnected = true,

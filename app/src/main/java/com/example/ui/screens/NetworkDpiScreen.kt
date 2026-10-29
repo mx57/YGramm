@@ -43,7 +43,6 @@ import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VerifiedUser
@@ -87,6 +86,7 @@ import com.example.R
 import com.example.data.YggPeerEntity
 import com.example.engine.DiscoveredYggPeer
 import com.example.engine.YggNativeCoreBridge
+import com.example.engine.YggPeerSchemeFacts
 import com.example.engine.YggPeerScannerCatalog
 import com.example.ui.components.YggSwitch
 import com.example.ui.theme.AmberShieldTertiary
@@ -117,10 +117,9 @@ fun NetworkDpiScreen(
     peers: List<YggPeerEntity>,
     onSelectPreset: (CensorshipPreset) -> Unit,
     onSelectWhitelistSni: (String) -> Unit,
-    onSelectUtlsProfile: (String) -> Unit,
     onToggleAntiDpiFlag: (String) -> Unit,
     onRunProbe: () -> Unit,
-    onAddPeer: (String, String, String, String, String, Boolean) -> Unit,
+    onAddPeer: (String, String, String, String, Boolean) -> Unit,
     onTogglePeer: (YggPeerEntity) -> Unit,
     onRemovePeer: (String) -> Unit,
     onSelectScanCountry: (String) -> Unit,
@@ -436,6 +435,23 @@ fun NetworkDpiScreen(
                                         EmeraldPrimary
                                     }
                                 )
+                                // What the node itself reports as bound. tls, wss and quic all
+                                // want 443, so a scheme that lost the port is shown refused
+                                // rather than silently missing from the list.
+                                coreMesh.listeners.forEach { listener ->
+                                    Text(
+                                        text = listener.describeRu(),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (listener.bound) {
+                                            EmeraldPrimary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("core_listener_${listener.scheme}")
+                                    )
+                                }
                                 Text(
                                     text = cfg.lastProbeReport,
                                     style = MaterialTheme.typography.labelSmall,
@@ -854,7 +870,7 @@ fun NetworkDpiScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Только порт 443 / WSS (Обход белых списков)",
+                                    text = "Только порт 443 (Обход белых списков)",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.weight(1f)
@@ -1086,50 +1102,6 @@ fun NetworkDpiScreen(
                                 }
                             }
 
-                            HorizontalDivider(
-                                modifier = Modifier.padding(vertical = 10.dp),
-                                color = MaterialTheme.colorScheme.outlineVariant
-                            )
-
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.Security, contentDescription = null, tint = CyberTealSecondary)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Профиль отпечатка TLS ClientHello (uTLS)",
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Ядро uTLS не использует: ClientHello собирает TLS-стек Android, поэтому выбор " +
-                                    "профиля сохраняется в базе пиров, но на трафик не влияет.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Row(
-                                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                val utlsProfiles = listOf(
-                                    "HelloChrome_128_Auto",
-                                    "HelloIOS_18_Auto",
-                                    "HelloFirefox_132_Auto",
-                                    "QUIC_v1_Padded_Jitter"
-                                )
-                                utlsProfiles.forEach { profile ->
-                                    FilterChip(
-                                        selected = cfg.utlsProfile == profile,
-                                        onClick = { onSelectUtlsProfile(profile) },
-                                        label = { Text(profile, style = MaterialTheme.typography.labelMedium) },
-                                        colors = FilterChipDefaults.filterChipColors(
-                                            selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                            selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
-                                        ),
-                                        modifier = Modifier.testTag("utls_chip_$profile")
-                                    )
-                                }
-                            }
                         }
                     }
                 }
@@ -1163,7 +1135,8 @@ fun NetworkDpiScreen(
                                     "фильтр уже сбросил. К нему узел возвращается, если локальный " +
                                     "эндпоинт маски не поднялся.\n" +
                                     "Не реализовано и переключателей нет: uTLS-подмена фингерпринта, VLESS Reality, " +
-                                    "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH.\n" +
+                                    "ShadowTLS v3, выравнивание QUIC-датаграмм, bootstrap через DHT BEP-44 и DoH. " +
+                                    "`quic://` имени сервера в hello не отправляет, поэтому маской не является.\n" +
                                     "Маска не меняет адрес назначения: если провайдер сверяет SNI с IP из белого " +
                                     "списка, подмена имени не поможет — нужен свой ретранслятор на разрешённом " +
                                     "домене, и приложение честно покажет, какие пиры под маску не попали.",
@@ -1172,10 +1145,11 @@ fun NetworkDpiScreen(
                             )
 
                             DpiSwitchRow(
-                                title = "Туннель WebSocket поверх CDN (wss:// Белый список)",
-                                subtitle = "Фреймы Yggdrasil идут поверх WebSocket (HTTP/1.1 Upgrade) на порту 443 " +
-                                    "к пирам wss://. Адрес берётся из списка пиров: приложение не подбирает " +
-                                    "«разрешённые диапазоны CDN» само",
+                                title = "Профиль белых списков (только порт 443)",
+                                subtitle = "Ядро набирает лишь эндпоинты с явно написанным портом 443 — любой " +
+                                    "схемы (`tls://`, `wss://`, `quic://`). Открытого `tcp://`-пира профиль " +
+                                    "пробует как TLS на 443 поверх маски и снимает его исходный диал. Имя " +
+                                    "эндпоинта приложение само не подбирает — адрес берётся из списка пиров",
                                 checked = cfg.whitelistCdnWssEnabled,
                                 tag = "switch_whitelist_wss",
                                 onToggle = { onToggleAntiDpiFlag("WHITELIST_WSS") }
@@ -1200,10 +1174,9 @@ fun NetworkDpiScreen(
     if (showAddPeerDialog) {
         AddYggPeerModal(
             defaultSni = cfg.whitelistSniDomain,
-            defaultUtls = cfg.utlsProfile,
             onDismiss = { showAddPeerDialog = false },
-            onAdd = { uri, transport, sni, utls, region, whitelist ->
-                onAddPeer(uri, transport, sni, utls, region, whitelist)
+            onAdd = { uri, transport, sni, region, whitelist ->
+                onAddPeer(uri, transport, sni, region, whitelist)
                 showAddPeerDialog = false
             }
         )
@@ -1293,7 +1266,7 @@ private fun ScannedPeerCard(
                     text = buildString {
                         append(peer.transportType)
                         append(" • ")
-                        append(if (peer.whitelistCompatible) "Порт 443/WSS" else "Прямой порт")
+                        append(YggPeerSchemeFacts.portLabelRu(peer.endpointUri, peer.whitelistCompatible))
                         append(" • ")
                         // How long ago the public directory saw this node answer — a sighting
                         // reported by somebody else, never presented as a reachability claim.
@@ -1531,17 +1504,14 @@ private fun PeerNodeCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (YggNativeCoreBridge.corePeerUri(peer.endpointUri, peer.sniDomain) != peer.endpointUri)
-                            "SNI в ClientHello: ${peer.sniDomain} • ${peer.utlsFingerprint}"
-                        else
-                            "SNI НЕ отправляется: ${peer.sniDomain.ifBlank { "не задан" }} • ${peer.utlsFingerprint}",
+                        text = YggPeerSchemeFacts.summaryRu(peer.endpointUri, peer.sniDomain),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "RX: ${peer.rxBytes} B • TX: ${peer.txBytes} B • ${if (peer.isWhitelistCompatible) "Порт 443 / WSS" else "Прямой TLS/TCP"}",
+                        text = "RX: ${peer.rxBytes} B • TX: ${peer.txBytes} B • ${YggPeerSchemeFacts.portLabelRu(peer.endpointUri, peer.isWhitelistCompatible)}",
                         style = MaterialTheme.typography.labelSmall,
                         color = if (peer.isWhitelistCompatible) EmeraldPrimary else AmberShieldTertiary
                     )
@@ -1569,14 +1539,12 @@ private fun PeerNodeCard(
 @Composable
 private fun AddYggPeerModal(
     defaultSni: String,
-    defaultUtls: String,
     onDismiss: () -> Unit,
-    onAdd: (String, String, String, String, String, Boolean) -> Unit
+    onAdd: (String, String, String, String, Boolean) -> Unit
 ) {
     var uri by rememberSaveable { mutableStateOf("tls://ygg.zbin.eu:7743") }
     var sni by rememberSaveable { mutableStateOf(defaultSni) }
     var region by rememberSaveable { mutableStateOf("Пользовательский пир Yggdrasil") }
-    var whitelistCompat by rememberSaveable { mutableStateOf(true) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1592,10 +1560,17 @@ private fun AddYggPeerModal(
                         .fillMaxWidth()
                         .testTag("add_peer_uri_input")
                 )
+                // Что ядро сделает с этим URI: набираемая ли схема, порт из URI, имя в hello.
+                Text(
+                    text = YggPeerSchemeFacts.summaryRu(uri, sni),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("add_peer_scheme_facts")
+                )
                 OutlinedTextField(
                     value = sni,
                     onValueChange = { sni = it },
-                    label = { Text("SNI-домен (для TLS/WSS)") },
+                    label = { Text("SNI-домен (читает только tls://)") },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1610,26 +1585,20 @@ private fun AddYggPeerModal(
                         .fillMaxWidth()
                         .testTag("add_peer_region_input")
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Совместим с Белыми списками (порт 443 / WSS)",
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    YggSwitch(checked = whitelistCompat, onCheckedChange = { whitelistCompat = it })
-                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     if (uri.isNotBlank()) {
-                        onAdd(uri, "TLS_YGGDRASIL", sni, defaultUtls, region, whitelistCompat)
+                        val facts = YggPeerSchemeFacts.of(uri, sni)
+                        onAdd(
+                            uri,
+                            facts.transportLabel(),
+                            sni,
+                            region,
+                            facts.onWhitelistPort
+                        )
                     }
                 },
                 modifier = Modifier.testTag("confirm_add_peer_button")
