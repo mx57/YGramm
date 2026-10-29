@@ -19,9 +19,11 @@ data class DiscoveredYggPeer(
     val countryNameRu: String,
     val cityRu: String,
     val endpointUri: String,
-    val transportType: String, // "TLS_YGGDRASIL", "TCP_YGGDRASIL", "WSS_CDN_WHITELIST", "QUIC_UDP_PADDING"
+    // The scheme the core dials this peer with, from the URI itself. Nothing here claims a
+    // shaped TLS hello: the app has no uTLS, so the old fingerprint labels are gone.
+    val transportType: String, // "TLS_YGGDRASIL", "TCP_YGGDRASIL", "WSS_YGGDRASIL", "QUIC_YGGDRASIL"
     val sniDomain: String,
-    val utlsFingerprint: String,
+    val utlsFingerprint: String = "",
     val latencyMs: Int, // -1 = this device has not measured it
     val whitelistCompatible: Boolean,
     val ed25519PubKeyShort: String,
@@ -102,7 +104,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://78.17.213.236:443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "nl1.route172.de",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/netherlands.md",
@@ -116,7 +117,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://128.140.56.86:443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg.mkg20001.io",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/germany.md",
@@ -128,9 +128,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Россия",
             cityRu = "donotclickthis.link:443 (wss, проверен 23.10.2026)",
             endpointUri = "wss://donotclickthis.link:443/api/v2/socket",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "WSS_YGGDRASIL",
             sniDomain = "donotclickthis.link",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "europe/russia.md",
@@ -144,7 +143,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://92.248.252.139:7992",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ekb.itrus.su",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -158,7 +156,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://5.45.65.149:7992",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "vpn.itrus.su",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/netherlands.md",
@@ -172,7 +169,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://195.3.252.69:15015",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "kursk.cleverfox.org",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -186,7 +182,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://178.253.55.191:12632",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "mskaeza.i113d.ru",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -200,7 +195,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://185.45.62.109:12632",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "server.i113d.ru",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -214,7 +208,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://95.165.105.90:8362",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg-msk-1.averyan.ru",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -228,7 +221,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://176.215.239.87:6221",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg.med-dev-systems.ru",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -242,7 +234,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://193.124.9.204:29331",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "yg-vvo.magicum.net",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -256,7 +247,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://188.243.229.1:13338",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "box.paulll.cc",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -270,7 +260,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://46.147.209.186:36014",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "vix.duckdns.org",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/russia.md",
@@ -284,7 +273,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://62.210.85.80:39575",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "s2.i2pd.xyz",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "europe/france.md",
@@ -308,7 +296,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://51.15.204.214:54321",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "51.15.204.214",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -323,7 +310,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://ygg.zbin.eu:7743",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg.zbin.eu",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -337,7 +323,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://ru.ygg.mimir.im:65534",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ru.ygg.mimir.im",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "mimir-mesh-ru",
@@ -349,9 +334,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Россия",
             cityRu = "Москва (ygg.it4.org:443)",
             endpointUri = "tls://ygg.it4.org:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg.it4.org",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -365,7 +349,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://185.22.172.110:49999",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "185.22.172.110",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -379,7 +362,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://94.198.51.149:55556",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "94.198.51.149",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -391,9 +373,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Россия",
             cityRu = "Екатеринбург (ygg-ekb.ru:443)",
             endpointUri = "tls://176.53.160.19:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "176.53.160.19",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -407,7 +388,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://82.146.43.201:36120",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "82.146.43.201",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -421,9 +401,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Германия",
             cityRu = "Франкфурт (neilalexander.dev:443)",
             endpointUri = "tls://publicpeers.neilalexander.dev:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "publicpeers.neilalexander.dev",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ygg-core-directory",
@@ -435,9 +414,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Германия",
             cityRu = "Фалькенштайн (ygg-uplink.de:443)",
             endpointUri = "tls://ygg-uplink.de:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg-uplink.de",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -451,7 +429,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://88.99.219.42:54321",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "88.99.219.42",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -465,7 +442,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://de.ygg.mimir.im:65534",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "de.ygg.mimir.im",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "mimir-mesh-de",
@@ -477,9 +453,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Германия",
             cityRu = "Берлин (DE Backbone WSS:443)",
             endpointUri = "wss://138.201.92.114:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "WSS_YGGDRASIL",
             sniDomain = "138.201.92.114",
-            utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -491,9 +466,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Германия",
             cityRu = "Фалькенштайн (QUIC v1 :443)",
             endpointUri = "quic://168.119.153.26:443",
-            transportType = "QUIC_UDP_PADDING",
+            transportType = "QUIC_YGGDRASIL",
             sniDomain = "168.119.153.26",
-            utlsFingerprint = "QUIC_v1_Padded_Jitter",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -509,7 +483,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://65.21.57.125:61995",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "65.21.57.125",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -521,9 +494,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Финляндия",
             cityRu = "Хельсинки (Hetzner FI #2 :443)",
             endpointUri = "tls://95.217.35.148:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "95.217.35.148",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -537,7 +509,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://135.181.141.72:52222",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "135.181.141.72",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -553,7 +524,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://45.147.198.155:6010",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "45.147.198.155",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -565,9 +535,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Нидерланды",
             cityRu = "Амстердам (NL Relay :443)",
             endpointUri = "tls://185.107.56.142:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "185.107.56.142",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -581,7 +550,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://194.5.78.29:37420",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "194.5.78.29",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -595,7 +563,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tcp://91.92.109.41:62111",
             transportType = "TCP_YGGDRASIL",
             sniDomain = "91.92.109.41",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -609,9 +576,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Франция",
             cityRu = "Рубе (OVH Backbone :443)",
             endpointUri = "tls://51.210.104.88:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "51.210.104.88",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -625,7 +591,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://163.172.149.60:44443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "163.172.149.60",
-            utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -637,9 +602,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Франция",
             cityRu = "Гравелин (WSS Tunnel :443)",
             endpointUri = "wss://54.37.204.19:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "WSS_YGGDRASIL",
             sniDomain = "54.37.204.19",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -655,7 +619,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://193.93.119.42:14244",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "193.93.119.42",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -667,9 +630,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Польша",
             cityRu = "Варшава (PL Whitelist :443)",
             endpointUri = "tls://51.83.236.115:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "51.83.236.115",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -683,7 +645,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://185.238.72.18:58080",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "185.238.72.18",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -699,7 +660,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://ygg.ace.ctrl-c.liu.se:9999",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "ygg.ace.ctrl-c.liu.se",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ctrl-c-liu-se",
@@ -711,9 +671,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Швеция",
             cityRu = "Стокгольм (Bahnhof SE :443)",
             endpointUri = "tls://185.65.134.90:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "185.65.134.90",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -727,9 +686,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Швейцария",
             cityRu = "Цюрих (SwissIX :443)",
             endpointUri = "tls://179.43.148.92:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "179.43.148.92",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -743,7 +701,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://83.166.152.34:51443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "83.166.152.34",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -757,9 +714,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Великобритания",
             cityRu = "Лондон (LINX :443)",
             endpointUri = "tls://51.89.172.104:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "51.89.172.104",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -773,7 +729,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://213.171.208.55:60443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "213.171.208.55",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -787,9 +742,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Чехия",
             cityRu = "Прага (NIX.CZ :443)",
             endpointUri = "tls://185.8.165.72:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "185.8.165.72",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -803,9 +757,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Эстония",
             cityRu = "Таллин (Baltic IX :443)",
             endpointUri = "tls://185.31.240.19:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "185.31.240.19",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -819,9 +772,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Казахстан",
             cityRu = "Алматы (KZ IX :443)",
             endpointUri = "tls://185.98.5.140:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "185.98.5.140",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -835,7 +787,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://91.147.92.81:54321",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "91.147.92.81",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -851,7 +802,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://45.76.166.128:65534",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "45.76.166.128",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -863,9 +813,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "США",
             cityRu = "Майами (US South :443)",
             endpointUri = "tls://198.251.89.114:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "198.251.89.114",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -879,7 +828,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://104.238.140.55:50443",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "104.238.140.55",
-            utlsFingerprint = "HelloFirefox_132_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -891,9 +839,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "США",
             cityRu = "Лос-Анджелес (US West :443)",
             endpointUri = "tls://45.32.78.210:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "45.32.78.210",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -907,7 +854,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://137.220.41.88:59999",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "137.220.41.88",
-            utlsFingerprint = "HelloIOS_18_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -921,9 +867,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Канада",
             cityRu = "Монреаль (OVH CA :443)",
             endpointUri = "tls://158.69.198.44:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "158.69.198.44",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -937,7 +882,6 @@ object YggPeerScannerCatalog {
             endpointUri = "tls://149.248.56.92:61234",
             transportType = "TLS_YGGDRASIL",
             sniDomain = "149.248.56.92",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = false,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -951,9 +895,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Сингапур",
             cityRu = "Сингапур (SGIX :443)",
             endpointUri = "tls://139.180.132.75:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "139.180.132.75",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -967,9 +910,8 @@ object YggPeerScannerCatalog {
             countryNameRu = "Япония",
             cityRu = "Токио (JPIX :443)",
             endpointUri = "tls://45.32.24.160:443",
-            transportType = "WSS_CDN_WHITELIST",
+            transportType = "TLS_YGGDRASIL",
             sniDomain = "45.32.24.160",
-            utlsFingerprint = "HelloChrome_128_Auto",
             latencyMs = -1,
             whitelistCompatible = true,
             ed25519PubKeyShort = "ключ не проверялся",
@@ -1079,11 +1021,11 @@ object YggPeerScannerCatalog {
 
                 val host = extractHostFromUri(endpointUri)
                 val port = extractPortFromUri(endpointUri)
+                val whitelistPort = explicitPortFromUri(endpointUri)
                 val transportType = when {
-                    endpointUri.startsWith("wss://") -> "WSS_CDN_WHITELIST"
-                    endpointUri.startsWith("tls://") && port == 443 -> "WSS_CDN_WHITELIST"
+                    endpointUri.startsWith("wss://") -> "WSS_YGGDRASIL"
                     endpointUri.startsWith("tls://") -> "TLS_YGGDRASIL"
-                    endpointUri.startsWith("quic://") -> "QUIC_UDP_PADDING"
+                    endpointUri.startsWith("quic://") -> "QUIC_YGGDRASIL"
                     else -> "TCP_YGGDRASIL"
                 }
                 val nodeKey = meta.optString("key", "").trim().lowercase()
@@ -1098,9 +1040,8 @@ object YggPeerScannerCatalog {
                         endpointUri = endpointUri,
                         transportType = transportType,
                         sniDomain = host,
-                        utlsFingerprint = "HelloChrome_128_Auto",
                         latencyMs = -1,
-                        whitelistCompatible = endpointUri.startsWith("wss://") || port == 443,
+                        whitelistCompatible = whitelistPort == 443,
                         ed25519PubKeyShort =
                             if (nodeKey.length == 64) "key:${nodeKey.take(12)}…" else "ключ неизвестен",
                         lastSeenAtMs = lastSeenMs,
@@ -1148,22 +1089,28 @@ object YggPeerScannerCatalog {
     /**
      * Parses a multi-line or space-separated block of peer URIs (`tls://...`, `tcp://...`, `wss://...`, `quic://...`)
      * pasted by the user from clipboard, GitHub, or configuration files.
+     *
+     * Only the schemes yggdrasil v0.5.14 dials are taken. A `shadowtls://` or `vless://` line
+     * has no listener in the bundled core, so importing it would put a peer in the database
+     * that nothing can ever connect to.
      */
     fun parseCustomPeerUrisFromText(
         rawText: String,
-        defaultSni: String,
-        defaultUtls: String
+        defaultSni: String
     ): List<DiscoveredYggPeer> {
-        val regex = Regex("""(tls|tcp|wss|quic|shadowtls|vless\+tls)://[^\s,"']+""", RegexOption.IGNORE_CASE)
+        val regex = Regex("""(tls|tcp|wss|quic)://[^\s,"']+""", RegexOption.IGNORE_CASE)
         val matches = regex.findAll(rawText).map { it.value.trim() }.distinct().toList()
         return matches.map { uri ->
             val host = extractHostFromUri(uri)
             val port = extractPortFromUri(uri)
-            val isWhitelist = uri.startsWith("wss://", ignoreCase = true) || port == 443
+            // The whitelist verdict uses the port written into the URI: extractPortFromUri falls
+            // back to 443, and a peer with no port in it is a peer the core never dials, so that
+            // fallback must not be reported as a port the provider forwards.
+            val explicitPort = explicitPortFromUri(uri)
+            val isWhitelist = explicitPort == 443
             val transport = when {
-                uri.startsWith("wss://", ignoreCase = true) -> "WSS_CDN_WHITELIST"
-                uri.startsWith("quic://", ignoreCase = true) -> "QUIC_UDP_PADDING"
-                uri.startsWith("tls://", ignoreCase = true) && port == 443 -> "WSS_CDN_WHITELIST"
+                uri.startsWith("wss://", ignoreCase = true) -> "WSS_YGGDRASIL"
+                uri.startsWith("quic://", ignoreCase = true) -> "QUIC_YGGDRASIL"
                 uri.startsWith("tls://", ignoreCase = true) -> "TLS_YGGDRASIL"
                 else -> "TCP_YGGDRASIL"
             }
@@ -1172,11 +1119,10 @@ object YggPeerScannerCatalog {
                 countryCode = "ALL",
                 countryFlag = "🌐",
                 countryNameRu = "Импорт",
-                cityRu = "$host:$port",
+                cityRu = if (explicitPort != null) "$host:$explicitPort" else "$host • порт не указан",
                 endpointUri = uri,
                 transportType = transport,
                 sniDomain = host.ifBlank { defaultSni },
-                utlsFingerprint = defaultUtls,
                 latencyMs = -1,
                 whitelistCompatible = isWhitelist,
                 ed25519PubKeyShort = "custom-imported-peer"
@@ -1193,6 +1139,11 @@ object YggPeerScannerCatalog {
             uri.substringAfter("://").substringBefore(":").substringBefore("/")
         }
     }
+
+    /** Port exactly as written in the URI; null when the URI has none, so nothing is dialled. */
+    fun explicitPortFromUri(uri: String): Int? =
+        uri.substringAfter("://", "").substringBefore("/").substringBefore("?")
+            .substringAfterLast(':', "").toIntOrNull()
 
     fun extractPortFromUri(uri: String): Int {
         return try {

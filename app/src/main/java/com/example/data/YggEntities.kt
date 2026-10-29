@@ -159,9 +159,13 @@ data class P2PFileTransferEntity(
 data class YggPeerEntity(
     @PrimaryKey val peerId: String,
     val endpointUri: String,
-    val transportType: String, // "WSS_CDN_WHITELIST", "VLESS_REALITY_UTLS", "SHADOWTLS_V3", "QUIC_UDP_PADDING"
+    // The scheme the core dials, taken from the URI: TLS_YGGDRASIL, TCP_YGGDRASIL,
+    // WSS_YGGDRASIL, QUIC_YGGDRASIL. The old CDN/uTLS labels described a hello nothing
+    // in this build assembles.
+    val transportType: String,
     val sniDomain: String,
-    val utlsFingerprint: String,
+    // Kept as a column so an existing database still opens; nothing writes a fingerprint.
+    val utlsFingerprint: String = "",
     val regionLabel: String,
     val latencyMs: Int,
     val rxBytes: Long,

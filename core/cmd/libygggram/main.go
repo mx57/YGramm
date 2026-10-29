@@ -57,6 +57,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -74,15 +75,33 @@ type OverlayRxPacket struct {
 	SenderPubKeyHex string
 }
 
+// listenerState is one bind attempt of this node, kept so the app can say which
+// schemes this device actually listens on rather than which ones were requested.
+type listenerState struct {
+	URI        string
+	Addr       string
+	Error      string
+	RecordedAt time.Time
+}
+
 type EngineInstance struct {
-	mu        sync.RWMutex
-	yggCore   *core.Core
-	keys      *yggcrypto.KeyHierarchy
-	dataDir   string
-	started   time.Time
-	overlayRx chan OverlayRxPacket
-	done      chan struct{}
-	listeners []*core.Listener
+	mu             sync.RWMutex
+	yggCore        *core.Core
+	keys           *yggcrypto.KeyHierarchy
+	dataDir        string
+	started        time.Time
+	overlayRx      chan OverlayRxPacket
+	done           chan struct{}
+	listeners      []*core.Listener
+	listenerStates []listenerState
+}
+
+func (e *EngineInstance) recordListener(uri, addr, errText string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.listenerStates = append(e.listenerStates, listenerState{
+		URI: uri, Addr: addr, Error: errText, RecordedAt: time.Now(),
+	})
 }
 
 var (
@@ -271,22 +290,34 @@ func YggGramInitCoreImpl(profileID, mnemonic, androidFilesDir string) string {
 
 	// A node that only dials is a leaf: nobody can peer with it, so it can neither be
 	// reached nor carry anyone else's traffic. 5985 is the port the public yggdrasil
-	// nodes expect, and the TLS listener tries 443 because that is the port an
-	// allow-list lets through. Every bind is best effort - an unprivileged Android
-	// process is refused on low ports and a second profile finds the port taken - so
-	// the outcome goes into the journal instead of failing the init.
-	for _, uri := range []string{"tcp://0.0.0.0:5985", "tls://0.0.0.0:443"} {
+	// nodes expect, and everything on 443 exists because that is the port an allow-list
+	// lets through. Nothing here may be assumed to succeed: an unprivileged Android
+	// process is refused on a low port, a second profile finds it taken, and the core has
+	// no WSS listener at all - link_wss.go answers "WSS listener not supported, use WS
+	// listener behind reverse proxy instead", so that attempt is kept in the list precisely
+	// because the journal then says what the core told us instead of hiding the scheme.
+	// QUIC sits on UDP/443 and is independent of the TCP ones. Every bind is best effort,
+	// and the outcome is recorded per scheme instead of failing the init.
+	for _, uri := range []string{
+		"tcp://0.0.0.0:5985",
+		"tls://0.0.0.0:443",
+		"wss://0.0.0.0:443",
+		"quic://0.0.0.0:443",
+	} {
 		u, err := url.Parse(uri)
 		if err != nil {
 			appendLinkLog("ERR bad listen uri %s: %v", uri, err)
+			engine.recordListener(uri, "", "listen URI не разобран: "+err.Error())
 			continue
 		}
 		l, err := node.Listen(u, "")
 		if err != nil {
 			appendLinkLog("ERR listener %s refused: %v", uri, err)
+			engine.recordListener(uri, "", err.Error())
 			continue
 		}
 		engine.listeners = append(engine.listeners, l)
+		engine.recordListener(uri, l.Addr().String(), "")
 		appendLinkLog("INFO listener %s bound to %s", uri, l.Addr().String())
 	}
 
@@ -494,6 +525,50 @@ func YggGramRetryPeersImpl(profileID string) string {
 		"profileId": profileID,
 		"upCount":   upCount,
 		"total":     len(peers),
+	})
+}
+
+// YggGramGetListenersImpl reports which listen endpoints this node actually got.
+//
+// The app cannot infer this from its own intent: TCP/443 is taken by whichever of tls/wss
+// bound first, a low port is refused without root, and a second profile on the same phone
+// loses the port to the first. Showing the requested scheme as though it were bound would
+// be a claim about the network that nothing measured.
+func YggGramGetListenersImpl(profileID string) string {
+	engine := lookupEngine(profileID)
+	if engine == nil {
+		return `{"ok":false,"error":"yggdrasil core is not initialized","listeners":[]}`
+	}
+	engine.mu.RLock()
+	states := append([]listenerState(nil), engine.listenerStates...)
+	engine.mu.RUnlock()
+	out := make([]map[string]any, 0, len(states))
+	for _, s := range states {
+		scheme := s.URI
+		if idx := strings.Index(s.URI, "://"); idx > 0 {
+			scheme = strings.ToLower(s.URI[:idx])
+		}
+		out = append(out, map[string]any{
+			"scheme":     scheme,
+			"uri":        s.URI,
+			"bound":      s.Error == "",
+			"addr":       s.Addr,
+			"error":      s.Error,
+			"recordedAt": s.RecordedAt.UnixMilli(),
+		})
+	}
+	return engineJSON(true, map[string]any{
+		"profileId": profileID,
+		"listeners": out,
+		"upCount": func() int {
+			n := 0
+			for _, s := range states {
+				if s.Error == "" {
+					n++
+				}
+			}
+			return n
+		}(),
 	})
 }
 
@@ -841,6 +916,14 @@ func Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers(env *C.JNIEnv,
 func Java_com_example_engine_YggNativeCoreBridge_nativeProbeOverlay(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring, timeoutMsC C.jint) C.jstring {
 	profileId := C.jni_to_cstring(env, profileIdC)
 	result := guardedCall(func() string { return YggGramOverlayProbeImpl(valueOrEmpty(profileId), int(timeoutMsC)) })
+	C.free(unsafe.Pointer(profileId))
+	return C.jni_from_cstring(env, C.CString(result))
+}
+
+//export Java_com_example_engine_YggNativeCoreBridge_nativeGetListeners
+func Java_com_example_engine_YggNativeCoreBridge_nativeGetListeners(env *C.JNIEnv, thiz C.jobject, profileIdC C.jstring) C.jstring {
+	profileId := C.jni_to_cstring(env, profileIdC)
+	result := guardedCall(func() string { return YggGramGetListenersImpl(valueOrEmpty(profileId)) })
 	C.free(unsafe.Pointer(profileId))
 	return C.jni_from_cstring(env, C.CString(result))
 }

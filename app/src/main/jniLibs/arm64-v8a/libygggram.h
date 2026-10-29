@@ -124,6 +124,7 @@ extern jstring Java_com_example_engine_YggNativeCoreBridge_nativePollOverlay(JNI
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeGetLinkLog(JNIEnv* env, jobject thiz);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeRetryPeers(JNIEnv* env, jobject thiz, jstring profileIdC);
 extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeProbeOverlay(JNIEnv* env, jobject thiz, jstring profileIdC, jint timeoutMsC);
+extern jstring Java_com_example_engine_YggNativeCoreBridge_nativeGetListeners(JNIEnv* env, jobject thiz, jstring profileIdC);
 
 #ifdef __cplusplus
 }

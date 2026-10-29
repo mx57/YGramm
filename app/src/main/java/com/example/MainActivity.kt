@@ -732,7 +732,6 @@ fun YggGramRootApp(
                                 peers = peers,
                                 onSelectPreset = viewModel::applyCensorshipPreset,
                                 onSelectWhitelistSni = viewModel::selectWhitelistSniDomain,
-                                onSelectUtlsProfile = viewModel::selectUtlsFingerprint,
                                 onToggleAntiDpiFlag = viewModel::toggleAntiDpiFlag,
                                 onRunProbe = viewModel::runAntiDpiDiagnosticProbe,
                                 onAddPeer = viewModel::addCustomPeer,

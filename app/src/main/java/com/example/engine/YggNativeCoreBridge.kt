@@ -51,8 +51,33 @@ object YggNativeCoreBridge {
         // confirmed. The TCP scanner cannot know this: a node can refuse a plain handshake
         // while the Yggdrasil link over the same endpoint carries traffic, and the scanner
         // used to grey out exactly those peers.
-        val livePeers: Map<String, Int> = emptyMap()
+        val livePeers: Map<String, Int> = emptyMap(),
+        // What the node managed to bind for incoming links, attempt by attempt. A scheme the
+        // kernel refused is shown with its error, never as an active transport.
+        val listeners: List<CoreListener> = emptyList()
     )
+
+    /**
+     * One listen endpoint the core tried, with the result it got.
+     *
+     * tls, wss and quic all want 443 and only the first one to bind keeps it, so the list is
+     * shown as attempts rather than as a set of active transports.
+     */
+    data class CoreListener(
+        val scheme: String,
+        val uri: String,
+        val bound: Boolean,
+        val address: String,
+        val error: String,
+        val recordedAtMs: Long
+    ) {
+        /** Строка отчёта: бинд или отказ с причиной, как их вернул kernel. */
+        fun describeRu(): String = if (bound) {
+            "$scheme слушает $address"
+        } else {
+            "$scheme не слушает: ${error.ifBlank { "порт занят или прав не хватает" }}"
+        }
+    }
 
     private external fun nativeInitCore(profileId: String, mnemonic: String, filesDir: String): String?
     private external fun nativeStopCore(profileId: String): String?
@@ -66,6 +91,7 @@ object YggNativeCoreBridge {
     private external fun nativeGetLinkLog(): String?
     private external fun nativeRetryPeers(profileId: String): String?
     private external fun nativeProbeOverlay(profileId: String, timeoutMs: Int): String?
+    private external fun nativeGetListeners(profileId: String): String?
 
     private val unavailableResult: NativeCoreResult
         get() = NativeCoreResult(
@@ -139,6 +165,45 @@ object YggNativeCoreBridge {
     fun getPeersJson(profileId: String): NativeCoreResult =
         invoke { nativeGetPeersJson(profileId) }
 
+    fun getListenersJson(profileId: String): NativeCoreResult =
+        invoke { nativeGetListeners(profileId) }
+
+    /**
+     * The endpoints this node reports as listening.
+     *
+     * Nothing here is inferred: the answer comes from the core's own bind attempts, so a scheme
+     * the kernel refused appears with its error instead of being shown as active because the
+     * profile asked for it.
+     */
+    fun readListeners(profileId: String): List<CoreListener> {
+        val result = getListenersJson(profileId)
+        if (!result.ok) return emptyList()
+        return readCoreListeners(result.rawJson)
+    }
+
+    internal fun readCoreListeners(rawJson: String): List<CoreListener> {
+        val listeners = try {
+            JSONObject(rawJson).optJSONArray("listeners")
+        } catch (_: Exception) {
+            null
+        } ?: return emptyList()
+        val result = ArrayList<CoreListener>(listeners.length())
+        for (i in 0 until listeners.length()) {
+            val entry = listeners.optJSONObject(i) ?: continue
+            result.add(
+                CoreListener(
+                    scheme = entry.optString("scheme").lowercase(),
+                    uri = entry.optString("uri"),
+                    bound = entry.optBoolean("bound", false),
+                    address = entry.optString("addr"),
+                    error = entry.optString("error"),
+                    recordedAtMs = entry.optLong("recordedAt", 0L)
+                )
+            )
+        }
+        return result
+    }
+
     /**
      * Reads the live mesh state of a profile's core. This is the authoritative
      * source for "is the node really connected": the Kotlin side can only see
@@ -157,7 +222,11 @@ object YggNativeCoreBridge {
             totalLinks = extractJsonInt(raw, "total", 0),
             knownNodes = extractJsonInt(raw, "knownNodes", 0),
             sessionCount = extractJsonInt(raw, "sessionCount", 0),
-            livePeers = livePeers
+            livePeers = livePeers,
+            listeners = run {
+                val listenersResult = getListenersJson(profileId)
+                if (listenersResult.ok) readCoreListeners(listenersResult.rawJson) else emptyList()
+            }
         )
     }
 
@@ -279,11 +348,11 @@ object YggNativeCoreBridge {
      *
      * The scanner stores this as a per-peer flag, but the boot gate has URIs only and a peer
      * pasted in by hand never went through the scanner at all, so the rule is re-read from the
-     * endpoint here: port 443, or a WebSocket tunnel that already rides on it.
+     * endpoint here: the port has to be written into the URI, because a scheme name proves
+     * nothing about it - `wss://relay:9999` rides a port the whitelist drops just as `tcp://` does.
      */
     fun isWhitelistEndpoint(endpointUri: String): Boolean {
         val uri = endpointUri.trim().substringBefore('?')
-        if (uri.startsWith("wss://", ignoreCase = true)) return true
         val authority = uri.substringAfter("://", "").substringBefore('/')
         return authority.substringAfterLast(':', "").toIntOrNull() == 443
     }

@@ -153,7 +153,6 @@ data class AntiDpiConfigState(
         "habr.com",
         "ozone.ru"
     ),
-    val utlsProfile: String = "HelloChrome_128_Auto",
     val coverTransportEnabled: Boolean = true,
     val dohResolverUri: String = "https://dns.quad9.net/dns-query",
     val isProbingRoutes: Boolean = false,
@@ -4632,8 +4631,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         val cfg = _uiState.value.antiDpiConfig
         val parsed = YggPeerScannerCatalog.parseCustomPeerUrisFromText(
             rawText = rawText,
-            defaultSni = cfg.whitelistSniDomain,
-            defaultUtls = cfg.utlsProfile
+            defaultSni = cfg.whitelistSniDomain
         )
         if (parsed.isEmpty()) {
             _uiState.update {
@@ -4660,7 +4658,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                             endpointUri = peer.endpointUri,
                             transportType = peer.transportType,
                             sniDomain = peer.sniDomain,
-                            utlsFingerprint = peer.utlsFingerprint,
                             regionLabel = "${peer.countryFlag} Импорт • ${peer.cityRu}",
                             latencyMs = rtt,
                             isConnected = reachable,
@@ -4896,9 +4893,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         networkDpiController.selectWhitelistSniDomain(domain)
     }
 
-    fun selectUtlsFingerprint(fingerprint: String) {
-        networkDpiController.selectUtlsFingerprint(fingerprint)
-    }
 
     fun toggleAntiDpiFlag(flagName: String) {
         networkDpiController.toggleAntiDpiFlag(flagName)
@@ -5038,7 +5032,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         endpointUri: String,
         transportType: String,
         sniDomain: String,
-        utlsFingerprint: String,
         regionLabel: String,
         whitelistCompatible: Boolean
     ) {
@@ -5054,7 +5047,6 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 endpointUri = endpointUri,
                 transportType = transportType,
                 sniDomain = sniDomain.ifBlank { _uiState.value.antiDpiConfig.whitelistSniDomain },
-                utlsFingerprint = utlsFingerprint,
                 regionLabel = regionLabel.ifBlank { "Пользовательский пир Yggdrasil" },
                 latencyMs = if (probe.reachable) probe.rttMs else -1,
                 isConnected = probe.reachable,

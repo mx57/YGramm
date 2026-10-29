@@ -148,6 +148,7 @@ import com.example.ui.components.RichAttachmentSheetDialog
 import com.example.ui.components.VoiceMessagePlayerCard
 import com.example.ui.components.VoiceRecordingComposerBar
 import com.example.ui.components.YggAvatar
+import com.example.ui.rememberCopyToClipboard
 import com.example.ui.components.YggSwitch
 import com.example.ui.components.resolveUriFileMetadata
 import com.example.ui.theme.AmberShieldTertiary
@@ -2651,6 +2652,7 @@ private fun EncryptedMessageBubble(
     onDelete: () -> Unit = {}
 ) {
     var showReactionPicker by rememberSaveable(message.messageId) { mutableStateOf(false) }
+    val (copyText, copiedMessageKey) = rememberCopyToClipboard()
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val alignment = if (message.isOutgoing) Alignment.End else Alignment.Start
     val bubbleColor = if (message.isOutgoing) {
@@ -2856,6 +2858,29 @@ private fun EncryptedMessageBubble(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface
                     )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(
+                            onClick = { copyText(message.messageId, message.plainText) },
+                            modifier = Modifier.testTag("copy_message_${message.messageId}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Копировать", style = MaterialTheme.typography.labelSmall)
+                        }
+                        // Подпись только у той строки, которую скопировали только что: без неё
+                        // нажатие неотличимо от того, что система молча проглотила буфер.
+                        if (copiedMessageKey.value == message.messageId) {
+                            Text(
+                                text = "в буфере обмена",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = EmeraldPrimary
+                            )
+                        }
+                    }
                 }
 
                 // Telegram/WhatsApp-style Reaction Pills Row

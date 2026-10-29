@@ -466,7 +466,11 @@ class ExampleUnitTest {
             YggNativeCoreBridge.isWhitelistEndpoint("tls://95.217.35.148:443?sni=ya.ru")
         )
         assertTrue(
-            "a wss tunnel rides the allowed port wherever it is mounted",
+            "a wss tunnel on the forwarded port passes",
+            YggNativeCoreBridge.isWhitelistEndpoint("wss://cdn.example:443/socket")
+        )
+        assertFalse(
+            "a scheme name proves nothing about its port, and a portless URI is never dialled",
             YggNativeCoreBridge.isWhitelistEndpoint("wss://cdn.example/socket")
         )
         assertFalse("4433 is not 443", YggNativeCoreBridge.isWhitelistEndpoint("tls://95.217.35.148:4433"))
