@@ -24,10 +24,10 @@ android {
     applicationId = "com.aistudio.ygggram.vxkprm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 25
+    versionCode = 26
     // The suffix is the only thing that tells a tester whether the node on the screen can
     // be the shipped one: an emulator build carries the x86_64 core, a release build arm64.
-    versionName = "1.7.8" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
+    versionName = "1.7.9" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")

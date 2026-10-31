@@ -69,6 +69,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.BufferOverflow
@@ -140,6 +141,16 @@ data class PeerScannerState(
     val isScanning: Boolean = false,
     val discoveredPeers: List<DiscoveredYggPeer> = YggPeerScannerCatalog.initialCatalog,
     val lastScanSummary: String = "В базе ${YggPeerScannerCatalog.initialCatalog.size} пиров в 16 странах • Нажмите «Сканировать пинг»"
+)
+
+// What the spare-node autopilot last decided, kept on screen after the banner faded. The
+// question "why is there still one link?" gets asked minutes after the pass that answers it,
+// and only this state survives the Snackbar.
+data class AutopilotState(
+    val lastPassSummary: String = "",
+    val lastPassAtMs: Long = 0L,
+    val poolSize: Int = 0,
+    val poolNote: String = ""
 )
 
 data class AntiDpiConfigState(
@@ -262,6 +273,7 @@ data class YggGramUiState(
     val isSeedPhraseRevealed: Boolean = false,
     val antiDpiConfig: AntiDpiConfigState = AntiDpiConfigState(),
     val peerScanner: PeerScannerState = PeerScannerState(),
+    val autopilot: AutopilotState = AutopilotState(),
     val coreMesh: YggNativeCoreBridge.CoreMeshState = YggNativeCoreBridge.CoreMeshState(available = false),
     val overlayDrops: Long = 0L,
     val userProfile: DecentralizedUserProfile = DecentralizedUserProfile(),
@@ -347,6 +359,9 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     private companion object {
         const val TYPING_THROTTLE_MS = 4_000L
         const val TYPING_EXPIRY_MS = 6_000L
+
+        // How far the draft write trails the typing. One row per chat, not one per keypress.
+        const val DRAFT_SAVE_DEBOUNCE_MS = 500L
 
         // A muted peer still transmits encrypted silence, so this many seconds without a
         // single decrypted inbound frame can only mean the media path is dead.
@@ -462,8 +477,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 val suppressForOpenChat = chatVisibleNow &&
                     _uiState.value.privacyMatrix.suppressNotificationsForOpenChat
 
+                // A muted chat announces nothing on this device. The frame itself was already
+                // stored and already counted unread by the time we get here, so muting is a
+                // choice about noise, never about delivery.
+                val chatIsMuted = conversations.value.firstOrNull { it.chatId == chatId }?.isMuted == true
+
                 // Dispatch Popup & Android System Notification if the recipient profile is enabled in settings
-                if (!suppressForOpenChat &&
+                if (!suppressForOpenChat && !chatIsMuted &&
                     targetProfile != null &&
                     (targetProfile.isActiveInBackground || targetProfile.isCurrentPrimary)
                 ) {
@@ -735,6 +755,12 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         onIncomingCallSignalReceived = { callSig ->
             viewModelScope.launch { handleIncomingCallSignal(callSig) }
         },
+        // A PONG proved the path to that node, and the repository turns the proof into the one
+        // presence timestamp the chat list reads. The measured delay stays in the bridge's journal:
+        // it describes a route, not a message, and no message was delivered by it.
+        onPeerRouteHeld = { chatId, _ ->
+            viewModelScope.launch { repository.markPeerRouteHeld(chatId) }
+        },
         onCallAudioFrameReceived = { packet ->
             handleIncomingCallAudioFrame(packet)
         },
@@ -849,6 +875,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     init {
         YGrammUpdateController.attach(application)
         viewModelScope.launch {
+            // The keep-alive holds the paths of every running node, not only the profile on screen,
+            // so it gets the whole chat table rather than the filtered slice the UI reads.
+            repository.conversations.collect { rows -> networkEngine.refreshOverlayKeepAlive(rows) }
+        }
+        viewModelScope.launch {
             // A relay reply has to name this node with something a human chose, not a key hash.
             _uiState.map { it.userProfile.displayName }.distinctUntilChanged().collect { name ->
                 networkEngine.localProfileLabel = name.ifBlank { "Мой узел Yggdrasil" }
@@ -862,6 +893,11 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             networkDpiController.peerScanner.collect { scanner ->
                 _uiState.update { it.copy(peerScanner = scanner) }
+            }
+        }
+        viewModelScope.launch {
+            networkDpiController.autopilot.collect { report ->
+                _uiState.update { it.copy(autopilot = report) }
             }
         }
         viewModelScope.launch {
@@ -1163,12 +1199,24 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         if (!privacy.inAppNotificationsEnabled && !privacy.systemNotificationsEnabled) return
 
         val app = getApplication<Application>()
-        // The chat's own picture — the contact's for a dialog, the cover for a group. Taken from
-        // the row rather than passed in, so no caller can pair a name with someone else's face;
-        // a picture that has not reached this device yet simply produces no icon.
-        val chatAvatarUri = conversations.value
-            .firstOrNull { it.chatId == chatId }?.avatarUri
-            .orEmpty()
+        // One read of the row gives the notification both its picture and its name. Taken from
+        // the row rather than passed in, so no caller can pair a name with someone else's face.
+        val chatRow = conversations.value.firstOrNull { it.chatId == chatId }
+        val chatAvatarUri = chatRow?.avatarUri.orEmpty()
+        // A notification has one line to say who is writing. The raw address that arrives on the
+        // wire is the worst option, so the chat's own name - the owner's rename, or the handle the
+        // peer proved - is used whenever this device holds one.
+        val resolvedSenderName = if (chatRow != null) {
+            notificationSenderLabel(
+                chatType = chatRow.chatType,
+                chatTitle = chatRow.title,
+                peerHandle = chatRow.peerHandle,
+                senderName = senderName,
+                senderIpv6 = senderIpv6
+            )
+        } else {
+            senderName
+        }
         val item = YggPopupNotificationItem(
             notificationId = "notif_${UUID.randomUUID().toString().take(8)}",
             category = category,
@@ -1178,7 +1226,7 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             targetProfileColorHex = targetProfile.avatarColorHex,
             targetProfileRelayRole = targetProfile.nodeRelayRole,
             chatId = chatId,
-            senderName = senderName,
+            senderName = resolvedSenderName,
             senderIpv6 = senderIpv6,
             messagePreview = messagePreview,
             voiceDurationSec = voiceDurationSec,
@@ -1975,6 +2023,111 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Silences one chat's popups and system notifications on this device.
+     *
+     * Delivery is untouched: the message still arrives, is stored and still counts as unread. A
+     * mute that quietly dropped traffic would look like the peer had stopped writing, which is the
+     * opposite of what this app promises.
+     */
+    fun toggleChatMute(chatId: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId } ?: return@launch
+            repository.setConversationMuted(chatId, !targetConv.isMuted)
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (targetConv.isMuted) {
+                        "Чат «${targetConv.title}» снова звуковой: уведомления включены"
+                    } else {
+                        "Чат «${targetConv.title}» без уведомлений: сообщения приходят и остаются в непрочитанных"
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * Moves a chat out of the list without touching its traffic or its flags.
+     *
+     * The row stays in the same flow the sending and forwarding paths read from, so an archived
+     * contact is still a contact: only the list hides it, and the «Архив» filter shows it again.
+     */
+    fun toggleChatArchive(chatId: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId } ?: return@launch
+            repository.setConversationArchived(chatId, !targetConv.isArchived)
+            if (!targetConv.isArchived && _uiState.value.selectedChatId == chatId) {
+                _uiState.update { it.copy(selectedChatId = null) }
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (targetConv.isArchived) {
+                        "Чат «${targetConv.title}» вернулся в список"
+                    } else {
+                        "Чат «${targetConv.title}» в архиве • он по-прежнему получает сообщения, " +
+                            "а тише он только с выключенными уведомлениями"
+                    }
+                )
+            }
+        }
+    }
+
+    /** Labels a chat with a name this device chose; the peer's own PROFILE frames no longer rename it. */
+    fun renameChat(chatId: String, newTitle: String) {
+        viewModelScope.launch {
+            val targetConv = conversations.value.find { it.chatId == chatId } ?: return@launch
+            val title = newTitle.trim().take(80)
+            if (title.isEmpty()) {
+                _uiState.update { it.copy(statusBannerMessage = "Имя чата не может быть пустым") }
+                return@launch
+            }
+            if (targetConv.chatType == "GROUP") {
+                // A group name belongs to the group: it travels to the members, so the existing
+                // group path is the only honest one here.
+                renameGroup(chatId, title)
+                return@launch
+            }
+            if (!repository.renameConversation(chatId, title)) {
+                _uiState.update {
+                    it.copy(statusBannerMessage = "Чат уже называется «${targetConv.title}» — менять нечего")
+                }
+                return@launch
+            }
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = "Чат назван «$title» локально: как собеседник себя называет " +
+                        "по-прежнему видно в его профиле"
+                )
+            }
+        }
+    }
+
+    private val draftSaveJobs = HashMap<String, Job>()
+
+    /**
+     * Keeps half-typed text per chat, off the keystroke path.
+     *
+     * Writing on every character would put a database update behind each key on a slow overlay
+     * device, so the write trails the typing; the last pending job wins and a blank draft is
+     * written at once, because that is the composer being emptied by hand.
+     */
+    fun saveChatDraft(chatId: String, text: String) {
+        draftSaveJobs.remove(chatId)?.cancel()
+        when (planDraftWrite(text = text, chatId = chatId)) {
+            DraftWrite.NONE -> return
+            DraftWrite.CLEAR -> viewModelScope.launch { repository.setConversationDraft(chatId, "") }
+            DraftWrite.SAVE -> draftSaveJobs[chatId] = viewModelScope.launch {
+                delay(DRAFT_SAVE_DEBOUNCE_MS)
+                repository.setConversationDraft(chatId, text)
+            }
+        }
+    }
+
+    private fun clearChatDraft(chatId: String) {
+        draftSaveJobs.remove(chatId)?.cancel()
+        viewModelScope.launch { repository.setConversationDraft(chatId, "") }
+    }
+
     fun toggleChatPin(chatId: String) {
         viewModelScope.launch {
             val targetConv = conversations.value.find { it.chatId == chatId } ?: return@launch
@@ -2690,6 +2843,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
                 }
                 return@launch
             }
+
+            // The text is a stored message from here on, so the composer's saved draft for this
+            // chat is stale. Before this point every path returned with the text handed back.
+            clearChatDraft(chatId)
 
             if (offline) {
                 val reason = if (currentState.isAirplaneModeOn) "Авиарежим" else "Офлайн"

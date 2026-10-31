@@ -701,6 +701,10 @@ fun YggGramRootApp(
                                 onLeaveGroup = viewModel::leaveGroup,
                                 onDeleteChat = viewModel::deleteChat,
                                 onToggleChatPin = viewModel::toggleChatPin,
+                                onToggleChatMute = viewModel::toggleChatMute,
+                                onToggleChatArchive = viewModel::toggleChatArchive,
+                                onRenameChat = viewModel::renameChat,
+                                onDraftChange = viewModel::saveChatDraft,
                                 onClearChat = viewModel::clearChatHistory,
                                 onRunSendReceiveTest = viewModel::runLiveMessageSendReceiveTest,
                                 onOpenSelfYggdrasilChat = { runOverlayProbe ->

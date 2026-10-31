@@ -563,6 +563,33 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `the core's session table names the nodes it can be addressed by`() {
+        // An ironwood session only exists after the remote node answered the session
+        // acknowledgement, so this is the one presence proof that does not depend on the app
+        // having stored a timestamp — and the keep-alive reads it to hold paths that were learned
+        // by the crypto layer alone.
+        val raw = """
+            {"ok":true,"sessions":[
+              {"keyHex":"${"a".repeat(64)}","rx":120,"tx":340},
+              {"keyHex":" ${"B".repeat(64)} ","rx":1,"tx":1},
+              {"keyHex":"","rx":0,"tx":0},
+              {"keyHex":"not-a-key","rx":0,"tx":0},
+              {"rx":0,"tx":0}
+            ]}
+        """.trimIndent()
+        assertEquals(
+            setOf("a".repeat(64), "b".repeat(64)),
+            com.example.engine.YggNativeCoreBridge.readOverlaySessionKeys(raw)
+        )
+        assertTrue(
+            "No sessions, or a core that could not be queried, is no proof of anything",
+            com.example.engine.YggNativeCoreBridge.readOverlaySessionKeys(
+                """{"ok":false,"error":"panic"}"""
+            ).isEmpty()
+        )
+    }
+
+    @Test
     fun `lost overlay frames are counted instead of vanishing silently`() {
         val logs = CopyOnWriteArrayList<YggLivePacketLogEntry>()
         val node = YggTwinP2PBridge(
