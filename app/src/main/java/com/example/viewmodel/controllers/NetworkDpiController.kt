@@ -14,6 +14,7 @@ import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggNetworkFilterProbe
 import com.example.engine.YggPeerDirectoryCache
 import com.example.engine.YggPeerScannerCatalog
+import com.example.engine.YggTransportMatrix
 import com.example.engine.YggTwinP2PBridge
 import com.example.viewmodel.AntiDpiConfigState
 import com.example.viewmodel.AutopilotState
@@ -95,6 +96,12 @@ class NetworkDpiController(
     private var lastFilterReport: YggNetworkFilterProbe.Report? = null
     private var filterProbeJob: Job? = null
     private val filterProbeLock = Mutex()
+
+    // Measured separately from the TCP half, on the same clock: a link can carry TCP/443 and drop
+    // every UDP/443 datagram, and the quic:// row has to be able to say so.
+    private var lastUdpProbeAt = 0L
+    private var lastUdpReport: YggNetworkFilterProbe.UdpReport? = null
+    private val udpProbeLock = Mutex()
 
     init {
         syncCoverTransport()
@@ -186,7 +193,15 @@ class NetworkDpiController(
         if (filterProbeJob?.isActive == true) return
         filterProbeJob = scope.launch(Dispatchers.IO) {
             val report = networkFilterReport(force = true) ?: return@launch
-            withContext(Dispatchers.Main) { onBannerMessage(report.summary) }
+            // QUIC rides UDP, so the same question is asked of the other protocol; the answer to
+            // one has never been evidence about the other.
+            val udp = udpFilterReport(force = true)
+            val banner = if (udp == null) {
+                report.summary
+            } else {
+                report.summary + "\n" + udp.summary
+            }
+            withContext(Dispatchers.Main) { onBannerMessage(banner) }
         }
     }
 
@@ -205,14 +220,58 @@ class NetworkDpiController(
         }
         lastFilterProbeAt = android.os.SystemClock.elapsedRealtime()
         lastFilterReport = report
+        publishFilterMeasurements(report, udpFilterReport(force = false))
+        return report
+    }
+
+    /** What the link carries over UDP/443 - the only path a quic:// peer can be dialled over. */
+    private suspend fun udpFilterReport(force: Boolean): YggNetworkFilterProbe.UdpReport? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cached = lastUdpReport
+        if (!force && cached != null && now - lastUdpProbeAt < FILTER_PROBE_TTL_MS) return cached
+        if (!udpProbeLock.tryLock()) return cached
+        val report = try {
+            withContext(Dispatchers.IO) { YggNetworkFilterProbe.probeUdp() }
+        } finally {
+            udpProbeLock.unlock()
+        }
+        lastUdpProbeAt = android.os.SystemClock.elapsedRealtime()
+        lastUdpReport = report
+        publishFilterMeasurements(lastFilterReport, report)
+        return report
+    }
+
+    /**
+     * Puts both measurements and the scheme matrix on the screen together.
+     *
+     * The matrix is rebuilt from whichever half just arrived because a row mixes a TCP verdict, a
+     * UDP verdict and the core's own listener report: publishing them separately would let the
+     * screen show a matrix built from yesterday's UDP answer next to today's TCP one.
+     */
+    private fun publishFilterMeasurements(
+        tcp: YggNetworkFilterProbe.Report?,
+        udp: YggNetworkFilterProbe.UdpReport?
+    ) {
+        if (tcp == null && udp == null) return
+        val matrix = YggTransportMatrix.lines(
+            tcp = tcp?.verdict,
+            udp = udp?.verdict,
+            listeners = YggNativeCoreBridge.readListeners(YggRepository.DEFAULT_PROFILE_ID),
+            whitelistMode = YggCoverTransport.whitelistMode
+        )
         _antiDpiConfig.update {
             it.copy(
-                networkFilterSummary = report.summary,
-                networkFilterEvidence = YggNetworkFilterProbe.evidenceLines(report),
-                networkFilterMeasuredAtMs = report.measuredAtMs
+                networkFilterSummary = tcp?.summary ?: it.networkFilterSummary,
+                networkFilterEvidence = tcp?.let(YggNetworkFilterProbe::evidenceLines)
+                    ?: it.networkFilterEvidence,
+                networkFilterMeasuredAtMs = tcp?.measuredAtMs ?: it.networkFilterMeasuredAtMs,
+                networkUdpSummary = udp?.summary ?: it.networkUdpSummary,
+                networkUdpEvidence = udp?.let(YggNetworkFilterProbe::udpEvidenceLines)
+                    ?: it.networkUdpEvidence,
+                networkUdpMeasuredAtMs = udp?.measuredAtMs ?: it.networkUdpMeasuredAtMs,
+                networkSchemeMatrix = matrix
             )
         }
-        return report
     }
 
     /**

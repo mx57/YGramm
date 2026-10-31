@@ -179,6 +179,16 @@ data class AntiDpiConfigState(
     // screen would present an hour-old answer as if it were about the network in front of the
     // user now, which is exactly how a killed hotspot reads as a permanent filter.
     val networkFilterMeasuredAtMs: Long = 0L,
+    // The same question put to UDP, because quic:// does not ride the TCP path at all: an answer
+    // about 443/tcp says nothing about 443/udp, and leaving the second one unasked is what made
+    // every quic:// peer unverifiable from inside the app.
+    val networkUdpSummary: String = "",
+    val networkUdpEvidence: List<String> = emptyList(),
+    val networkUdpMeasuredAtMs: Long = 0L,
+    // Scheme by scheme, using only verdicts that were actually measured above plus the listener
+    // report from the core. A row with no measurement says «не измерялся» rather than borrowing
+    // another scheme's evidence.
+    val networkSchemeMatrix: List<String> = emptyList(),
     // Measured on this device, by this app: which codec it really found and what one note
     // actually costs there. A number copied from a codec brochure would be a guess.
     val voiceCodecSummary: String = "",
