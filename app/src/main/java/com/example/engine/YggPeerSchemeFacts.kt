@@ -155,7 +155,10 @@ object YggPeerSchemeFacts {
     fun summaryRu(endpointUri: String, sniDomain: String): String {
         val facts = of(endpointUri, sniDomain)
         val parts = buildList {
-            add(facts.transportRu + (facts.port?.let { ":$it" } ?: " — порт не указан"))
+            // The port is its own bullet: glued to the end of the sentence it read as part of
+            // the description ("рукопожатие оверлея идёт открытым текстом:65535").
+            add(facts.transportRu)
+            add(facts.port?.let { "порт $it" } ?: "порт не указан")
             if (!facts.dialableByCore) add("ядро не диалит без порта")
             add(if (facts.sendsHostnameSni) "SNI есть" else "SNI нет")
             if (facts.canBeMasked) add("маска через TLS-стек телефона")

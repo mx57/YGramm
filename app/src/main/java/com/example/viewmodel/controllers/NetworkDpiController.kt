@@ -6,14 +6,17 @@ import com.example.data.YggDatabase
 import com.example.data.YggPeerEntity
 import com.example.data.YggRepository
 import com.example.engine.DiscoveredYggPeer
+import com.example.engine.DirectoryFetch
 import com.example.engine.YggCoverTransport
 import com.example.engine.OverlayProbeOutcome
 import com.example.engine.YggLivePacketLogEntry
 import com.example.engine.YggNativeCoreBridge
 import com.example.engine.YggNetworkFilterProbe
+import com.example.engine.YggPeerDirectoryCache
 import com.example.engine.YggPeerScannerCatalog
 import com.example.engine.YggTwinP2PBridge
 import com.example.viewmodel.AntiDpiConfigState
+import com.example.viewmodel.AutopilotState
 import com.example.viewmodel.CensorshipPreset
 import com.example.viewmodel.PeerScannerState
 import java.util.UUID
@@ -58,12 +61,32 @@ class NetworkDpiController(
     private val _isSmartWatchdogEnabled = MutableStateFlow(true)
     val isSmartWatchdogEnabled: StateFlow<Boolean> = _isSmartWatchdogEnabled.asStateFlow()
 
+    private val _autopilot = MutableStateFlow(AutopilotState())
+    val autopilot: StateFlow<AutopilotState> = _autopilot.asStateFlow()
+
     private val _isAdaptiveJitterEnabled = MutableStateFlow(true)
     val isAdaptiveJitterEnabled: StateFlow<Boolean> = _isAdaptiveJitterEnabled.asStateFlow()
 
     private var watchdogJob: Job? = null
     private var peerScanJob: Job? = null
     private var lastWatchdogFailoverAt = 0L
+    private var lastDirectoryPoolAt = 0L
+
+    // What the autopilot dials from when a link dies. Kept apart from the scanner screen's list:
+    // that one is what the user measured with their own finger, and quietly rewriting it on a
+    // timer would make the ping column mean nothing. The shipped catalog seeds it so the first
+    // hunt after install still has material.
+    private var directoryPool: List<DiscoveredYggPeer> = YggPeerScannerCatalog.initialCatalog
+    private var directoryPoolNote = "список из сборки, каталог ещё не читался"
+
+    // When each spare was first handed to the node, in uptime milliseconds. The peer row has no
+    // such column and the grace clock only has to survive as long as the process dials it.
+    private val watchdogPeerSinceMs = HashMap<String, Long>()
+
+    // Endpoints this process watched a probe or a dial fail, keyed the way the core names them.
+    // Kept only in memory: whether a node answers is a fact about the current link, and a
+    // refusal from yesterday's hotspot is no reason to skip it today.
+    private val autopilotRejections = HashMap<String, Long>()
 
     // What the current network permits, measured from this app's own sockets. Cached because
     // the answer belongs to the link, not to a dial: re-running it every 30 seconds would buy
@@ -200,54 +223,18 @@ class NetworkDpiController(
         watchdogJob?.cancel()
         watchdogJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                delay(30_000L) // check every 30 seconds
+                delay(WATCHDOG_TICK_MS)
                 if (!_isSmartWatchdogEnabled.value) continue
                 if (!networkEngine.isRealNetworkAvailable() || networkEngine.isAirplaneModeActive()) continue
 
+                if (android.os.SystemClock.elapsedRealtime() - lastDirectoryPoolAt >= CANDIDATE_REFRESH_MS) {
+                    refreshDirectoryCandidatePool()
+                }
+
                 val liveLinks = networkEngine.coreLiveLinkCount()
                 if (liveLinks < 0) continue
-                if (liveLinks < 2) {
-                    // The node itself is the authority: at one confirmed link every route
-                    // depends on a single flapping neighbour, whatever the stored peer flags
-                    // say. The count is now peers that finished the overlay handshake, so a
-                    // node holding a dozen dead sockets and shaking hands on none is finally
-                    // seen as isolated - and needs a pause between spare-node hunts, otherwise
-                    // this branch would hit the peer directory every 30 seconds.
-                    //
-                    // The pause grows when the network itself is the reason. Measured on an
-                    // allow-listed uplink, none of the 28 directory nodes answering port 443
-                    // could be reached at all, because the filter decides by destination
-                    // address: hunting a spare there only spends the user's metered data.
-                    val filter = networkFilterReport(force = false)
-                    val now = android.os.SystemClock.elapsedRealtime()
-                    if (filter != null && filter.verdict == YggNetworkFilterProbe.Verdict.NO_LINK) {
-                        // A link that answers nothing about any address is not a link to hunt a
-                        // spare node over: the directory fetch, every candidate probe and the dial
-                        // would all be spent on the same route that carries nothing. The autopilot
-                        // says it is standing by instead of pretending it tried, once per pause.
-                        if (now - lastWatchdogFailoverAt < FILTERED_FAILOVER_COOLDOWN_MS) continue
-                        lastWatchdogFailoverAt = now
-                        withContext(Dispatchers.Main) {
-                            onBannerMessage("Автопилот узел не ищет: ${filter.summary}")
-                        }
-                        continue
-                    }
-                    // Silence gets the same long pause a filter gets. The measurement cannot say
-                    // which of the two it is, and both make a directory hunt expensive the same
-                    // way: on a path that answers nothing, a candidate probe answers nothing either.
-                    val cooldown = if (filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN) {
-                        WATCHDOG_FAILOVER_COOLDOWN_MS
-                    } else {
-                        FILTERED_FAILOVER_COOLDOWN_MS
-                    }
-                    if (now - lastWatchdogFailoverAt < cooldown) continue
-                    lastWatchdogFailoverAt = now
-                    autoCascadeFailover(
-                        "Ядро держит лишь $liveLinks линков с рукопожатием: автопилот добавляет резервные узлы" +
-                            (if (filter == null) "" else " • ${filter.verdict.labelRu}")
-                    )
-                    continue
-                }
+                maintainWatchdogPeers(liveLinks)
+
                 val connectedPeers = repository.getAllPeersNow().filter { it.isConnected }
                 if (connectedPeers.isNotEmpty()) {
                     // Check if current connected peers are failing
@@ -261,7 +248,10 @@ class NetworkDpiController(
                     }
                     if (unreachableCount == connectedPeers.size) {
                         // All connected peers became unreachable (likely DPI block or node down)
-                        autoCascadeFailover("Обнаружена блокировка ТСПУ/сбой узлов: автопилот переключает пир...")
+                        maintainWatchdogPeers(
+                            liveLinks,
+                            blockedReason = "Обнаружена блокировка ТСПУ/сбой узлов: автопилот меняет резервные узлы"
+                        )
                     }
                 }
             }
@@ -297,53 +287,231 @@ class NetworkDpiController(
         }
     }
 
-    private suspend fun autoCascadeFailover(reason: String) {
-        withContext(Dispatchers.Main) {
-            onBannerMessage(reason)
+    /**
+     * The directory as this device can actually get it: a fresh read when the uplink lets the
+     * document through, otherwise the last snapshot it did read while that is still believable.
+     *
+     * The cached copy is labelled (`fromCache`) rather than passed off as a live read, because
+     * its sighting stamps are exactly as old as they say they are.
+     */
+    private suspend fun resolveDirectorySnapshot(): DirectoryFetch {
+        val fetched = withContext(Dispatchers.IO) {
+            YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory()
         }
-        val candidatePeers = _peerScanner.value.discoveredPeers
-        // The shipped catalog ages: a public node taken down months ago is not a spare,
-        // and under a whitelist uplink the nodes that still answer are exactly the ones a
-        // stale list cannot name. Ask the directory once, here, because this path only runs
-        // when the current links are already failing.
-        val livePeers = withContext(Dispatchers.IO) {
-            YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200).peers
+        return if (fetched.errorDetail == null && fetched.peers.isNotEmpty()) {
+            withContext(Dispatchers.IO) { YggPeerDirectoryCache.save(application, fetched) }
+            fetched
+        } else {
+            val cached = withContext(Dispatchers.IO) { YggPeerDirectoryCache.load(application) }
+            if (cached != null && cached.snapshotAgeMs() in 0L until CACHE_TRUSTED_MS) cached else fetched
         }
-        if (livePeers.isNotEmpty()) {
-            _peerScanner.update { state ->
-                state.copy(
-                    discoveredPeers = (livePeers + state.discoveredPeers).distinctBy { it.endpointUri }
-                )
+    }
+
+    /**
+     * Re-reads the pool the autopilot dials from, at most once per [CANDIDATE_REFRESH_MS].
+     *
+     * Left to the shipped catalog, the spare-node hunt fails for a reason nobody can see: the
+     * directory answers, the copy in memory aged out of it. The attempt clock moves whether or
+     * not the read succeeded, so a directory this network refuses costs one timeout per pause
+     * instead of one per tick.
+     */
+    private suspend fun refreshDirectoryCandidatePool() {
+        lastDirectoryPoolAt = android.os.SystemClock.elapsedRealtime()
+        val snapshot = resolveDirectorySnapshot()
+        if (snapshot.peers.isNotEmpty()) {
+            directoryPool = snapshot.peers
+            directoryPoolNote = when {
+                snapshot.fromCache -> "снимок с диска"
+                else -> "${snapshot.peers.size} свежих узлов"
+            }
+        } else {
+            directoryPoolNote = when {
+                snapshot.errorDetail != null -> "каталог: ${snapshot.errorDetail}"
+                else -> "каталог: 0 пригодных из ${snapshot.reportedTotal}"
             }
         }
-        val validCandidates = (candidatePeers + livePeers)
-            .filter { it.endpointUri.isNotBlank() }
-            .distinctBy { it.endpointUri }
-            // Freshest first: this path runs precisely because the current links died, and the
-            // spare most likely to still be up is a node the directory saw answering recently,
-            // not one picked at random out of a list that ages.
-            .sortedWith(
-                compareByDescending<DiscoveredYggPeer> { it.lastSeenAtMs }
-                    .thenByDescending { if (it.latencyMs > 0) 1 else 0 }
-            )
-            .take(5)
+    }
 
-        for (candidate in validCandidates) {
-            val probe = networkEngine.probeRealYggdrasilPeer(
-                endpointUri = candidate.endpointUri,
-                sniOverride = candidate.sniDomain,
-                timeoutMs = 3000
+    /**
+     * Keeps the node holding up to [LIVE_DIAL_TARGET] spare dials the core actually handshook with.
+     *
+     * The running node is the only authority here: [YggTwinP2PBridge.coreConfirmedEndpoints]
+     * names the peers that finished an overlay handshake, while a saved flag only says a port was
+     * open once and an accepted socket says less than nothing. That is what makes this safe to
+     * automate - a spare the node never accepted is removed by name, and a peer the node answers
+     * is never touched, whatever else this pass decides.
+     *
+     * The two halves cost different things, so they run on different clocks. Reading the mesh
+     * state and dropping a dead spare opens no sockets and runs every tick. Hunting replacements
+     * is throttled: measured on an allow-listed uplink, none of the directory nodes answering
+     * port 443 could be reached at all, because the filter decides by destination address, and
+     * every probe on such a route is metered data spent on a path that carries nothing.
+     */
+    private suspend fun maintainWatchdogPeers(
+        liveLinks: Int,
+        blockedReason: String? = null
+    ) {
+        val confirmed = networkEngine.coreConfirmedEndpoints()
+        val now = android.os.SystemClock.elapsedRealtime()
+        val managed = repository.getAllPeersNow().filter { it.peerId in WATCHDOG_MANAGED_IDS }
+
+        val pruned = mutableListOf<String>()
+        val decision = classifyWatchdogSpares(
+            managed = managed,
+            answered = { coreAnswers(it, confirmed) },
+            sinceMs = watchdogPeerSinceMs,
+            nowMs = now,
+            graceMs = SPARE_CONFIRM_GRACE_MS
+        )
+        watchdogPeerSinceMs.clear()
+        watchdogPeerSinceMs.putAll(decision.stampedSinceMs)
+        for (peerId in decision.prunePeerIds) {
+            val peer = managed.first { it.peerId == peerId }
+            repository.deletePeer(peerId)
+            networkEngine.applyPeerChangeToCores(peer.endpointUri, enabled = false)
+            pruned.add(peerId)
+        }
+
+        val heldSlots = managed.map { it.peerId }.toSet() - pruned.toSet()
+        val freeSlots = WATCHDOG_PEER_IDS.filter { it !in heldSlots }
+        if (freeSlots.isEmpty()) {
+            if (pruned.isNotEmpty()) {
+                reportAutopilot("Автопилот убрал резервные узлы без рукопожатия: ${pruned.size}")
+            } else {
+                // Full reserve with nothing to drop used to leave the card blank, and a blank card
+                // reads as a dead watchdog. Say what is actually held, without a banner.
+                val answered = managed.count { coreAnswers(it, confirmed) }
+                reportAutopilot(
+                    "Автопилот: резерв полон • узлов в резерве ${managed.size} • с рукопожатием ядра $answered",
+                    banner = false
+                )
+            }
+            return
+        }
+
+        // A node already holding the target number of handshaked links is not a reason to spend
+        // probes: the reserve is rebuilt when one of its own dials died or when the links dropped
+        // below the target, so an idle healthy node stays idle instead of circling the directory
+        // every few minutes on the user's metered uplink.
+        if (liveLinks >= LIVE_DIAL_TARGET && pruned.isEmpty() && blockedReason == null) {
+            // Silent, but not invisible: the routes card needs to say the autopilot looked and
+            // found nothing to do, otherwise "no banner" reads as "the watchdog is dead".
+            reportAutopilot(
+                "Автопилот: резерв трогать нечего • линков с рукопожатием $liveLinks (цель $LIVE_DIAL_TARGET) • " +
+                    "слотов свободно ${freeSlots.size}",
+                banner = false
             )
-            if (probe.reachable) {
-                // One rotating spare, never a growing pile: every peer the node cannot
-                // shake hands with keeps its own dial loop, and a long list of dead ones
-                // is what left the node reporting 0 links out of 24.
-                val previousUri = repository.getAllPeersNow()
-                    .firstOrNull { it.peerId == WATCHDOG_PEER_ID }
-                    ?.endpointUri
-                    ?.trim()
+            return
+        }
+
+        val filter = networkFilterReport(force = false)
+        if (filter != null && filter.verdict == YggNetworkFilterProbe.Verdict.NO_LINK) {
+            // A link that answers nothing about any address is not a link to hunt a spare node
+            // over: the directory fetch, every candidate probe and the dial would all be spent
+            // on the same route that carries nothing. The autopilot says it is standing by
+            // instead of pretending it tried, once per pause.
+            if (now - lastWatchdogFailoverAt < FILTERED_FAILOVER_COOLDOWN_MS) return
+            lastWatchdogFailoverAt = now
+            reportAutopilot("Автопилот узел не ищет: ${filter.summary}")
+            return
+        }
+        // Silence gets the same long pause a filter gets. The measurement cannot say which of the
+        // two it is, and both make a directory hunt expensive the same way.
+        val cooldown = if (filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN) {
+            WATCHDOG_FAILOVER_COOLDOWN_MS
+        } else {
+            FILTERED_FAILOVER_COOLDOWN_MS
+        }
+        if (now - lastWatchdogFailoverAt < cooldown) return
+        lastWatchdogFailoverAt = now
+
+        if (blockedReason != null) {
+            withContext(Dispatchers.Main) { onBannerMessage(blockedReason) }
+        }
+
+        val dialled = repository.getAllPeersNow().mapTo(HashSet()) { normalizedEndpoint(it.endpointUri) }
+        val whitelistProfile = _antiDpiConfig.value.whitelistCdnWssEnabled
+        // The 443-only pool is a bet about the uplink, not a law. When this device's own
+        // measurement says nothing is filtered, parking every other port costs links and buys
+        // protection that is not needed on this route; the peers that still fit the whitelist are
+        // tried first either way, so the moment the filter comes back the reserve is built from
+        // the nodes that survive it.
+        val linkMeasuredOpen = filter?.verdict == YggNetworkFilterProbe.Verdict.OPEN
+        val poolAll = (_peerScanner.value.discoveredPeers + directoryPool)
+            .filter { it.endpointUri.isNotBlank() && normalizedEndpoint(it.endpointUri) !in dialled }
+            .filter { !whitelistProfile || linkMeasuredOpen || it.whitelistCompatible }
+            .distinctBy { normalizedEndpoint(it.endpointUri) }
+        // Freshness is not reachability. Sorting by it alone sent every pass to the same fifteen
+        // newest nodes: each pass re-probed the same dead ports and the reserve never grew, while
+        // the scan's own numbers say roughly one node in five answers from here at all.
+        val rejected = liveAutopilotRejections(now)
+        val needed = freeSlots.size * AUTOPILOT_PROBES_PER_SLOT
+        // Restarts the circuit once the process has watched everything left in the pool fail.
+        // Holding the memory past that point would leave the node with no reserve at all, which
+        // is a worse answer than trying a dead node twice.
+        val freshRound = poolAll.count { normalizedEndpoint(it.endpointUri) !in rejected } < needed
+        if (freshRound) autopilotRejections.clear()
+        val pool = if (freshRound) poolAll else poolAll.filter {
+            normalizedEndpoint(it.endpointUri) !in rejected
+        }
+        // A quic:// candidate cannot be judged from here: the transport runs on UDP and the probe
+        // handshakes TCP, so it answers nothing about whether the node is alive. Spending a spare
+        // slot on a guess the node cannot confirm is how a dial list grows links nobody can verify,
+        // and the bundled core does not listen on 443 for UDP anyway.
+        val quicLeft = pool.count { it.transportType == "QUIC_YGGDRASIL" }
+        // A peer this device already handshook with is the best spare there is: the directory's
+        // freshness says another network saw the node recently, while a measured latency says the
+        // handshake completed from this exact link. Freshest first only breaks ties between the
+        // nodes nobody here has probed yet.
+        val candidates = pool
+            .filter { it.transportType != "QUIC_YGGDRASIL" }
+            .sortedWith(
+                compareByDescending<DiscoveredYggPeer> { if (it.latencyMs > 0) 1 else 0 }
+                    .thenByDescending { if (whitelistProfile) it.whitelistCompatible else false }
+                    .thenByDescending { it.lastSeenAtMs }
+            )
+            .take(needed)
+
+        var added = 0
+        var coreLive = liveLinks
+        var coreTotal = 0
+        val refusals = LinkedHashMap<String, Int>()
+        // Nine failed probes are nine data points, not one reason. Reporting only the last one
+        // made a hunt that met three different refusals look like the same refusal nine times.
+        val note: (String, String) -> Unit = { endpoint, reason ->
+            val key = shortRefusal(reason)
+            refusals[key] = (refusals[key] ?: 0) + 1
+            autopilotRejections[normalizedEndpoint(endpoint)] = now
+        }
+        var nextCandidate = 0
+        for (slot in freeSlots) {
+            var filled = false
+            while (nextCandidate < candidates.size && !filled) {
+                val candidate = candidates[nextCandidate++]
+                val probe = networkEngine.probeRealYggdrasilPeer(
+                    endpointUri = candidate.endpointUri,
+                    sniOverride = candidate.sniDomain,
+                    timeoutMs = 3000
+                )
+                if (!probe.reachable) {
+                    note(candidate.endpointUri, probe.errorDetail ?: "порт не ответил на замер")
+                    continue
+                }
+                // A reachable port is not a Yggdrasil link: hand the peer to the live node and
+                // only count the slot as filled once the node accepted the dial.
+                val core = networkEngine.applyPeerChangeToCores(
+                    candidate.endpointUri,
+                    enabled = true,
+                    sniDomain = candidate.sniDomain
+                )
+                coreLive = core.liveLinks
+                coreTotal = core.totalLinks
+                if (core.applied == 0) {
+                    note(candidate.endpointUri, core.errorDetail ?: "живая нода не приняла диал")
+                    continue
+                }
                 repository.addOrUpdatePeer(
-                    peerId = WATCHDOG_PEER_ID,
+                    peerId = slot,
                     endpointUri = candidate.endpointUri,
                     transportType = candidate.transportType,
                     sniDomain = candidate.sniDomain,
@@ -352,51 +520,164 @@ class NetworkDpiController(
                     isConnected = true,
                     whitelistCompatible = candidate.whitelistCompatible
                 )
-                if (previousUri != null && previousUri != candidate.endpointUri) {
-                    networkEngine.applyPeerChangeToCores(previousUri, enabled = false)
-                }
-                // A reachable port is not a Yggdrasil link: hand the peer to the live node
-                // and only report recovery once the node accepted it.
-                val core = networkEngine.applyPeerChangeToCores(
-                    candidate.endpointUri,
-                    enabled = true,
-                    sniDomain = candidate.sniDomain
-                )
-
-                if (core.applied > 0) {
-                    withContext(Dispatchers.Main) {
-                        onBannerMessage(
-                            "Автопилот добавил ${candidate.countryFlag} ${candidate.cityRu} в ноду " +
-                                "(${probe.rttMs} мс • линков ядра: ${core.liveLinks} из ${core.totalLinks})"
-                        )
-                        onSyncForegroundNotification()
-                    }
-                    return
-                }
+                watchdogPeerSinceMs[slot] = now
+                added++
+                filled = true
             }
+            if (!filled) break
         }
-        // The hunt failed, so it says so. Silence here is what made an allow-listed uplink look
-        // like an app that had not tried: the banner promised spare nodes and nothing followed.
-        val filter = networkFilterReport(force = false)
-        val why = when {
-            validCandidates.isEmpty() ->
-                "каталог публичных узлов не дал ни одного кандидата (его адрес эта сеть не пропускает)"
-            filter == null || filter.verdict == YggNetworkFilterProbe.Verdict.OPEN ->
-                "ни один из проверенных узлов не ответил на рукопожатие Yggdrasil"
-            else -> filter.summary
+
+        // Worst first: the reason that cost the most slots is the one worth reading before the
+        // rest, and a hunt that ran out of candidates says so through the count, not a message.
+        val refusalReport = refusals.entries
+            .sortedByDescending { it.value }
+            .joinToString(" • ") { "${it.key} ×${it.value}" }
+            .ifBlank { filter?.summary ?: "ни один узел не ответил на рукопожатие Yggdrasil" }
+        val quicPart = if (quicLeft > 0) " • quic:// отложено: $quicLeft (UDP, TCP-замер его не проверяет)" else ""
+        val openPart = if (whitelistProfile && linkMeasuredOpen) {
+            " • замер сети: фильтра нет, брали узлы не только на 443"
+        } else ""
+
+        val outcome = when {
+            added > 0 ->
+                "Автопилот: резервных узлов добавлено $added • свободных слотов было ${freeSlots.size} • " +
+                    "линков ядра: $coreLive из $coreTotal$openPart"
+            candidates.isEmpty() ->
+                "Автопилот: кандидатов нет • свободных слотов ${freeSlots.size} • " +
+                    (if (whitelistProfile && !linkMeasuredOpen) "на 443 в каталоге пусто, " else "") +
+                    directoryPoolNote + quicPart
+            else ->
+                "Автопилот: резервный узел не добавлен • проверено ${candidates.size} • $refusalReport$quicPart$openPart"
         }
-        withContext(Dispatchers.Main) {
-            onBannerMessage(
-                "Автопилот: резервный узел не добавлен • проверено ${validCandidates.size} • $why"
+        reportAutopilot(outcome)
+        if (added > 0) withContext(Dispatchers.Main) { onSyncForegroundNotification() }
+    }
+
+    /**
+     * Writes what one autopilot pass decided into the state the routes card reads, and shows it
+     * as a banner unless the pass was the routine "nothing to do" one.
+     *
+     * The banner alone was not enough: it fades in seconds, while the question it answers - why
+     * the node still holds one link - gets asked minutes later.
+     */
+    private suspend fun reportAutopilot(summary: String, banner: Boolean = true) {
+        _autopilot.update {
+            it.copy(
+                lastPassSummary = summary,
+                lastPassAtMs = System.currentTimeMillis(),
+                poolSize = directoryPool.size,
+                poolNote = directoryPoolNote
             )
         }
+        if (banner) withContext(Dispatchers.Main) { onBannerMessage(summary) }
+    }
+
+    /** The URI as the core names it in its peer list, so a dial and a confirmation match. */
+    private fun normalizedEndpoint(endpointUri: String): String =
+        endpointUri.substringBefore('?').trim().lowercase()
+
+    /**
+     * This process's failed endpoints that are still too recent to hand a spare slot to again,
+     * dropping the ones that have aged out on the way.
+     */
+    private fun liveAutopilotRejections(now: Long): Set<String> {
+        if (autopilotRejections.isNotEmpty()) {
+            autopilotRejections.entries.removeAll { now - it.value >= AUTOPILOT_REJECTION_TTL_MS }
+        }
+        return autopilotRejections.keys.toSet()
+    }
+
+    /**
+     * A bucket name for one refusal, so ninety probes against the same wall read as "×90".
+     *
+     * A Java exception names itself before the colon and that name is the useful part; anything
+     * else (a scheme the probe refuses to test, a socket message) is kept as its first line,
+     * shortened to what still fits a banner.
+     */
+    private fun shortRefusal(reason: String): String {
+        val firstLine = reason.lineSequence().first().trim()
+        val head = firstLine.substringBefore(':').trim().substringAfterLast('.')
+        if (head.length !in 4..60 || !head.first().isUpperCase()) return firstLine.take(60)
+        // A TLS refusal says which alert the far side sent, and that is the difference between a
+        // node that is not there and a node that objects to how we greet it. The bare class name
+        // throws that away and the hunt looks random, while the socket address BoringSSL writes
+        // into the message would split one refusal into a bucket per connection.
+        val detail = if (head.contains("SSL", ignoreCase = true)) sslDetail(reason) else ""
+        return if (detail.isBlank()) head else "$head: $detail"
+    }
+
+    /** The named BoringSSL failure, searched across the whole message: the alert sits on its own line. */
+    private fun sslDetail(reason: String): String {
+        val alert = Regex("OPENSSL_internal:([A-Z0-9_]+)").find(reason)?.groupValues?.get(1)
+        if (alert != null) return alert
+        val firstLine = reason.lineSequence().first().trim()
+        val cleaned = firstLine.replace(Regex("ssl=0x[0-9a-fA-F]+"), "ssl").trim()
+        return cleaned.substringAfter(':', "").trim().take(52)
+    }
+
+    /**
+     * Whether the running node reports a finished overlay handshake for this peer.
+     *
+     * Both of its routes count. Under the TLS mask the core dials a local endpoint whose handshake
+     * comes from the phone's stack, so a peer the node answers through that loopback is a working
+     * link and not a spare to remove - judging it by its raw URI alone would drop the exact peers
+     * the mask was switched on to reach.
+     */
+    private fun coreAnswers(peer: YggPeerEntity, confirmed: Map<String, Int>): Boolean {
+        val uri = peer.endpointUri.trim()
+        if (uri.isBlank()) return false
+        if (normalizedEndpoint(uri) in confirmed) return true
+        val coverKey = YggCoverTransport.coveredUri(YggNativeCoreBridge.corePeerUri(uri, peer.sniDomain))
+            ?.substringBefore('?')?.trim()?.lowercase()
+        return coverKey != null && coverKey in confirmed
     }
 
     private companion object {
-        const val WATCHDOG_PEER_ID = "peer_watchdog_active"
+        // The autopilot's own peer slots. Named by slot, not by node, so a spare that died is
+        // replaced in place instead of leaving a pile of one-shot peers in the database - the
+        // pile is what left a node reporting 0 links out of 24 dials.
+        val WATCHDOG_PEER_IDS = listOf("peer_watchdog_1", "peer_watchdog_2", "peer_watchdog_3")
+
+        // A spare under the id this build used before the slots existed. It is still managed -
+        // dropped when the node does not answer it - but never refilled.
+        const val LEGACY_WATCHDOG_PEER_ID = "peer_watchdog_active"
+        val WATCHDOG_MANAGED_IDS: Set<String> = WATCHDOG_PEER_IDS.toSet() + LEGACY_WATCHDOG_PEER_ID
+
+        // How often the watchdog looks at the node.
+        const val WATCHDOG_TICK_MS = 30_000L
+
+        // Spare dials the autopilot keeps standing. Below two handshaked links every route runs
+        // through a single flapping neighbour; three gives the overlay a second path to learn
+        // while the first one is being re-dialled.
+        const val LIVE_DIAL_TARGET = 3
+
+        // How long a spare may stay unanswered before the autopilot stops paying for its dial
+        // loop. Ten ticks is generous: the core dials on its own backoff and a node that wants
+        // the link takes the first two tries.
+        const val SPARE_CONFIRM_GRACE_MS = 300_000L
+
+        // Candidates probed per free slot in one hunt. Sized so one pass cuts a fifth of the
+        // directory out of the circuit: the budget is time-bounded by the timeout, and a hunt
+        // that covers 220 nodes only every hour is a node that spends the hour with one link.
+        const val AUTOPILOT_PROBES_PER_SLOT = 10
+
+        // How long a node that failed here stays skipped by the hunt. Long enough that a pass
+        // moves on to new addresses instead of re-probing the same dead ports every five minutes,
+        // short enough that a node which came back is reachable again inside a working day.
+        const val AUTOPILOT_REJECTION_TTL_MS = 21_600_000L
+
+        // How often the autopilot re-reads the public directory. The compressed document is a
+        // few kilobytes and the publisher regenerates it hourly, so this is a floor on cost,
+        // not a freshness claim.
+        const val CANDIDATE_REFRESH_MS = 900_000L
+
+        // A snapshot read by this device stays usable material this long after the directory
+        // itself stopped answering - longer than the publisher's own regeneration period, so
+        // one stalled read is not a reason to fall back on the shipped catalog.
+        const val CACHE_TRUSTED_MS = 3 * 3_600_000L
 
         // How often the watchdog is allowed to hunt for a spare node while the core reports
-        // fewer than two handshaked links.
+        // fewer handshaked links than the target.
         const val WATCHDOG_FAILOVER_COOLDOWN_MS = 300_000L
 
         // How long the autopilot waits between spare-node hunts once the network has been
@@ -408,8 +689,11 @@ class NetworkDpiController(
 
         // A scan has to finish while the user is watching the screen. The freshest nodes are
         // probed first, so the budget cuts the stale tail of the catalog rather than the live
-        // head, and the summary states how many candidates were left unprobed.
-        const val MAX_PEER_PROBES_PER_SCAN = 96
+        // head, and the summary states how many candidates were left unprobed. At the batch width
+        // below the whole budget is six bursts, which is the worst case on a link that answers
+        // nothing at all; nodes that answer usually reply in under a fifth of the timeout.
+        const val MAX_PEER_PROBES_PER_SCAN = 160
+        const val PROBE_BATCH_SIZE = 24
     }
 
     fun applyCensorshipPreset(preset: CensorshipPreset) {
@@ -667,8 +951,19 @@ class NetworkDpiController(
                 )
             }
 
-            val directory = withContext(Dispatchers.IO) {
-                YggPeerScannerCatalog.fetchLivePublicPeersFromDirectory(timeoutMs = 4200)
+            val directory = resolveDirectorySnapshot()
+            // A snapshot this device managed to read before is better raw material than the
+            // shipped catalog, and it is the only material left when the directory's own address
+            // is not on the uplink's allow-list. It is labelled as cached below rather than
+            // presented as a live read, because its sighting stamps are exactly as old as they say.
+            if (directory.peers.isNotEmpty()) {
+                directoryPool = directory.peers
+                directoryPoolNote = if (directory.fromCache) {
+                    "узлы взяты с диска этим устройством раньше"
+                } else {
+                    "каталог прочитан этим устройством только что"
+                }
+                lastDirectoryPoolAt = android.os.SystemClock.elapsedRealtime()
             }
             val candidateCatalog = withContext(Dispatchers.IO) {
                 if (directory.peers.isNotEmpty()) {
@@ -692,7 +987,7 @@ class NetworkDpiController(
             val toProbe = matching.take(MAX_PEER_PROBES_PER_SCAN)
 
             val probedMap = withContext(Dispatchers.IO) {
-                toProbe.chunked(16).flatMap { batch ->
+                toProbe.chunked(PROBE_BATCH_SIZE).flatMap { batch ->
                     batch.map { peer ->
                         async {
                             val res = networkEngine.probeRealYggdrasilPeer(
@@ -708,10 +1003,13 @@ class NetworkDpiController(
 
             val updatedCatalog = candidateCatalog.map { peer ->
                 val probe = probedMap[peer.endpointUri]
-                if (probe != null) {
-                    peer.copy(latencyMs = if (probe.reachable) probe.rttMs else -1)
+                // A ping this pass did not take is not shown as a ping. The pool now survives
+                // between scans, so a node that went quiet since last week would otherwise keep
+                // its green number at the top of the list forever.
+                if (probe != null && probe.reachable) {
+                    peer.copy(latencyMs = probe.rttMs)
                 } else {
-                    peer
+                    peer.copy(latencyMs = -1)
                 }
             }.sortedWith(
                 compareBy<DiscoveredYggPeer> { if (it.latencyMs > 0) 0 else 1 }
@@ -727,16 +1025,43 @@ class NetworkDpiController(
 
             val dropped = mutableListOf<String>().apply {
                 if (directory.skippedDown > 0) add("не отвечает каталогу: ${directory.skippedDown}")
-                if (directory.skippedStale > 0) add("не виден ${YggPeerScannerCatalog.freshWindowMs / 60000} мин: ${directory.skippedStale}")
+                if (directory.skippedStale > 0) add("не виден со времени снимка: ${directory.skippedStale}")
                 if (directory.skippedOldProtocol > 0) add("старый протокол: ${directory.skippedOldProtocol}")
             }
+            // The snapshot's own age and transport belong in the summary. Without compression the
+            // document is 181 KiB and stalls on a throttled uplink, and freshness is measured
+            // against the publisher's stamp — so "0 fresh nodes" can mean either a dead directory,
+            // a directory that stopped being regenerated, or a read that never completed.
+            val snapshotAgeMs = directory.snapshotAgeMs()
+            val transportPart = when {
+                directory.elapsedMs < 0L -> ""
+                directory.wireBytes > 0 ->
+                    " • прочитан ${directory.wireBytes} Б по сети за ${directory.elapsedMs} мс" +
+                        if (directory.contentEncoding.isBlank()) "" else " (${directory.contentEncoding})"
+                else -> " • прочитан за ${directory.elapsedMs} мс"
+            }
+            val snapshotPart = when {
+                directory.fromCache -> {
+                    val ageMs = directory.snapshotAgeMs()
+                    " • узлы взяты с диска" +
+                        if (ageMs < 0L) "" else " (снимку ${ageMs / 60000} мин)"
+                }
+                snapshotAgeMs < 0L -> " • снимок без штампа"
+                snapshotAgeMs > YggPeerScannerCatalog.snapshotTrustedMs ->
+                    " • снимку ${snapshotAgeMs / 60000} мин: каталог давно не перегенерировался"
+                else -> " • снимку ${snapshotAgeMs / 60000} мин"
+            }
+            val whitelistPool = directory.usableCount -
+                directory.peers.count { !it.whitelistCompatible }
             val directoryPart = when {
                 directory.errorDetail != null ->
                     "Каталог недоступен (${directory.errorDetail}), проверен упакованный список"
                 directory.peers.isEmpty() ->
-                    "Каталог вернул 0 свежих узлов из ${directory.reportedTotal}"
+                    "Каталог вернул 0 пригодных узлов из ${directory.reportedTotal}" +
+                        if (dropped.isEmpty()) "" else " • отброшено ${dropped.joinToString(" • ")}"
                 else ->
-                    "Каталог: ${directory.reportedTotal} узлов, свежих ${directory.usableCount}" +
+                    "Каталог: ${directory.reportedTotal} узлов, пригодных ${directory.usableCount} " +
+                        "(на 443: $whitelistPool)" +
                         if (dropped.isEmpty()) "" else " • отброшено ${dropped.joinToString(" • ")}"
             }
             val probePart = if (reachableInSelection.isNotEmpty()) {
@@ -745,7 +1070,7 @@ class NetworkDpiController(
             } else {
                 "из ${toProbe.size} проверенных не ответил ни один"
             }
-            val summary = "$directoryPart • $probePart" +
+            val summary = "$directoryPart$snapshotPart$transportPart • $probePart" +
                 (if (bestRtt != null) " • лучший пинг $bestRtt мс" else "")
 
             _peerScanner.update { state ->
@@ -877,4 +1202,43 @@ class NetworkDpiController(
     fun stop() {
         watchdogJob?.cancel()
     }
+}
+
+/** What one watchdog tick decided about the saved spares: whose grace clock to start, and what to delete. */
+internal data class WatchdogSpareDecision(
+    val prunePeerIds: List<String>,
+    val stampedSinceMs: Map<String, Long>
+)
+
+/**
+ * Split of the managed peer rows between "keep dialing" and "drop", pure so the restart case is
+ * testable - this is the only code in the app that deletes user-visible peers by itself.
+ *
+ * The grace clock lives in memory and the rows live in the database, so every row saved by an
+ * earlier process arrives without a stamp. Deleting on that signal would empty the reserve on the
+ * first tick of every start and then wait out the candidate refresh to refill it, so an unstamped
+ * row starts the window like a brand new one instead of ending it.
+ */
+internal fun classifyWatchdogSpares(
+    managed: List<YggPeerEntity>,
+    answered: (YggPeerEntity) -> Boolean,
+    sinceMs: Map<String, Long>,
+    nowMs: Long,
+    graceMs: Long
+): WatchdogSpareDecision {
+    val stamps = HashMap<String, Long>()
+    val doomed = mutableListOf<String>()
+    for (peer in managed) {
+        if (answered(peer)) {
+            stamps[peer.peerId] = nowMs
+            continue
+        }
+        val since = sinceMs[peer.peerId]
+        if (since == null || nowMs - since < graceMs) {
+            stamps[peer.peerId] = since ?: nowMs
+            continue
+        }
+        doomed.add(peer.peerId)
+    }
+    return WatchdogSpareDecision(doomed, stamps)
 }

@@ -53,6 +53,7 @@ import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddReaction
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Call
@@ -63,6 +64,7 @@ import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.automirrored.filled.Forward
 import androidx.compose.material.icons.filled.Groups
@@ -71,7 +73,10 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.NetworkCheck
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.QrCode2
@@ -155,6 +160,7 @@ import com.example.ui.theme.AmberShieldTertiary
 import com.example.ui.theme.CyberTealSecondary
 import com.example.ui.theme.EmeraldPrimary
 import com.example.viewmodel.YggGramUiState
+import com.example.viewmodel.rowPreviewText
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -196,6 +202,9 @@ fun ChatsScreen(
     onLeaveGroup: (String) -> Unit = {},
     onDeleteChat: (String) -> Unit = {},
     onToggleChatPin: (String) -> Unit = {},
+    onToggleChatMute: (String) -> Unit = {},
+    onToggleChatArchive: (String) -> Unit = {},
+    onRenameChat: (String, String) -> Unit = { _, _ -> },
     onClearChat: (String) -> Unit = {},
     onRunSendReceiveTest: (String?) -> Unit = {},
     onOpenSelfYggdrasilChat: (Boolean) -> Unit = {},
@@ -203,6 +212,7 @@ fun ChatsScreen(
     onDeleteMessage: (String, Boolean) -> Unit = { _, _ -> },
     onPingChatRoute: (String) -> Unit = {},
     onSetContactVerified: (String, Boolean) -> Unit = { _, _ -> },
+    onDraftChange: (String, String) -> Unit = { _, _ -> },
     onRestoreRejectedDraft: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -213,20 +223,17 @@ fun ChatsScreen(
 
     val filteredConversations = remember(conversations, uiState.searchQuery, uiState.selectedChatFilter) {
         conversations.filter { conv ->
-            val matchesQuery = uiState.searchQuery.isBlank() ||
-                conv.title.contains(uiState.searchQuery, ignoreCase = true) ||
-                conv.yggIpv6Address.contains(uiState.searchQuery, ignoreCase = true) ||
-                conv.publicKeyHex.contains(uiState.searchQuery, ignoreCase = true) ||
-                conv.peerHandle.contains(uiState.searchQuery, ignoreCase = true)
-
-            val matchesFilter = when (uiState.selectedChatFilter) {
-                "DIRECT" -> !conv.chatId.startsWith("chat_self_ygg_node")
-                "OFFLINE_SF" -> !conv.isOnlineInMesh || uiState.isOfflineStoreAndForwardMode
-                else -> true
-            }
-            matchesQuery && matchesFilter
+            conversationMatchesSearchQuery(conv, uiState.searchQuery) &&
+                conversationMatchesChatFilter(
+                    conv,
+                    uiState.selectedChatFilter,
+                    uiState.isOfflineStoreAndForwardMode
+                )
         }
     }
+
+    val archivedCount = remember(conversations) { conversations.count { it.isArchived } }
+    val activeChatsCount = remember(conversations) { conversations.count { !it.isArchived } }
 
     val activeConversation = remember(conversations, uiState.selectedChatId) {
         conversations.find { it.chatId == uiState.selectedChatId }
@@ -310,6 +317,11 @@ fun ChatsScreen(
                         onToggleOfflineMode = onToggleOfflineMode,
                         onDeleteChat = onDeleteChat,
                         onToggleChatPin = onToggleChatPin,
+                        onToggleChatMute = onToggleChatMute,
+                        onToggleChatArchive = onToggleChatArchive,
+                        onRenameChat = onRenameChat,
+                        archivedCount = archivedCount,
+                        allChatsCount = activeChatsCount,
                         onStartVoiceCall = onStartVoiceCall,
                         onOpenNewChatDialog = { showNewChatDialog = true },
                         onOpenQrModal = { tab ->
@@ -380,6 +392,7 @@ fun ChatsScreen(
                                 onRemoveGroupMember(activeConversation.chatId, ipv6)
                             },
                             onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
+                            onDraftChanged = { text -> onDraftChange(activeConversation.chatId, text) },
                             rejectedDraft = uiState.rejectedDraft
                                 ?.takeIf { it.first == activeConversation.chatId }?.second,
                             onRejectedDraftRestored = onRestoreRejectedDraft
@@ -450,6 +463,7 @@ fun ChatsScreen(
                     onSetGroupAvatar = { uri -> onSetGroupAvatar(activeConversation.chatId, uri) },
                     onRemoveGroupMember = { ipv6 -> onRemoveGroupMember(activeConversation.chatId, ipv6) },
                     onLeaveGroup = { onLeaveGroup(activeConversation.chatId) },
+                    onDraftChanged = { text -> onDraftChange(activeConversation.chatId, text) },
                     rejectedDraft = uiState.rejectedDraft
                         ?.takeIf { it.first == activeConversation.chatId }?.second,
                     onRejectedDraftRestored = onRestoreRejectedDraft
@@ -469,6 +483,11 @@ fun ChatsScreen(
                     onToggleOfflineMode = onToggleOfflineMode,
                     onDeleteChat = onDeleteChat,
                     onToggleChatPin = onToggleChatPin,
+                    onToggleChatMute = onToggleChatMute,
+                    onToggleChatArchive = onToggleChatArchive,
+                    onRenameChat = onRenameChat,
+                    archivedCount = archivedCount,
+                    allChatsCount = activeChatsCount,
                     onStartVoiceCall = onStartVoiceCall,
                     onOpenNewChatDialog = { showNewChatDialog = true },
                     onOpenQrModal = { tab ->
@@ -547,6 +566,11 @@ private fun ChatListPane(
     onToggleOfflineMode: () -> Unit,
     onDeleteChat: (String) -> Unit,
     onToggleChatPin: (String) -> Unit = {},
+    onToggleChatMute: (String) -> Unit = {},
+    onToggleChatArchive: (String) -> Unit = {},
+    onRenameChat: (String, String) -> Unit = { _, _ -> },
+    archivedCount: Int = 0,
+    allChatsCount: Int = 0,
     onStartVoiceCall: (String) -> Unit,
     onOpenNewChatDialog: () -> Unit,
     onOpenQrModal: (Int) -> Unit,
@@ -620,9 +644,12 @@ private fun ChatListPane(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         val filters = listOf(
-                            "ALL" to "Все (${conversations.size})",
+                            // Counted over the whole list, not over what this chip currently
+                            // shows: "Все (1)" while looking at the archive would be a lie.
+                            "ALL" to "Все ($allChatsCount)",
                             "DIRECT" to "Личные",
-                            "OFFLINE_SF" to "Очередь ($queuedOfflineCount)"
+                            "OFFLINE_SF" to "Очередь ($queuedOfflineCount)",
+                            "ARCHIVE" to "Архив ($archivedCount)"
                         )
                         filters.forEach { (key, label) ->
                             FilterChip(
@@ -705,7 +732,10 @@ private fun ChatListPane(
                         },
                         onClick = { onSelectChat(conv.chatId) },
                         onDelete = { onDeleteChat(conv.chatId) },
-                        onTogglePin = { onToggleChatPin(conv.chatId) }
+                        onTogglePin = { onToggleChatPin(conv.chatId) },
+                        onToggleMute = { onToggleChatMute(conv.chatId) },
+                        onToggleArchive = { onToggleChatArchive(conv.chatId) },
+                        onRename = { onRenameChat(conv.chatId, it) }
                     )
                 }
             }
@@ -1294,9 +1324,15 @@ private fun ConversationRowCard(
     groupMemberCount: Int = 0,
     onClick: () -> Unit,
     onDelete: () -> Unit,
-    onTogglePin: () -> Unit = {}
+    onTogglePin: () -> Unit = {},
+    onToggleMute: () -> Unit = {},
+    onToggleArchive: () -> Unit = {},
+    onRename: (String) -> Unit = {}
 ) {
     var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
+    var showActions by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
+    var showRename by rememberSaveable(conversation.chatId) { mutableStateOf(false) }
+    var renameDraft by rememberSaveable(conversation.chatId) { mutableStateOf("") }
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val isSelfChat = conversation.chatId == YggRepository.SELF_NODE_CHAT_ID
 
@@ -1397,6 +1433,30 @@ private fun ConversationRowCard(
                                 modifier = Modifier.size(14.dp)
                             )
                         }
+                        if (conversation.isMuted) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            // Silence is a local choice, not a delivery state: the badge says this
+                            // device asked not to be pinged, and nothing about the peer.
+                            Icon(
+                                Icons.Default.NotificationsOff,
+                                contentDescription = "Уведомления этого чата выключены",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .size(14.dp)
+                                    .testTag("conversation_muted_badge_${conversation.chatId}")
+                            )
+                        }
+                        if (conversation.isArchived) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                Icons.Default.Archive,
+                                contentDescription = "Чат в архиве",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .size(14.dp)
+                                    .testTag("conversation_archived_badge_${conversation.chatId}")
+                            )
+                        }
                         if (conversation.chatType == "GROUP") {
                             Spacer(modifier = Modifier.width(5.dp))
                             Icon(
@@ -1434,7 +1494,10 @@ private fun ConversationRowCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = conversation.lastMessagePreview,
+                        text = rowPreviewText(
+                            conversation.lastMessagePreview,
+                            conversation.draftText
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -1490,6 +1553,24 @@ private fun ConversationRowCard(
                             modifier = Modifier.size(16.dp)
                         )
                     }
+                    // One entry for the choices that are not destructive but are needed every day:
+                    // silence, archive, a name this device picks itself.
+                    IconButton(
+                        onClick = {
+                            renameDraft = conversation.title
+                            showActions = true
+                        },
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("chat_actions_icon_${conversation.chatId}")
+                    ) {
+                        Icon(
+                            Icons.Default.MoreVert,
+                            contentDescription = "Действия с чатом",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1513,6 +1594,125 @@ private fun ConversationRowCard(
             },
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Отмена")
+                }
+            }
+        )
+    }
+
+    if (showActions) {
+        AlertDialog(
+            onDismissRequest = { showActions = false },
+            title = { Text("Чат «${conversation.title}»") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = {
+                            showActions = false
+                            onTogglePin()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_action_pin_${conversation.chatId}")
+                    ) {
+                        Text(if (conversation.isPinned) "Открепить" else "Закрепить сверху")
+                    }
+                    TextButton(
+                        onClick = {
+                            showActions = false
+                            onToggleMute()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_action_mute_${conversation.chatId}")
+                    ) {
+                        Text(
+                            if (conversation.isMuted) "Включить уведомления" else "Выключить уведомления"
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            showActions = false
+                            onToggleArchive()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_action_archive_${conversation.chatId}")
+                    ) {
+                        Text(if (conversation.isArchived) "Вернуть из архива" else "Убрать в архив")
+                    }
+                    TextButton(
+                        onClick = {
+                            showActions = false
+                            showRename = true
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_action_rename_${conversation.chatId}")
+                    ) {
+                        Text(
+                            if (conversation.chatType == "GROUP") {
+                                "Переименовать группу (уходит участникам)"
+                            } else {
+                                "Переименовать контакт"
+                            }
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showActions = false }) {
+                    Text("Закрыть")
+                }
+            }
+        )
+    }
+
+    if (showRename) {
+        AlertDialog(
+            onDismissRequest = { showRename = false },
+            title = { Text("Новое имя") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = renameDraft,
+                        onValueChange = { renameDraft = it.take(80) },
+                        label = { Text("Название чата") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_rename_field_${conversation.chatId}")
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = if (conversation.chatType == "GROUP") {
+                            "Имя группы отправляется её участникам."
+                        } else {
+                            "Это имя остаётся на устройстве: собеседник о нём не узнает, и его " +
+                                "собственное название профиля перестанет его менять."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = renameDraft.trim()
+                        if (trimmed.isNotEmpty()) {
+                            showRename = false
+                            onRename(trimmed)
+                        }
+                    },
+                    modifier = Modifier.testTag("chat_rename_confirm_${conversation.chatId}")
+                ) {
+                    Text("Сохранить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRename = false }) {
                     Text("Отмена")
                 }
             }
@@ -1553,12 +1753,16 @@ private fun ChatDetailPane(
     onRemoveGroupMember: (String) -> Unit = {},
     onLeaveGroup: () -> Unit = {},
     rejectedDraft: String? = null,
+    onDraftChanged: (String) -> Unit = {},
     onRejectedDraftRestored: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
-    var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf("") }
+    // The draft on the row is what this chat had unsent when the owner last left it. Restoring it
+    // here is the difference between a half-written message surviving a rotation, a notification
+    // that opened another chat, and a process the system killed.
+    var messageInput by rememberSaveable(conversation.chatId) { mutableStateOf(conversation.draftText) }
     // A send that was refused never became a message, so its text goes back where it came from.
     LaunchedEffect(rejectedDraft) {
         if (!rejectedDraft.isNullOrBlank()) {
@@ -2505,6 +2709,7 @@ private fun ChatDetailPane(
                         value = messageInput,
                         onValueChange = { updated ->
                             messageInput = updated
+                            onDraftChanged(updated)
                             if (updated.isNotBlank()) onTyping()
                         },
                         modifier = Modifier

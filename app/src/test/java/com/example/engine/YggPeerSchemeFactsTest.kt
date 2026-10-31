@@ -135,7 +135,10 @@ class YggPeerSchemeFactsTest {
     @Test
     fun `summary names the transport the port and the name in the hello`() {
         val summary = YggPeerSchemeFacts.summaryRu("tls://95.217.35.148:443", "static-mon.yandex.net")
-        assertTrue(summary.startsWith("tls:// — TLS поверх TCP:443"))
+        assertTrue(summary.startsWith("tls:// — TLS поверх TCP • порт 443 •"))
         assertTrue(summary.contains("SNI есть"))
+        // The port must never glue onto the end of the description sentence.
+        val tcpSummary = YggPeerSchemeFacts.summaryRu("tcp://146.103.107.222:65535", "")
+        assertTrue(tcpSummary.contains("рукопожатие оверлея идёт открытым текстом • порт 65535"))
     }
 }
