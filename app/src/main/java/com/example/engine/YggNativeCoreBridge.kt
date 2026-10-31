@@ -60,8 +60,11 @@ object YggNativeCoreBridge {
     /**
      * One listen endpoint the core tried, with the result it got.
      *
-     * tls, wss and quic all want 443 and only the first one to bind keeps it, so the list is
-     * shown as attempts rather than as a set of active transports.
+     * Shown as attempts, not as a set of working transports: an app without root is refused
+     * on any port below 1024, and yggdrasil-go v0.5.14 has no WSS listener at all
+     * (src/core/link_wss.go answers "WSS listener not supported"), so that row carries the
+     * core's own refusal rather than a port someone else took. QUIC sits on UDP/443 and is
+     * therefore independent of the TCP/443 the TLS attempt wants.
      */
     data class CoreListener(
         val scheme: String,
@@ -290,6 +293,30 @@ object YggNativeCoreBridge {
     }
 
     /**
+     * The node keys this core holds an open encrypted session with, right now.
+     *
+     * The ironwood session is created only after the far side answers the session acknowledgement
+     * (see the overlay probe, which uses exactly this fact to prove a round trip), so a key in this
+     * list is not a socket to a port that answered TLS: the node on the other end of the overlay
+     * received our frame and replied. That makes it a stronger proof of presence than any timestamp
+     * this app stored earlier, and it costs nothing to read — the same peers query already carries
+     * the session table, with the keys hex-encoded by the core.
+     */
+    internal fun readOverlaySessionKeys(rawJson: String): Set<String> {
+        val sessions = try {
+            JSONObject(rawJson).optJSONArray("sessions")
+        } catch (_: Exception) {
+            null
+        } ?: return emptySet()
+        val result = HashSet<String>(sessions.length())
+        for (i in 0 until sessions.length()) {
+            val key = sessions.optJSONObject(i)?.optString("keyHex")?.trim()?.lowercase()
+            if (key != null && YggCryptoEngine.isEd25519Hex(key)) result.add(key)
+        }
+        return result
+    }
+
+    /**
      * The URI exactly as the Go core must receive it.
      *
      * yggdrasil reads `?sni=<hostname>` off the peer URI (src/core/link.go) and uses it
@@ -318,7 +345,7 @@ object YggNativeCoreBridge {
      * literal is exactly what RFC 6066 forbids as a server name, and Go drops it in
      * silence instead of refusing the dial.
      */
-    private fun isSniHostname(value: String): Boolean {
+    internal fun isSniHostname(value: String): Boolean {
         if (!value.matches(SNI_HOSTNAME)) return false
         return !value.split('.').all { it.toIntOrNull() != null }
     }
@@ -383,6 +410,18 @@ object YggNativeCoreBridge {
         val result = getPeersJson(profileId)
         if (!result.ok) return -1
         return readCoreConfirmedPeers(result.rawJson).size
+    }
+
+    /**
+     * Which nodes this profile's core can be addressed by right now, as lowercase hex keys.
+     *
+     * Empty when the core cannot be queried — the callers read an absent key as "no proof", which is
+     * the only reading a failed query can honestly support.
+     */
+    fun liveOverlaySessionKeys(profileId: String): Set<String> {
+        val result = getPeersJson(profileId)
+        if (!result.ok) return emptySet()
+        return readOverlaySessionKeys(result.rawJson)
     }
 
     /**

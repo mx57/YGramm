@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.provider.Settings
+import com.example.data.ConversationEntity
 import com.example.data.UserProfileEntity
 import com.example.update.ApkRelayRequest
 import com.example.update.YGrammPeerRelay
@@ -369,6 +370,12 @@ class YggTwinP2PBridge(
     private val onFileTransferProgress: suspend (FileTransferProgress) -> Unit = {},
     private val onReadReceiptReceived: suspend (chatId: String, wireMessageIds: List<String>) -> Unit = { _, _ -> },
     private val onTypingReceived: suspend (chatId: String, senderNodeLabel: String, senderIpv6: String) -> Unit = { _, _, _ -> },
+    /**
+     * A keep-alive PONG came back from the node behind this dialog: the path held and the frame
+     * opened here. It is presence evidence of exactly the same strength as a message — and no
+     * stronger, which is why the repository writes a timestamp and this callback never a delivery.
+     */
+    private val onPeerRouteHeld: suspend (chatId: String, rttMs: Long) -> Unit = { _, _ -> },
     private val onIncomingCallSignalReceived: suspend (IncomingCallSignalPacket) -> Unit = {},
     private val onCallAudioFrameReceived: suspend (IncomingCallAudioPacket) -> Unit = {},
     private val onProfileRelayPacketHandled: suspend (profileId: String, role: String) -> Unit = { _, _ -> },
@@ -403,6 +410,18 @@ class YggTwinP2PBridge(
     private val activeProfilePortMap = ConcurrentHashMap<String, Int>() // profileId -> bound port
     private val ipv6ToProfileIdMap = ConcurrentHashMap<String, String>() // yggIpv6.lowercase() -> profileId
     private val profileRelayRoleMap = ConcurrentHashMap<String, String>() // profileId -> nodeRelayRole
+
+    // Peers the overlay keep-alive may address, refreshed by the ViewModel from the chat table:
+    // profileId|nodeKey -> candidate. Kept in the bridge rather than read from the database here
+    // because this class never touches Room, and a timer that queried the database directly would
+    // be the one place in the engine that does.
+    private val keepAliveCandidates = ConcurrentHashMap<String, KeepAliveCandidate>()
+
+    // profileId|nodeKey -> what we remember of that peer's path. In-memory on purpose: the proof it
+    // holds is written to the database through the repository, and a restart legitimately forgets
+    // the streak and starts from the stored last-seen again.
+    private val keepAliveStates = ConcurrentHashMap<String, KeepAlivePeerState>()
+    private var keepAliveJob: Job? = null
 
     var localTcpPort: Int = 51921
         private set
@@ -841,6 +860,9 @@ class YggTwinP2PBridge(
                 if (coreWatchdogJob?.isActive != true) {
                     coreWatchdogJob = launch { coreWatchdogLoop() }
                 }
+                if (keepAliveJob?.isActive != true) {
+                    keepAliveJob = launch { overlayKeepAliveLoop() }
+                }
             }
 
             launch {
@@ -1181,6 +1203,24 @@ class YggTwinP2PBridge(
             if (mesh.available) best = maxOf(best, mesh.liveLinks)
         }
         return best
+    }
+
+    /**
+     * Endpoints the running nodes confirmed with a finished overlay handshake, as
+     * `endpoint (query stripped, lowercased) -> link latency in ms`.
+     *
+     * The autopilot needs this per endpoint rather than as a single count: «hold N links» is
+     * only an honest goal when the node can tell which of the peers it dials actually answered,
+     * so a spare that never confirmed can be dropped without touching a working link.
+     */
+    fun coreConfirmedEndpoints(): Map<String, Int> {
+        val merged = HashMap<String, Int>()
+        for (profileId in initializedNativeProfiles.toList()) {
+            val mesh = YggNativeCoreBridge.readMeshState(profileId)
+            if (!mesh.available) continue
+            mesh.livePeers.forEach { (endpoint, latency) -> merged[endpoint] = latency }
+        }
+        return merged
     }
 
     /**
@@ -1551,6 +1591,220 @@ class YggTwinP2PBridge(
             )
         }
         return result.ok
+    }
+
+    private fun keepAliveKey(profileId: String, nodeKeyHex: String): String =
+        "${profileId.trim()}|${nodeKeyHex.trim().lowercase()}"
+
+    /** This profile's own mesh address, for the frames a peer needs to answer in address form. */
+    private fun ownOverlayIpv6(profileId: String): String =
+        ipv6ToProfileIdMap.entries.firstOrNull { it.value == profileId }?.key ?: ""
+
+    /**
+     * What we remember of one peer's path: the longest-lived proof wins, because the candidate
+     * carries what the database says, [sessionProofAt] what the core's session table says about this
+     * very moment, and the stored state what this process has seen since.
+     */
+    private fun mergeProof(
+        stored: KeepAlivePeerState?,
+        candidate: KeepAliveCandidate,
+        sessionProofAt: Long = 0L,
+    ): KeepAlivePeerState {
+        val current = stored ?: KeepAlivePeerState()
+        val proof = maxOf(current.proofAt, candidate.proofAt, sessionProofAt)
+        return if (proof != current.proofAt) current.copy(proofAt = proof) else current
+    }
+
+    /**
+     * The chat table as the ViewModel last saw it, kept so the keep-alive can re-derive its own
+     * candidate list when the cores come up rather than only when a chat changes.
+     */
+    private var keepAliveConversations: List<ConversationEntity> = emptyList()
+
+    /** How many dialogs the journal was last told the keep-alive is holding. */
+    private var keepAliveWatchedCount = -1
+
+    /**
+     * Replaces the set of peers the keep-alive may address.
+     *
+     * The ViewModel owns the chat table and this class does not touch Room, so the list arrives from
+     * above on every change. Forgetting is keyed on the dialog disappearing, not on the profile being
+     * momentarily down: a core restart would otherwise wipe a silent peer's streak and start
+     * hammering it at the fast cadence again.
+     */
+    fun refreshOverlayKeepAlive(conversations: List<ConversationEntity>) {
+        keepAliveConversations = conversations
+        rebuildOverlayKeepAlive()
+    }
+
+    /**
+     * Recomputes who may be pinged from the last chat snapshot and the cores running right now.
+     *
+     * The filter reads [initializedNativeProfiles], which changes when a core starts — and on a quiet
+     * device the chat table emits once, long before any node is up. Deriving the list only from that
+     * emission left the keep-alive with no candidates forever, which is the difference between a
+     * feature that holds paths and one that is switched on.
+     */
+    private fun rebuildOverlayKeepAlive() {
+        val conversations = keepAliveConversations
+        val ownKeys = profileIdToPubKeyMap.values.map { it.trim().lowercase() }.filter { it.isNotBlank() }.toSet()
+        val fresh = keepAliveCandidates(conversations, initializedNativeProfiles.toSet(), ownKeys)
+        val stillChatted = keepAliveCandidates(
+            conversations,
+            conversations.map { it.ownerProfileId }.toSet(),
+            ownKeys
+        ).mapTo(HashSet()) { keepAliveKey(it.profileId, it.nodeKeyHex) }
+        keepAliveCandidates.keys.filterNot { it in stillChatted }.forEach {
+            keepAliveCandidates.remove(it)
+            keepAliveStates.remove(it)
+        }
+        fresh.forEach { keepAliveCandidates[keepAliveKey(it.profileId, it.nodeKeyHex)] = it }
+        val watched = keepAliveCandidates.size
+        if (watched != keepAliveWatchedCount) {
+            keepAliveWatchedCount = watched
+            // The journal answers the question the user actually has when a chat goes quiet: is this
+            // dialog one of the paths the node is holding, or is nothing being held at all. Said only
+            // when the number moves, so a stable mesh stays a quiet log.
+            logPacket(
+                direction = "SYS • KEEPALIVE",
+                summary = if (watched == 0) "Держание связи: ни один диал не под присмотром"
+                else "Держание связи: под присмотром $watched живых диалов",
+                details = if (watched == 0) "Ни одного прямого диалога на запущенном профиле — держать нечего"
+                else "Пинги идут не чаще одного на кадр каждые " +
+                    "${KEEPALIVE_TICK_MS / 1000} с, шаг на диал — " +
+                    "${keepAliveIntervalMs(0, proofAgeMs = 0L) / 1000} с",
+                // Whether the node is holding anyone's path at all is the first thing to know about a
+                // link that went quiet, and the screen journal is gone once the app is.
+                mirror = true
+            )
+        }
+    }
+
+    /** Any frame that opened from a peer we hold a path for counts as proof it is still there. */
+    private fun noteOverlayContact(profileId: String, nodeKeyHex: String) {
+        val key = keepAliveKey(profileId, nodeKeyHex)
+        val candidate = keepAliveCandidates[key] ?: return
+        keepAliveStates.compute(key) { _, stored ->
+            notePeerProof(mergeProof(stored, candidate), System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * Keeps the mesh path to live contacts warm.
+     *
+     * A ping is not a dial: no TCP connection is opened, no handshake is repeated, so the whitelist
+     * profile's rule about which peers may be handshaked does not reach it. What it does cost is one
+     * datagram over the links the node already holds — and when the route to that peer has aged out,
+     * the frame also starts a route search, which is the whole point of the feature and is also why a
+     * peer with no session, no route in the tree and no live link on its profile is skipped: with
+     * nothing to carry it, the search would be a broadcast into silence.
+     */
+    private suspend fun overlayKeepAliveLoop() {
+        while (true) {
+            delay(KEEPALIVE_TICK_MS)
+            currentCoroutineContext().ensureActive()
+            rebuildOverlayKeepAlive()
+            val now = System.currentTimeMillis()
+            val profiles = keepAliveCandidates.values.mapTo(HashSet()) { it.profileId }
+            val sessions = profiles.associateWith { YggNativeCoreBridge.liveOverlaySessionKeys(it) }
+            val livePeers = profiles.associateWith { YggNativeCoreBridge.livePeerCount(it) }
+            val due = keepAliveCandidates.values
+                .map { candidate ->
+                    val key = keepAliveKey(candidate.profileId, candidate.nodeKeyHex)
+                    val sessionAt = sessionProofAt(candidate, sessions, now)
+                    val stated = mergeProof(keepAliveStates[key], candidate, sessionAt)
+                    val pathAt = if (stated.proofAt > 0L) 0L else pathProofAt(candidate, now)
+                    val state = mergeProof(stated, candidate, pathAt)
+                    KeepAliveTarget(
+                        candidate = candidate,
+                        state = state,
+                        coreEvidence = sessionAt > 0L || pathAt > 0L,
+                        proofNote = when {
+                            sessionAt > 0L -> "сессия с узлом открыта"
+                            pathAt > 0L -> "путь к узлу в дереве ядра"
+                            state.proofAt > 0L -> "диал выходил на связь"
+                            else -> "доказательств нет: кадр ищет путь"
+                        }
+                    )
+                }
+                .filter { target ->
+                    planOverlayPing(
+                        target.candidate.nodeKeyHex,
+                        target.state,
+                        now
+                    ) == KeepAliveVerdict.PING
+                }
+                .sortedBy { it.state.lastPingSentAt }
+                .take(KEEPALIVE_MAX_PER_TICK)
+            for (target in due) {
+                val candidate = target.candidate
+                if (!target.coreEvidence && (livePeers[candidate.profileId] ?: 0) <= 0) continue
+                val key = keepAliveKey(candidate.profileId, candidate.nodeKeyHex)
+                val sentAt = System.currentTimeMillis()
+                val frame = encodeWireFrame(
+                    mapOf("type" to "PING", "sentAt" to sentAt.toString())
+                )
+                if (!sendOverlayFrame(candidate.profileId, candidate.nodeKeyHex, frame, "PING")) continue
+                val afterSend = keepAliveStates.compute(key) { _, stored ->
+                    notePingSent(mergeProof(stored, candidate, target.state.proofAt), sentAt)
+                }
+                val held = afterSend ?: target.state
+                logPacket(
+                    direction = "TX -> YGG",
+                    summary = "Держание связи: пин ноде ${candidate.nodeKeyHex.take(12)}...",
+                    details = "chat=${candidate.chatId.take(16)} • ${target.proofNote} • следующий через " +
+                        "${keepAliveIntervalMs(held.unanswered, sentAt - held.proofAt) / 1000} с • " +
+                        "ответ ещё не получен",
+                    // A quiet peer's route is decided by whether these frames are actually going out,
+                    // and the on-screen journal does not survive the process that wrote it.
+                    mirror = true
+                )
+            }
+        }
+    }
+
+    /** One dialog the keep-alive considered this tick, with what the core says proves it. */
+    private class KeepAliveTarget(
+        val candidate: KeepAliveCandidate,
+        val state: KeepAlivePeerState,
+        /** Whether the running core, not the database, is what makes this peer worth a frame. */
+        val coreEvidence: Boolean,
+        val proofNote: String,
+    )
+
+    /**
+     * The moment the core's routing tree proves this peer is present, or zero.
+     *
+     * ironwood installs a path to a key only when something on the far side of that key answered a
+     * search for it, so a live entry is the node's own signature and it outlives nothing else in this
+     * app: a dialog imported from a contact card, never opened, has no message to date it and no
+     * session to name it, yet its route is real and it is exactly the route the next message would
+     * otherwise have to search for again. Asked only of dialogs nothing else can prove, so the routing
+     * table is read once per unproved contact per tick instead of once per contact per second.
+     */
+    private fun pathProofAt(candidate: KeepAliveCandidate, nowMs: Long): Long =
+        if (YggNativeCoreBridge.hasOverlayRoute(candidate.profileId, candidate.nodeKeyHex) == true) {
+            nowMs
+        } else {
+            0L
+        }
+
+    /**
+     * The moment the core's session table proves this peer is present, or zero.
+     *
+     * An ironwood session exists only after the far node answered the session acknowledgement, so its
+     * key sitting in that table is the node itself saying "I am reachable" — worth more than the
+     * timestamp the database happens to hold, and it is the case the database can never cover: a
+     * contact whose route went cold before this app recorded anything about it.
+     */
+    private fun sessionProofAt(
+        candidate: KeepAliveCandidate,
+        sessions: Map<String, Set<String>>,
+        nowMs: Long,
+    ): Long {
+        val keys = sessions[candidate.profileId] ?: return 0L
+        val nodeKey = candidate.nodeKeyHex.trim().lowercase()
+        return if (nodeKey in keys) nowMs else 0L
     }
 
     /**
@@ -2701,6 +2955,7 @@ class YggTwinP2PBridge(
     private suspend fun handleOverlayFrame(profileId: String, payload: ByteArray, senderPubKeyHex: String) {
         val map = decodeWireFrame(String(payload, StandardCharsets.UTF_8))
         val senderIpv6 = map["senderIpv6"] ?: ""
+        noteOverlayContact(profileId, senderPubKeyHex)
         when (map["type"]) {
             "TYPING" -> {
                 onTwinReachableChanged(true)
@@ -2710,6 +2965,54 @@ class YggTwinP2PBridge(
                         chatId,
                         map["senderNodeLabel"]?.takeIf { it.isNotBlank() } ?: "Собеседник",
                         senderIpv6
+                    )
+                }
+            }
+            "PING" -> {
+                // Answering a keep-alive probe costs one datagram back to the node that just proved
+                // it can reach us, and a peer that never hears anything stretches its own interval and
+                // starts treating a working route as a dead one. Nothing here claims a message was
+                // delivered, and the reply carries no chat data.
+                onTwinReachableChanged(true)
+                val pong = encodeWireFrame(
+                    mapOf(
+                        "type" to "PONG",
+                        "sentAt" to (map["sentAt"] ?: ""),
+                        "senderIpv6" to ownOverlayIpv6(profileId)
+                    )
+                )
+                sendOverlayFrame(profileId, senderPubKeyHex, pong, "PONG")
+            }
+            "PONG" -> {
+                onTwinReachableChanged(true)
+                val key = keepAliveKey(profileId, senderPubKeyHex)
+                val rttMs = keepAliveRttMs(
+                    nowMs = System.currentTimeMillis(),
+                    echoedSentAtMs = map["sentAt"]?.toLongOrNull(),
+                    pendingSentAtMs = keepAliveStates[key]?.pendingSentAt
+                )
+                if (rttMs == null) {
+                    // A pong this device cannot tie to one of its own pings measured nothing. It
+                    // still proved the node can reach us, which the contact note above recorded, so
+                    // the journal says there is no number instead of printing an invented one.
+                    logPacket(
+                        direction = "RX <- YGG",
+                        summary = "PONG без нашего пина — задержка не измерена",
+                        details = "от ноды ${senderPubKeyHex.take(16)}..."
+                    )
+                } else {
+                    keepAliveStates.compute(key) { _, stored -> notePongReceived(stored ?: KeepAlivePeerState()) }
+                    // Resolved by the key the core authenticated, never by the address the frame
+                    // claims: a reply could name any dialog it liked, and presence is a fact about
+                    // one person. The measured delay stays out of the message-ACK budget too — a
+                    // ping's round trip says nothing about how long a stream's ACK should wait.
+                    val chatId = resolveIncomingDialogChatId(profileId, senderPubKeyHex, "")
+                    if (chatId != null) onPeerRouteHeld(chatId, rttMs)
+                    logPacket(
+                        direction = "RX <- YGG",
+                        summary = "Держание связи: путь до ноды жив, RTT ${rttMs} мс",
+                        details = "по PONG от ${senderPubKeyHex.take(16)}...",
+                        mirror = true
                     )
                 }
             }
@@ -3907,9 +4210,20 @@ class YggTwinP2PBridge(
                     val sslSocket = yggdrasilTlsSocketFactory.createSocket(rawSocket, host, port, true) as SSLSocket
                     sslSocket.soTimeout = timeoutMs
                     val effectiveSni = sniOverride?.takeIf { it.isNotBlank() } ?: host
+                    // The probe has to speak the same ClientHello the core will speak, or its
+                    // verdict is about a dial nobody makes. Go drops an IP literal from the SNI
+                    // extension per RFC 6066 and sends no server name; this stack used to put the
+                    // address in anyway, and a node that routes TLS by name answered the core's
+                    // hello while refusing the probe's - which read back as SSLHandshakeException
+                    // and cost the reserve a candidate that was reachable all along.
+                    val sniToSend = if (YggNativeCoreBridge.isSniHostname(effectiveSni)) {
+                        listOf(SNIHostName(effectiveSni))
+                    } else {
+                        emptyList()
+                    }
                     try {
                         val params = sslSocket.sslParameters ?: SSLParameters()
-                        params.serverNames = listOf(SNIHostName(effectiveSni))
+                        params.serverNames = sniToSend
                         sslSocket.sslParameters = params
                     } catch (_: Throwable) {
                     }
@@ -6020,6 +6334,12 @@ class YggTwinP2PBridge(
         listenersRequested = false
         tcpListenerJob?.cancel()
         tcpListenerJob = null
+        // The keep-alive is a timer, and a timer that outlives stop() would go on sending pings to
+        // nodes whose cores were just closed — traffic with no mesh left to carry it.
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+        keepAliveCandidates.clear()
+        keepAliveStates.clear()
         // The cover endpoints exist only to feed the running nodes; with them left bound, a
         // restarted bridge would keep loopback listeners nobody dials any more.
         YggCoverTransport.releaseAll()

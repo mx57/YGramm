@@ -98,10 +98,14 @@ interface YggDao {
     // Same reason as the avatar update above: an incoming profile frame has to rename the
     // dialog without re-saving the row, because the re-save path rebuilds the conversation from
     // a copy and drops whatever the writer never looked at.
+    // The CASE is what makes a local rename stick: the claimed handle, status and version always
+    // come through, while the visible name only follows the peer until this device named the
+    // chat by hand.
     @Query(
-        "UPDATE conversations SET title = :title, peerHandle = :peerHandle, " +
-            "peerStatusText = :peerStatusText, peerProfileVersion = :peerProfileVersion " +
-            "WHERE chatId = :chatId"
+        "UPDATE conversations SET " +
+            "title = CASE WHEN titleLockedByUser = 0 THEN :title ELSE title END, " +
+            "peerHandle = :peerHandle, peerStatusText = :peerStatusText, " +
+            "peerProfileVersion = :peerProfileVersion WHERE chatId = :chatId"
     )
     suspend fun updatePeerProfile(
         chatId: String,
@@ -121,6 +125,20 @@ interface YggDao {
     // must survive incoming frames that re-save the conversation row.
     @Query("UPDATE conversations SET isPinned = :pinned WHERE chatId = :chatId")
     suspend fun setConversationPinned(chatId: String, pinned: Boolean)
+
+    @Query("UPDATE conversations SET isMuted = :muted WHERE chatId = :chatId")
+    suspend fun setConversationMuted(chatId: String, muted: Boolean)
+
+    @Query("UPDATE conversations SET isArchived = :archived WHERE chatId = :chatId")
+    suspend fun setConversationArchived(chatId: String, archived: Boolean)
+
+    @Query("UPDATE conversations SET draftText = :draft WHERE chatId = :chatId")
+    suspend fun setConversationDraft(chatId: String, draft: String)
+
+    // Naming a contact is a local act, so it writes both the name and the flag that keeps a
+    // sender's own PROFILE frame from putting their claim back over it.
+    @Query("UPDATE conversations SET title = :title, titleLockedByUser = 1 WHERE chatId = :chatId")
+    suspend fun renameConversationLocally(chatId: String, title: String)
 
     @Query(
         "UPDATE ygg_profiles SET avatarUri = :avatarUri, avatarHashHex = :avatarHashHex, " +

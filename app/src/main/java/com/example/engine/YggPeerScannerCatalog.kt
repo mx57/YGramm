@@ -1,9 +1,12 @@
 // File: app/src/main/java/com/example/engine/YggPeerScannerCatalog.kt
 package com.example.engine
 
+import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
+import java.util.zip.GZIPInputStream
 import org.json.JSONObject
 
 data class CountryFilterOption(
@@ -35,9 +38,16 @@ data class DiscoveredYggPeer(
     // ranking only; the number the UI shows as ping is always the local socket measurement.
     val directoryRttMs: Int = -1
 ) {
-    /** Only a node the directory saw inside [windowMs] counts as fresh. */
-    fun freshWithin(windowMs: Long, nowMs: Long): Boolean =
-        lastSeenAtMs > 0L && nowMs - lastSeenAtMs <= windowMs
+    /**
+     * Only a node the directory saw inside [windowMs] of [referenceMs] counts as fresh.
+     *
+     * [referenceMs] is the moment the directory generated its snapshot, not the local clock: the
+     * publisher rewrites the whole document on its own schedule (measured: hourly), so every
+     * `last_seen` in a fresh document already sits 0–60 minutes behind "now" on the reader's
+     * clock. Comparing against "now" makes a 15-minute window reject a complete snapshot.
+     */
+    fun freshWithin(windowMs: Long, referenceMs: Long): Boolean =
+        lastSeenAtMs > 0L && referenceMs - lastSeenAtMs <= windowMs
 }
 
 /**
@@ -53,8 +63,27 @@ data class DirectoryFetch(
     val skippedStale: Int,
     val skippedOldProtocol: Int,
     val fetchedAtMs: Long,
-    val errorDetail: String? = null
-)
+    val errorDetail: String? = null,
+    // When the publisher generated this snapshot (max of the per-entry `updated`). The freshness
+    // of every entry is measured against it; 0 means the document did not say.
+    val snapshotUpdatedAtMs: Long = 0L,
+    // Bytes the socket actually carried (-1 = unknown) and bytes after decoding. Together they
+    // show whether compression was used: the same document costs 181 KiB plain or 15 KiB gzipped,
+    // and on a link that stalls a plain body that difference decides whether the scan has any
+    // candidates at all.
+    val wireBytes: Int = -1,
+    val decodedBytes: Int = -1,
+    val contentEncoding: String = "",
+    val elapsedMs: Long = -1L,
+    // True when these candidates come from the on-disk copy of a previous snapshot rather than
+    // from a read that just succeeded. The scan summary has to say so: a week-old list of nodes
+    // is a starting point for probes, not a claim that the directory is reachable from here.
+    val fromCache: Boolean = false
+) {
+    /** How old the snapshot itself is, or -1 when the publisher did not stamp it. */
+    fun snapshotAgeMs(nowMs: Long = System.currentTimeMillis()): Long =
+        if (snapshotUpdatedAtMs <= 0L) -1L else (nowMs - snapshotUpdatedAtMs).coerceAtLeast(0L)
+}
 
 object YggPeerScannerCatalog {
 
@@ -918,16 +947,35 @@ object YggPeerScannerCatalog {
         )
     ) + verifiedPublicPeers
 
-    /** A node the directory saw answering no longer than this ago is a scan candidate. */
+    /**
+     * A node the directory saw answering no longer than this before it generated the snapshot is
+     * a scan candidate. Measured against the snapshot, not against this device's clock — see
+     * [DiscoveredYggPeer.freshWithin].
+     */
     val freshWindowMs: Long = 15 * 60 * 1000L
+
+    /**
+     * How long a snapshot still counts as the current one. The publisher rewrites the document
+     * hourly (measured from its own `updated` stamp), so three cycles is the point where the
+     * list has to be called old instead of quietly treated as live.
+     */
+    val snapshotTrustedMs: Long = 3 * 60 * 60 * 1000L
 
     /**
      * Reads the live public-peer directory (publicpeers.neilalexander.dev/publicnodes.json)
      * over a real HTTPS connection. Only the transport lives here; every judgement about which
      * node is worth a socket is in [parseDirectorySnapshot].
+     *
+     * The gzip request is the reason this path works on a throttling uplink at all. Measured
+     * against the live server: the same document arrives as 15508 bytes in 0.34 s when the client
+     * asks for gzip, while an uncompressed read of 181644 bytes had stalled at ~25 KB after 150 s
+     * and left every scan falling back to the shipped catalog — that is the scanner that
+     * "stopped finding peers". Android's own stack decodes gzip transparently only when the
+     * request leaves Accept-Encoding alone, so the header is set here and the decoding is done
+     * here too.
      */
     fun fetchLivePublicPeersFromDirectory(
-        timeoutMs: Int = 5000,
+        timeoutMs: Int = 8000,
         freshnessWindowMs: Long = freshWindowMs,
         nowMs: Long = System.currentTimeMillis()
     ): DirectoryFetch {
@@ -949,16 +997,37 @@ object YggPeerScannerCatalog {
                 readTimeout = timeoutMs
                 requestMethod = "GET"
                 setRequestProperty("User-Agent", "Ygramm-Android/1.7 (Yggdrasil-Mesh-Client)")
+                setRequestProperty("Accept-Encoding", "gzip")
             }
         } catch (e: Exception) {
             return failure("${e.javaClass.simpleName}: ${e.message}")
         }
 
+        val startedAtMs = System.currentTimeMillis()
         try {
             val status = connection.responseCode
             if (status != HttpURLConnection.HTTP_OK) return failure("HTTP $status")
-            val rawJson = connection.inputStream.bufferedReader().use { it.readText() }
-            return parseDirectorySnapshot(rawJson, nowMs, freshnessWindowMs)
+            val encoding = connection.contentEncoding.orEmpty()
+            val body = readCapped(
+                if (encoding.contains("gzip", ignoreCase = true)) {
+                    GZIPInputStream(connection.inputStream)
+                } else {
+                    connection.inputStream
+                },
+                maxDecodedBytes = MAX_DIRECTORY_BODY_BYTES
+            )
+            val elapsedMs = System.currentTimeMillis() - startedAtMs
+            val parsed = parseDirectorySnapshot(
+                rawJson = String(body, Charsets.UTF_8),
+                nowMs = nowMs,
+                freshnessWindowMs = freshnessWindowMs
+            )
+            return parsed.copy(
+                wireBytes = connection.contentLength,
+                decodedBytes = body.size,
+                contentEncoding = encoding,
+                elapsedMs = elapsedMs
+            )
         } catch (e: Exception) {
             return failure("${e.javaClass.simpleName}: ${e.message}")
         } finally {
@@ -968,11 +1037,20 @@ object YggPeerScannerCatalog {
 
     /**
      * Keeps the endpoints a public directory still reports as up, on the current wire protocol,
-     * and seen inside [freshnessWindowMs], ordered freshest-first.
+     * and seen inside [freshnessWindowMs] of the moment that snapshot was generated, ordered
+     * freshest-first.
      *
      * That is what makes a scan find nodes that are actually reachable: the directory publishes
      * `up`, `last_seen`, `proto_minor` and its own `response_ms` per entry, so a node three
      * weeks stale or still speaking an older protocol is dropped before any socket is opened.
+     *
+     * Freshness is measured against the publisher's own stamp (`updated`), not against this
+     * device's clock, because the document is regenerated on the publisher's schedule. Measured
+     * on a live snapshot: the publisher stamped it at 06:00:01, the freshest `last_seen` was
+     * 06:02:22, and the read happened at 06:37 — an absolute 15-minute window therefore rejected
+     * all 217 nodes the directory reported as up and current, which is a scanner that finds
+     * nothing on a correctly working network.
+     *
      * None of it is a claim that "this" device reached the node — the result only ranks probe
      * candidates, and the ping shown in the UI always comes from the local probe.
      */
@@ -985,7 +1063,10 @@ object YggPeerScannerCatalog {
         var skippedDown = 0
         var skippedOldProtocol = 0
         var skippedStale = 0
-        val discovered = mutableListOf<DiscoveredYggPeer>()
+        var snapshotUpdatedAtMs = 0L
+        // Entries that passed the up/protocol filters; freshness needs the publisher's stamp,
+        // which is only known once the whole document has been read.
+        val candidates = mutableListOf<DiscoveredYggPeer>()
         val root = JSONObject(rawJson)
         val countryKeys = root.keys()
         while (countryKeys.hasNext()) {
@@ -1013,11 +1094,9 @@ object YggPeerScannerCatalog {
                     skippedOldProtocol++
                     continue
                 }
+                val updatedMs = meta.optLong("updated", 0L) * 1000L
+                if (updatedMs > snapshotUpdatedAtMs) snapshotUpdatedAtMs = updatedMs
                 val lastSeenMs = meta.optLong("last_seen", 0L) * 1000L
-                if (lastSeenMs <= 0L || nowMs - lastSeenMs > freshnessWindowMs) {
-                    skippedStale++
-                    continue
-                }
 
                 val host = extractHostFromUri(endpointUri)
                 val port = extractPortFromUri(endpointUri)
@@ -1030,7 +1109,7 @@ object YggPeerScannerCatalog {
                 }
                 val nodeKey = meta.optString("key", "").trim().lowercase()
 
-                discovered.add(
+                candidates.add(
                     DiscoveredYggPeer(
                         id = "live_${code.lowercase()}_${endpointUri.hashCode().toUInt()}",
                         countryCode = code,
@@ -1051,7 +1130,11 @@ object YggPeerScannerCatalog {
             }
         }
 
-        val ordered = discovered
+        val referenceMs = if (snapshotUpdatedAtMs > 0L) snapshotUpdatedAtMs else nowMs
+        val fresh = candidates.filter { it.freshWithin(freshnessWindowMs, referenceMs) }
+        skippedStale = candidates.size - fresh.size
+
+        val ordered = fresh
             .distinctBy { it.endpointUri.lowercase() }
             .sortedWith(
                 // Freshest first; within one sighting, the directory's own RTT as the tie-break.
@@ -1065,9 +1148,35 @@ object YggPeerScannerCatalog {
             skippedDown = skippedDown,
             skippedStale = skippedStale,
             skippedOldProtocol = skippedOldProtocol,
-            fetchedAtMs = nowMs
+            fetchedAtMs = nowMs,
+            snapshotUpdatedAtMs = snapshotUpdatedAtMs
         )
     }
+
+    /**
+     * Reads a socket body up to a hard cap. The cap exists because the only thing a truncated
+     * directory document produces is a JSON parse error that hides the real reason — a stalled
+     * or oversized transfer — behind "Scanner found 0 peers".
+     */
+    private fun readCapped(input: InputStream, maxDecodedBytes: Int): ByteArray {
+        input.use { stream ->
+            val out = java.io.ByteArrayOutputStream(64 * 1024)
+            val buffer = ByteArray(16 * 1024)
+            var total = 0
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > maxDecodedBytes) {
+                    throw IOException("снимок каталога превысил ${maxDecodedBytes / 1024} КиБ")
+                }
+                out.write(buffer, 0, read)
+            }
+            return out.toByteArray()
+        }
+    }
+
+    private const val MAX_DIRECTORY_BODY_BYTES = 2 * 1024 * 1024
 
     /**
      * Human-readable age of the directory's last sighting, in Russian and without pretending

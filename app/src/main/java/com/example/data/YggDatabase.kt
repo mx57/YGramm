@@ -28,7 +28,7 @@ import java.io.FileInputStream
         GroupMemberEntity::class,
         MessageDeletionEntity::class
     ],
-    version = 16,
+    version = 17,
     exportSchema = false
 )
 abstract class YggDatabase : RoomDatabase() {
@@ -231,6 +231,17 @@ abstract class YggDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE conversations ADD COLUMN isMuted INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE conversations ADD COLUMN isArchived INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE conversations ADD COLUMN draftText TEXT NOT NULL DEFAULT ''")
+                db.execSQL(
+                    "ALTER TABLE conversations ADD COLUMN titleLockedByUser INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         fun getInstance(context: Context): YggDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: buildEncrypted(context.applicationContext).also { INSTANCE = it }
@@ -257,7 +268,7 @@ abstract class YggDatabase : RoomDatabase() {
                 .addMigrations(
                     MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10,
                     MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14,
-                    MIGRATION_14_15, MIGRATION_15_16
+                    MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17
                 )
                 .openHelperFactory(SupportOpenHelperFactory(passphrase))
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)

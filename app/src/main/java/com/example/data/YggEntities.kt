@@ -87,7 +87,19 @@ data class ConversationEntity(
     val peerVoiceOpusProven: Boolean = false,
     // The user's own ordering choice for the chat list. Purely local: never leaves this device
     // and says nothing about the peer.
-    val isPinned: Boolean = false
+    val isPinned: Boolean = false,
+    // Local-only chat conveniences. None of them travel on the wire: a peer cannot tell whether
+    // this device muted, archived or renamed the dialog, and nothing here changes what gets
+    // delivered - muted still stores the message and still counts as unread.
+    val isMuted: Boolean = false,
+    val isArchived: Boolean = false,
+    // Text typed into the composer and not sent yet. Kept per chat so leaving the screen or
+    // losing the process does not swallow a message being written.
+    val draftText: String = "",
+    // True once the owner named this chat by hand. A PROFILE frame carries the sender's own claim
+    // about their name and still updates the claimed fields below, but it must not overwrite a
+    // name this device chose - otherwise a rename survives exactly until the next message.
+    val titleLockedByUser: Boolean = false
 )
 
 @Entity(

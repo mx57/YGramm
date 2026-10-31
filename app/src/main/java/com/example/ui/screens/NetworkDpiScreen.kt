@@ -148,6 +148,7 @@ fun NetworkDpiScreen(
 
     val cfg = uiState.antiDpiConfig
     val scanner = uiState.peerScanner
+    val autopilot = uiState.autopilot
     val connectedPeersCount = peers.count { it.isConnected }
     // The Go core is the authority on connectivity: the Kotlin scanner only sees
     // TCP/TLS reachability of the peer list, the core knows the live public links.
@@ -435,9 +436,11 @@ fun NetworkDpiScreen(
                                         EmeraldPrimary
                                     }
                                 )
-                                // What the node itself reports as bound. tls, wss and quic all
-                                // want 443, so a scheme that lost the port is shown refused
-                                // rather than silently missing from the list.
+                                // What the node itself reports as bound, attempt by attempt. The
+                                // core has no WSS listener (link_wss.go in v0.5.14) and an
+                                // unprivileged app is refused below port 1024, so a scheme that
+                                // did not bind is shown with the kernel's reason instead of
+                                // silently missing from the list.
                                 coreMesh.listeners.forEach { listener ->
                                     Text(
                                         text = listener.describeRu(),
@@ -457,6 +460,25 @@ fun NetworkDpiScreen(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                                // The last spare-node pass, kept after its banner faded. One link
+                                // with no explanation looks the same as a watchdog that stopped,
+                                // and the difference is the whole question this card answers.
+                                if (autopilot.lastPassSummary.isNotBlank()) {
+                                    Text(
+                                        text = autopilot.lastPassSummary,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier
+                                            .padding(top = 6.dp)
+                                            .testTag("autopilot_last_pass")
+                                    )
+                                    Text(
+                                        text = "Проход в ${rememberClockAndAge(autopilot.lastPassAtMs)} • " +
+                                            "пул кандидатов: ${autopilot.poolSize} (${autopilot.poolNote})",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                                 if (cfg.isProbingRoutes) {
                                     Spacer(modifier = Modifier.height(8.dp))
                                     LinearProgressIndicator(
@@ -1704,6 +1726,7 @@ private fun SimpleNetworkShieldContent(
     onSwitchToExpertMode: () -> Unit
 ) {
     val cfg = uiState.antiDpiConfig
+    val autopilot = uiState.autopilot
     val isOnline = uiState.isNetworkAvailable && !uiState.isAirplaneModeOn
     val hasOverlayLink = isOnline && liveRoutes > 0
     val activePeer = peers.firstOrNull { it.isConnected }
@@ -1796,7 +1819,19 @@ private fun SimpleNetworkShieldContent(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (hasOverlayLink) EmeraldPrimary else if (!isOnline) AmberShieldTertiary else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                            }
+                                // What the autopilot is doing about the link count, in the mode
+                                // the user actually leaves the app in. «Поиск стабильного узла»
+                                // with no pass behind it would otherwise look like progress.
+                                if (autopilot.lastPassSummary.isNotBlank()) {
+                                    Text(
+                                        text = autopilot.lastPassSummary,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("autopilot_shield_line")
+                                    )
+                                }                            }
                         }
 
                         // Status Badge
@@ -2069,10 +2104,13 @@ private fun SimpleNetworkShieldContent(
                     )
 
                     Text(
-                        text = "Работает: подмена SNI в реальном TLS-рукопожатии и транспорт wss:// на 443.\n" +
+                        text = "Работает: подмена SNI в реальном TLS-рукопожатии.\n" +
                             "Замерено на проводе: hello маски - 512 байт с server_name и ALPN h2,http/1.1, " +
                             "тогда как рукопожатие ядра идёт без обоих. Принимает ли сеть замаскированное " +
                             "соединение - зависит от пира, это и показывает проверка ниже.\n" +
+                            "Схема wss://: ядро v0.5.14 умеет только набирать её на 443, маска к WebSocket не " +
+                            "применяется, а входящего слушателя WSS в ядре нет. Линка по wss на этом устройстве " +
+                            "подтверждено не было.\n" +
                             "Не реализовано: uTLS-фингерпринт, VLESS Reality, ShadowTLS v3, padding QUIC, DHT BEP-44.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -2258,6 +2296,13 @@ private fun SimpleNetworkShieldContent(
  */
 @Composable
 private fun rememberFilterAgeLabel(measuredAtMs: Long): String {
+    if (measuredAtMs <= 0L) return "Время измерения не записано"
+    return "Измерено в ${rememberClockAndAge(measuredAtMs)}"
+}
+
+/** Wall clock of a past event plus how long ago it was, reticking while the screen is open. */
+@Composable
+private fun rememberClockAndAge(atMs: Long): String {
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -2265,13 +2310,12 @@ private fun rememberFilterAgeLabel(measuredAtMs: Long): String {
             nowMs = System.currentTimeMillis()
         }
     }
-    if (measuredAtMs <= 0L) return "Время измерения не записано"
-    val minutes = ((nowMs - measuredAtMs) / 60_000L).coerceAtLeast(0L)
-    val clock = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(measuredAtMs))
+    val minutes = ((nowMs - atMs) / 60_000L).coerceAtLeast(0L)
+    val clock = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(atMs))
     val age = when {
         minutes < 1 -> "только что"
         minutes < 60 -> "$minutes мин назад"
         else -> "${minutes / 60} ч назад"
     }
-    return "Измерено в $clock • $age"
+    return "$clock • $age"
 }

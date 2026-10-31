@@ -1262,6 +1262,18 @@ class YggRepository(
         return true
     }
 
+    /**
+     * A keep-alive PONG came back from this peer's node.
+     *
+     * Presence has one source in this app — [ConversationEntity.peerLastSeenAt] — and a pong is as
+     * good evidence of it as a message: this device really reached the node and its frame opened
+     * here. Nothing about a message is claimed, because none was sent.
+     */
+    suspend fun markPeerRouteHeld(chatId: String) {
+        if (isSelfChatId(chatId)) return
+        dao.updatePeerLastSeen(chatId, System.currentTimeMillis())
+    }
+
     suspend fun conversationHasEndToEndKey(chatId: String): Boolean =
         dao.getConversationById(chatId)?.let { resolveSealingKeys(it) != null } ?: false
 
@@ -2346,6 +2358,36 @@ class YggRepository(
 
     suspend fun setConversationPinned(chatId: String, pinned: Boolean) {
         dao.setConversationPinned(chatId, pinned)
+    }
+
+    suspend fun setConversationMuted(chatId: String, muted: Boolean) {
+        if (chatId.isNotBlank()) dao.setConversationMuted(chatId, muted)
+    }
+
+    suspend fun setConversationArchived(chatId: String, archived: Boolean) {
+        if (chatId.isNotBlank()) dao.setConversationArchived(chatId, archived)
+    }
+
+    suspend fun setConversationDraft(chatId: String, draft: String) {
+        if (chatId.isNotBlank()) dao.setConversationDraft(chatId, draft)
+    }
+
+    /**
+     * Names a dialog on this device only.
+     *
+     * [YggDao.renameConversationLocally] also locks the title, because the peer keeps sending
+     * their own claim of what they are called: without the lock the next PROFILE frame renames the
+     * chat back and the user's choice lasts exactly as long as the gap between messages. The
+     * claimed handle and status still arrive unchanged - a local name is a label, not a denial of
+     * what the other side says about themselves.
+     */
+    suspend fun renameConversation(chatId: String, newTitle: String): Boolean {
+        val title = newTitle.trim().take(80)
+        if (title.isEmpty()) return false
+        val conv = dao.getConversationById(chatId) ?: return false
+        if (conv.title == title) return false
+        dao.renameConversationLocally(chatId, title)
+        return true
     }
 
     suspend fun createNewConversation(
