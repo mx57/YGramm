@@ -1439,7 +1439,7 @@ private fun ConversationRowCard(
                             // device asked not to be pinged, and nothing about the peer.
                             Icon(
                                 Icons.Default.NotificationsOff,
-                                contentDescription = "Уведомления этого чата выключены",
+                                contentDescription = "Уведомления и звонки этого чата выключены",
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier
                                     .size(14.dp)
@@ -1627,7 +1627,8 @@ private fun ConversationRowCard(
                             .testTag("chat_action_mute_${conversation.chatId}")
                     ) {
                         Text(
-                            if (conversation.isMuted) "Включить уведомления" else "Выключить уведомления"
+                            if (conversation.isMuted) "Включить уведомления и звонки"
+                            else "Выключить уведомления и звонки"
                         )
                     }
                     TextButton(
