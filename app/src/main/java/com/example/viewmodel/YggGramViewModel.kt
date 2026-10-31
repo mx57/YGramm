@@ -2024,11 +2024,13 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Silences one chat's popups and system notifications on this device.
+     * Silences one chat's popups, system notifications and incoming calls on this device.
      *
      * Delivery is untouched: the message still arrives, is stored and still counts as unread. A
      * mute that quietly dropped traffic would look like the peer had stopped writing, which is the
-     * opposite of what this app promises.
+     * opposite of what this app promises. A call is the same choice one level louder, so a muted
+     * dialog answers its RINGING with DECLINE — the caller learns the call was refused instead of
+     * waiting out a timeout on a phone that was never going to ring.
      */
     fun toggleChatMute(chatId: String) {
         viewModelScope.launch {
@@ -2037,9 +2039,10 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update {
                 it.copy(
                     statusBannerMessage = if (targetConv.isMuted) {
-                        "Чат «${targetConv.title}» снова звуковой: уведомления включены"
+                        "Чат «${targetConv.title}» снова звуковой: уведомления и звонки включены"
                     } else {
-                        "Чат «${targetConv.title}» без уведомлений: сообщения приходят и остаются в непрочитанных"
+                        "Чат «${targetConv.title}» без уведомлений: сообщения приходят и остаются " +
+                            "в непрочитанных, входящий звонок отклоняется без вызова"
                     }
                 )
             }
@@ -3851,10 +3854,23 @@ class YggGramViewModel(application: Application) : AndroidViewModel(application)
             peerX25519PublicKeyHex = callSig.senderX25519PubKeyHex,
             peerEd25519PublicKeyHex = callSig.senderNodePubKeyHex
         )
+        val ringingConversation = repository.getConversation(conversationChatId)
         if (isX25519KeyHex(callSig.senderX25519PubKeyHex)) {
-            repository.getConversation(conversationChatId)?.let {
+            ringingConversation?.let {
                 repository.pinConversationPeerX25519PublicKey(it, callSig.senderX25519PubKeyHex)
             }
+        }
+        // A muted dialog never rings: the owner asked for silence from this contact, and an
+        // incoming call is the loudest thing the app can do. Muting stays a choice about noise,
+        // never about delivery — the caller's RINGING was ACKed on the wire, so this answers it
+        // with DECLINE instead of letting them wait on a phone that stayed quiet, and the refused
+        // call stays in this dialog's call log.
+        if (ringingConversation?.isMuted == true) {
+            rejectUnringableCall(
+                callSig, targetProfile, conversationChatId,
+                "у этого диалога выключены уведомления"
+            )
+            return
         }
 
         val profileWords = targetProfile.mnemonicCsv.split(" ").filter { it.isNotBlank() }
