@@ -1,10 +1,15 @@
 package com.example.engine
 
+import java.io.IOException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.security.SecureRandom
 import java.util.concurrent.Executors
 
 /**
@@ -302,5 +307,222 @@ object YggNetworkFilterProbe {
             }
             else -> "часть адресов отклоняется при установлении соединения, часть рвётся после первых байт"
         }
+    }
+
+    // --- UDP/443: the same question, asked of the path quic:// peers actually ride. ---
+
+    /** What one UDP reference did. The four cases are not interchangeable as evidence. */
+    enum class UdpOutcome(val labelRu: String) {
+        /** A datagram came back: this network carries UDP to 443 and the answer finds its way home. */
+        ANSWERED("адрес ответил по UDP"),
+
+        /**
+         * ICMP port unreachable. Ugly looking, but it is the second-strongest proof there is: the
+         * datagram reached the far host and its reply reached this socket, so the path carries UDP
+         * even though nothing was listening on that port.
+         */
+        NO_LISTENER("вернулась ICMP-недоступность порта"),
+
+        /** Nothing at all within the timeout - the case this probe cannot interpret alone. */
+        SILENT("тишина до таймаута"),
+
+        /** The socket itself refused to send or receive on this device. */
+        FAILED("отправка UDP не удалась на устройстве")
+    }
+
+    enum class UdpVerdict(val labelRu: String, val carriesUdp: Boolean) {
+        ANSWERED("UDP/443 проходит, адрес отвечает", carriesUdp = true),
+        PATH_OPEN("UDP/443 проходит, слушателя на порту нет", carriesUdp = true),
+        SILENT("UDP/443 молчит", carriesUdp = false),
+        LOCAL_FAILURE("UDP не проходит на этом устройстве", carriesUdp = false),
+        NOT_MEASURED("UDP не измерялся", carriesUdp = false)
+    }
+
+    /**
+     * A UDP reference plus the identity its TLS hello should name.
+     *
+     * A QUIC server that has no reason to answer a hello for an unknown name is not evidence about
+     * the network, so the probe targets endpoints that publicly serve HTTP/3 on 443/udp and asks
+     * for that ALPN. Whether they answer from this link is precisely the unknown being measured.
+     */
+    data class UdpReference(
+        val label: String,
+        val host: String,
+        val port: Int,
+        val serverName: String,
+        val alpn: String
+    )
+
+    data class UdpObservation(val outcome: UdpOutcome, val replyBytes: Int, val detail: String)
+
+    data class UdpProbe(
+        val reference: UdpReference,
+        val outcome: UdpOutcome,
+        val replyBytes: Int,
+        val elapsedMs: Long,
+        val detail: String
+    )
+
+    data class UdpReport(
+        val verdict: UdpVerdict,
+        val summary: String,
+        val probes: List<UdpProbe>,
+        val measuredAtMs: Long = System.currentTimeMillis()
+    )
+
+    internal const val UDP_TIMEOUT_MS = 2000
+
+    /**
+     * Literal addresses only: resolving a name here would mix a DNS question into a UDP question,
+     * and the TCP half of this probe already measures DNS separately.
+     */
+    internal val udpReferences = listOf(
+        UdpReference("Google (UDP/443)", "8.8.8.8", 443, "www.google.com", "h3"),
+        UdpReference("Cloudflare (UDP/443)", "1.1.1.1", 443, "cloudflare.com", "h3"),
+        UdpReference("Quad9 (UDP/443)", "9.9.9.9", 443, "dns.quad9.net", "h3")
+    )
+
+    /** Opened for tests: sends one datagram and reports what, if anything, came back. */
+    internal var udpQuerier: (UdpReference, ByteArray, Int) -> UdpObservation =
+        { reference, packet, timeoutMs -> queryUdp(reference, packet, timeoutMs) }
+
+    fun probeUdp(): UdpReport {
+        val pool = Executors.newFixedThreadPool(udpReferences.size)
+        val probes = try {
+            pool.invokeAll(
+                udpReferences.map { reference ->
+                    java.util.concurrent.Callable { probeUdpOne(reference) }
+                }
+            ).map { it.get() }
+        } finally {
+            pool.shutdown()
+        }
+        val verdict = classifyUdp(probes)
+        return UdpReport(verdict, udpSummary(verdict, probes), probes)
+    }
+
+    private fun probeUdpOne(reference: UdpReference): UdpProbe {
+        // A fresh connection id per probe: the Initial keys come from it, and reusing one would
+        // make every measurement look like a retransmit of the same connection to the same server.
+        val connectionId = randomBytes(8)
+        val packet = YggQuicInitial.build(
+            destinationConnectionId = connectionId,
+            sourceConnectionId = ByteArray(0),
+            packetNumber = 0,
+            clientHello = YggQuicInitial.clientHello(
+                serverName = reference.serverName,
+                alpn = reference.alpn,
+                keySharePublic = randomBytes(32)
+            )
+        )
+        val startedAt = System.nanoTime()
+        val observation = try {
+            udpQuerier(reference, packet, UDP_TIMEOUT_MS)
+        } catch (e: Throwable) {
+            UdpObservation(UdpOutcome.FAILED, 0, "${e.javaClass.simpleName} • ${e.message ?: "без сообщения"}")
+        }
+        return UdpProbe(
+            reference,
+            observation.outcome,
+            observation.replyBytes,
+            (System.nanoTime() - startedAt) / 1_000_000L,
+            observation.detail
+        )
+    }
+
+    private fun queryUdp(reference: UdpReference, packet: ByteArray, timeoutMs: Int): UdpObservation =
+        try {
+            DatagramSocket().use { socket ->
+                socket.soTimeout = timeoutMs
+                val address = InetAddress.getByName(reference.host)
+                // Connected on purpose: an unconnected UDP socket drops the ICMP error for a
+                // destination this app never sent to, while a connected one reports ECONNREFUSED
+                // back to receive() - which is the difference between "no listener" and "no answer".
+                socket.connect(address, reference.port)
+                socket.send(DatagramPacket(packet, packet.size))
+                val buffer = ByteArray(2048)
+                val reply = DatagramPacket(buffer, buffer.size)
+                socket.receive(reply)
+                UdpObservation(
+                    UdpOutcome.ANSWERED,
+                    reply.length,
+                    "ответ ${reply.length} байт от ${reference.host}:${reference.port}"
+                )
+            }
+        } catch (e: SocketTimeoutException) {
+            UdpObservation(UdpOutcome.SILENT, 0, "за ${timeoutMs} мс не вернулось ничего")
+        } catch (e: IOException) {
+            // Android spells these as "send failed: ECONNREFUSED (Connection refused)" and older
+            // API levels have no PortUnreachableException at all, so the mechanism is read off the
+            // text rather than off a class the device may not ship.
+            val text = (e.javaClass.simpleName + " " + (e.message ?: "")).lowercase()
+            val portRefused = text.contains("portunreachable") || text.contains("econnrefused") ||
+                text.contains("connection refused") || text.contains("port unreachable")
+            if (portRefused) {
+                UdpObservation(UdpOutcome.NO_LISTENER, 0, "${e.javaClass.simpleName} • ${e.message ?: ""}")
+            } else {
+                UdpObservation(UdpOutcome.FAILED, 0, "${e.javaClass.simpleName} • ${e.message ?: ""}")
+            }
+        }
+
+    private fun randomBytes(count: Int): ByteArray =
+        ByteArray(count).also { SecureRandom().nextBytes(it) }
+
+    /**
+     * Decides from the outcomes, and never from silence alone.
+     *
+     * One answer proves the path; one port-unreachable proves it too, because an ICMP error is a
+     * packet that made the round trip. All-silence proves nothing: a network that drops UDP and a
+     * network whose far side simply ignored this hello are the same observation from inside the
+     * phone, and the wording has to keep them the same rather than pick the scarier one.
+     */
+    internal fun classifyUdp(probes: List<UdpProbe>): UdpVerdict {
+        if (probes.isEmpty()) return UdpVerdict.NOT_MEASURED
+        val answered = probes.count { it.outcome == UdpOutcome.ANSWERED }
+        val unreachable = probes.count { it.outcome == UdpOutcome.NO_LISTENER }
+        return when {
+            answered > 0 -> UdpVerdict.ANSWERED
+            unreachable > 0 -> UdpVerdict.PATH_OPEN
+            probes.all { it.outcome == UdpOutcome.FAILED } -> UdpVerdict.LOCAL_FAILURE
+            else -> UdpVerdict.SILENT
+        }
+    }
+
+    internal fun udpSummary(verdict: UdpVerdict, probes: List<UdpProbe>): String {
+        val total = probes.size
+        val fastest = probes.filter { it.outcome == UdpOutcome.ANSWERED }.minByOrNull { it.elapsedMs }
+        val refusedNote = probes.filter { it.outcome == UdpOutcome.NO_LISTENER }
+            .maxByOrNull { it.elapsedMs }?.elapsedMs
+        return when (verdict) {
+            UdpVerdict.ANSWERED ->
+                "UDP/443 проходит: ${fastest?.reference?.label ?: "адрес"} ответил за " +
+                    "${fastest?.elapsedMs ?: 0} мс (ответ ${fastest?.replyBytes ?: 0} байт). " +
+                    "quic:// пиры на этой сети достижимы по транспорту — жив ли сам узел, скажет " +
+                    "рукопожатие оверлея."
+            UdpVerdict.PATH_OPEN ->
+                "UDP/443 проходит: датаграмма дошла и вернулась ICMP-недоступностью порта " +
+                    "(быстрее всех за ${refusedNote ?: 0} мс). Путь открыт, но на 443/udp у этих " +
+                    "адресов слушать некому — для quic:// пира это значит «сеть пускает», а не " +
+                    "«пир жив»."
+            UdpVerdict.SILENT ->
+                "UDP/443 молчит: ни от одного из $total адресов не пришло ничего за " +
+                    "${UDP_TIMEOUT_MS} мс и ни один не ответил недоступностью порта. Для телефона " +
+                    "это одно и то же наблюдение в двух разных ситуациях: сеть режет UDP, или " +
+                    "адрес проигнорировал наш пакет. Утверждать, что UDP не проходит, по этому " +
+                    "замеру нельзя; quic:// пиры на такой связи остаются непроверенными, а не отвергнутыми."
+            UdpVerdict.LOCAL_FAILURE ->
+                "UDP не отправился с этого устройства: ${probes.first().detail}. Это наблюдение " +
+                    "про само приложение, а не про сеть: пока зонд не может послать датаграмму, " +
+                    "про quic:// не утверждается ничего."
+            UdpVerdict.NOT_MEASURED ->
+                "UDP-адреса не проверялись: измерения нет, поэтому про путь quic:// ничего не " +
+                    "утверждается."
+        }
+    }
+
+    /** Per-address evidence for the network screen, one line each. */
+    fun udpEvidenceLines(report: UdpReport): List<String> = report.probes.map {
+        "${it.outcome.labelRu} • ${it.reference.label} ${it.reference.host}:${it.reference.port} " +
+            "(${it.reference.alpn}, ${it.reference.serverName}) • ${it.detail} • ${it.elapsedMs} мс"
     }
 }

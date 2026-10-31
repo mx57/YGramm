@@ -4,6 +4,7 @@ package com.example.engine
 import java.net.ConnectException
 import java.net.UnknownHostException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -249,6 +250,145 @@ class YggNetworkFilterProbeTest {
         } finally {
             YggNetworkFilterProbe.connector = { host, port, timeoutMs ->
                 java.net.Socket().use { it.connect(java.net.InetSocketAddress(host, port), timeoutMs) }
+            }
+        }
+    }
+
+    private fun udpProbe(
+        referenceIndex: Int,
+        outcome: YggNetworkFilterProbe.UdpOutcome,
+        replyBytes: Int = 0
+    ) = YggNetworkFilterProbe.UdpProbe(
+        YggNetworkFilterProbe.udpReferences[referenceIndex],
+        outcome,
+        replyBytes,
+        elapsedMs = 40,
+        detail = outcome.labelRu
+    )
+
+    @Test
+    fun `one answering udp reference proves the path carries`() {
+        val probes = listOf(
+            udpProbe(0, YggNetworkFilterProbe.UdpOutcome.ANSWERED, replyBytes = 1200),
+            udpProbe(1, YggNetworkFilterProbe.UdpOutcome.SILENT),
+            udpProbe(2, YggNetworkFilterProbe.UdpOutcome.SILENT)
+        )
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.ANSWERED, verdict)
+        assertTrue(verdict.carriesUdp)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        assertTrue("Must say the transport path exists: $summary", summary.contains("UDP/443 проходит"))
+        // Peer liveness is a separate fact and the summary must not invent it.
+        assertTrue("Must not promise the peer is alive: $summary", !summary.contains("пир жив"))
+    }
+
+    @Test
+    fun `an icmp port unreachable is evidence about the path not the peer`() {
+        val probes = listOf(
+            udpProbe(0, YggNetworkFilterProbe.UdpOutcome.NO_LISTENER),
+            udpProbe(1, YggNetworkFilterProbe.UdpOutcome.SILENT),
+            udpProbe(2, YggNetworkFilterProbe.UdpOutcome.SILENT)
+        )
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.PATH_OPEN, verdict)
+        assertTrue(verdict.carriesUdp)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        assertTrue("Must name the ICMP answer: $summary", summary.contains("ICMP"))
+        assertTrue("Must not read a silent port as a blocked one: $summary", summary.contains("слушать некому"))
+    }
+
+    @Test
+    fun `silence on udp is never reported as a blocked port`() {
+        val probes = YggNetworkFilterProbe.udpReferences.indices.map {
+            udpProbe(it, YggNetworkFilterProbe.UdpOutcome.SILENT)
+        }
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.SILENT, verdict)
+        assertFalse("Unanswered probes must not be claimed as a carried path", verdict.carriesUdp)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        // The whole point of the honest wording: from inside the phone a dropped datagram and an
+        // ignored one are the same observation, and the sentence has to keep both open.
+        assertTrue("Must admit the ambiguity: $summary", summary.contains("нельзя"))
+        assertFalse("Must not claim UDP is closed: $summary", summary.contains("закрыт"))
+        assertTrue("quic must stay unjudged, not rejected: $summary", summary.contains("непроверенными"))
+    }
+
+    @Test
+    fun `a socket that will not send is about the device not the network`() {
+        val probes = YggNetworkFilterProbe.udpReferences.indices.map {
+            udpProbe(it, YggNetworkFilterProbe.UdpOutcome.FAILED)
+        }
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.LOCAL_FAILURE, YggNetworkFilterProbe.classifyUdp(probes))
+        val summary = YggNetworkFilterProbe.udpSummary(YggNetworkFilterProbe.UdpVerdict.LOCAL_FAILURE, probes)
+        assertTrue("Must point at the device: $summary", summary.contains("этого устройства"))
+        assertFalse(YggNetworkFilterProbe.UdpVerdict.LOCAL_FAILURE.carriesUdp)
+    }
+
+    @Test
+    fun `an unmeasured udp path stays unmeasured`() {
+        assertEquals(
+            YggNetworkFilterProbe.UdpVerdict.NOT_MEASURED,
+            YggNetworkFilterProbe.classifyUdp(emptyList())
+        )
+        assertFalse(YggNetworkFilterProbe.UdpVerdict.NOT_MEASURED.carriesUdp)
+    }
+
+    @Test
+    fun `udp references are literal addresses so dns never enters the measurement`() {
+        assertTrue(
+            "UDP-референсы обязаны быть адресами: иначе замер смешает DNS и UDP",
+            YggNetworkFilterProbe.udpReferences.all {
+                it.host.split('.').all { part -> part.toIntOrNull() != null } &&
+                    it.host.count { ch -> ch == '.' } == 3
+            }
+        )
+        assertTrue(YggNetworkFilterProbe.udpReferences.all { it.port == 443 })
+        assertTrue(YggNetworkFilterProbe.udpReferences.all { it.serverName.isNotBlank() })
+    }
+
+    @Test
+    fun `probe sends a spec sized initial and reports what came back`() {
+        val sent = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, ByteArray>>()
+        YggNetworkFilterProbe.udpQuerier = { reference, packet, _ ->
+            sent[reference.host] = packet.size to packet
+            if (reference.host == "8.8.8.8") {
+                YggNetworkFilterProbe.UdpObservation(YggNetworkFilterProbe.UdpOutcome.ANSWERED, 1200, "тест")
+            } else {
+                YggNetworkFilterProbe.UdpObservation(YggNetworkFilterProbe.UdpOutcome.SILENT, 0, "тест")
+            }
+        }
+        try {
+            val report = YggNetworkFilterProbe.probeUdp()
+            assertEquals(YggNetworkFilterProbe.udpReferences.size, sent.size)
+            assertEquals(YggNetworkFilterProbe.UdpVerdict.ANSWERED, report.verdict)
+            sent.values.forEach { (size, packet) ->
+                // Below the floor a compliant server must ignore the Initial, which would make the
+                // silence mean nothing. The length is therefore part of the measurement's validity.
+                assertTrue("пакет $size байт меньше 1200", size >= 1200)
+                assertEquals(0xC0, packet[0].toInt() and 0xF0)
+            }
+            val lines = YggNetworkFilterProbe.udpEvidenceLines(report)
+            assertEquals(YggNetworkFilterProbe.udpReferences.size, lines.size)
+            assertTrue(lines.first().contains("h3"))
+            assertTrue(lines.first().contains("www.google.com"))
+        } finally {
+            YggNetworkFilterProbe.udpQuerier = { reference, packet, timeoutMs ->
+                val socket = java.net.DatagramSocket()
+                try {
+                    socket.soTimeout = timeoutMs
+                    val address = java.net.InetAddress.getByName(reference.host)
+                    socket.connect(address, reference.port)
+                    socket.send(java.net.DatagramPacket(packet, packet.size))
+                    val reply = java.net.DatagramPacket(ByteArray(2048), 2048)
+                    socket.receive(reply)
+                    YggNetworkFilterProbe.UdpObservation(
+                        YggNetworkFilterProbe.UdpOutcome.ANSWERED,
+                        reply.length,
+                        "restore"
+                    )
+                } finally {
+                    socket.close()
+                }
             }
         }
     }

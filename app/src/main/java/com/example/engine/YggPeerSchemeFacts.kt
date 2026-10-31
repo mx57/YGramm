@@ -111,7 +111,8 @@ object YggPeerSchemeFacts {
                 sendsHostnameSni = false,
                 canBeMasked = false,
                 verdictRu = "Рукопожатие QUIC проходит, но имени в нём ядро не отправляет и " +
-                    "`?sni=` игнорирует: маски нет, UDP/443 надо измерять, а не предполагать."
+                    "`?sni=` игнорирует: маски нет. Путь UDP/443 замеряется на экране сети — " +
+                    "там же видно, носит ли эта связь датаграммы."
             )
             else -> Facts(
                 scheme = scheme,

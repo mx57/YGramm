@@ -2111,6 +2111,9 @@ private fun SimpleNetworkShieldContent(
                             "Схема wss://: ядро v0.5.14 умеет только набирать её на 443, маска к WebSocket не " +
                             "применяется, а входящего слушателя WSS в ядре нет. Линка по wss на этом устройстве " +
                             "подтверждено не было.\n" +
+                            "Схема quic://: идёт по UDP/443, и этот путь теперь измеряется так же честно, как " +
+                            "TCP — кнопкой ниже. Тишина в замере UDP не значит «закрыто»: неотвеченный пакет " +
+                            "и заблокированный порт выглядят из телефона одинаково.\n" +
                             "Не реализовано: uTLS-фингерпринт, VLESS Reality, ShadowTLS v3, padding QUIC, DHT BEP-44.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -2154,7 +2157,7 @@ private fun SimpleNetworkShieldContent(
                         onClick = onProbeNetworkFilter,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Что пропускает моя сеть: проверить адреса")
+                        Text("Что пропускает моя сеть: проверить TCP и UDP на 443")
                     }
 
                     // The mask question and the network question are different measurements, and
@@ -2179,6 +2182,40 @@ private fun SimpleNetworkShieldContent(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                    }
+
+                    // UDP is a separate measurement, not a footnote to the TCP one: a link can
+                    // carry every TCP/443 reference and still drop every QUIC datagram.
+                    if (cfg.networkUdpSummary.isNotBlank()) {
+                        Text(
+                            text = cfg.networkUdpSummary,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = rememberFilterAgeLabel(cfg.networkUdpMeasuredAtMs),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        cfg.networkUdpEvidence.forEach { line ->
+                            Text(
+                                text = line,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    // The four schemes side by side, each with the evidence it was actually
+                    // measured with, so a verdict about TCP is never read as a verdict about QUIC.
+                    cfg.networkSchemeMatrix.forEach { line ->
+                        Text(
+                            text = line,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("scheme_matrix_row")
+                        )
                     }
                 }
             }

@@ -4169,9 +4169,10 @@ class YggTwinP2PBridge(
 
         val isTls = endpointUri.startsWith("tls://", ignoreCase = true) ||
             endpointUri.startsWith("wss://", ignoreCase = true)
-        // A QUIC peer is dialled over UDP by the core. This probe speaks TCP, and nothing in
-        // the build measures UDP yet, so answering "unreachable" here would be a false
-        // negative about a path that was never tried. Say which instrument is missing.
+        // A QUIC peer is dialled over UDP. This probe speaks TCP, so answering "unreachable" here
+        // would be a false negative about a path this instrument never touches. The app does now
+        // measure UDP/443 - on the network screen, against reference addresses - which says whether
+        // the link carries QUIC at all, not whether this particular node answers.
         val overUdp = endpointUri.startsWith("quic://", ignoreCase = true)
         if (overUdp) {
             return@withContext PeerProbeResult(
@@ -4180,7 +4181,8 @@ class YggTwinP2PBridge(
                 rttMs = -1,
                 protocolUsed = "QUIC/UDP",
                 errorDetail = "quic:// идёт по UDP: TCP-рукопожатие этот путь не проверяет. " +
-                    "Пир можно добавить, жив он или нет скажет только ядро по рукопожатию оверлея."
+                    "Пропускает ли UDP сама сеть — замер на экране сети; жив ли этот пир, скажет " +
+                    "только рукопожатие оверлея."
             )
         }
         val schemeKnown = isTls || endpointUri.startsWith("tcp://", ignoreCase = true)
