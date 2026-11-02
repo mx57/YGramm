@@ -1,7 +1,9 @@
 // File: app/src/test/java/com/example/engine/YggQuicInitialTest.kt
 package com.example.engine
 
+import java.security.KeyPairGenerator
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -143,10 +145,36 @@ class YggQuicInitialTest {
         val hello = YggQuicInitial.clientHello("www.google.com", "h3", ByteArray(32))
         val asText = String(hello, Charsets.ISO_8859_1)
         assertEquals(0x01, hello[0].toInt() and 0xFF)
-        assertTrue("SNI не в КлиентХелло", asText.contains("www.google.com"))
-        assertTrue("ALPN не в КлиентХелло", asText.contains("h3"))
+        assertTrue("SNI не в ClientHello", asText.contains("www.google.com"))
+        assertTrue("ALPN не в ClientHello", asText.contains("h3"))
         // 32 bytes of key_share for group 0x001d: without a parseable share the server discards it.
         assertTrue(hello.toList().windowed(4).any { it == listOf(0x00, 0x1d, 0x00, 0x20.toByte()) })
+    }
+
+    @Test
+    fun `key share takes the group element out of the providers encoding`() {
+        val encoded = KeyPairGenerator.getInstance("X25519").generateKeyPair().public.encoded
+        val raw = YggQuicInitial.rawPublicKeyOf(encoded)
+        assertEquals(32, raw.size)
+        assertEquals(YggQuicInitial.unhex(encoded.takeLast(32).toByteArray()), YggQuicInitial.unhex(raw))
+        // The JDK wraps the value in a SubjectPublicKeyInfo whose header for X25519 is always these
+        // twelve bytes. If a provider ever changes that shape, the tail slice is what silently
+        // starts putting DER noise into the hello, so it is pinned here rather than assumed.
+        if (encoded.size > 32) {
+            assertEquals(
+                "302a300506032b656e032100",
+                YggQuicInitial.unhex(encoded.copyOfRange(0, encoded.size - 32))
+            )
+        }
+        val share = YggQuicInitial.ephemeralKeyShare()
+        assertEquals(32, share.size)
+        assertNotEquals(YggQuicInitial.unhex(share), YggQuicInitial.unhex(YggQuicInitial.ephemeralKeyShare()))
+        // A hello built the way the probe builds one keeps the structure the RFC vectors measure.
+        val hello = YggQuicInitial.clientHello("cloudflare.com", "h3", share)
+        assertEquals(
+            YggQuicInitial.clientHello("cloudflare.com", "h3", ByteArray(32)).size,
+            hello.size
+        )
     }
 
     @Test

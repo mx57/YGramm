@@ -62,6 +62,24 @@ class YggTransportMatrixTest {
     }
 
     @Test
+    fun `an answer that is not quic opens the path but not the scheme`() {
+        val rows = YggTransportMatrix.rows(
+            YggNetworkFilterProbe.Verdict.OPEN,
+            YggNetworkFilterProbe.UdpVerdict.PATH_OPEN_NOT_QUIC,
+            fullListeners,
+            whitelistMode = false
+        )
+        val quic = rows.first { it.schemeRu.startsWith("quic") }
+        assertTrue("Нужно видеть, что датаграммы ходят: ${quic.outboundRu}", quic.outboundRu.contains("UDP/443 проходит"))
+        assertFalse(
+            "Отвечает не QUIC — ряд quic не имеет права обещать путь для схемы: ${quic.outboundRu}",
+            quic.outboundRu.contains("путь для quic:// есть")
+        )
+        assertTrue("Должно быть прямо сказано, чего не доказано: ${quic.outboundRu}",
+            quic.outboundRu.contains("не доказана"))
+    }
+
+    @Test
     fun `an unmeasured udp path is admitted instead of judged`() {
         val rows = YggTransportMatrix.rows(
             YggNetworkFilterProbe.Verdict.ADDRESS_FILTERED,
