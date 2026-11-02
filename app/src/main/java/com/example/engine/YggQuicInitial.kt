@@ -1,6 +1,9 @@
 // File: app/src/main/java/com/example/engine/YggQuicInitial.kt
 package com.example.engine
 
+import java.security.GeneralSecurityException
+import java.security.KeyPairGenerator
+import java.security.NoSuchAlgorithmException
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.Mac
@@ -53,13 +56,44 @@ object YggQuicInitial {
     }
 
     /**
-     * A ClientHello, hand-encoded, aimed at what actually listens on 443/udp: an HTTP/3 endpoint.
-     * ALPN is h3 rather than hq because the reference addresses serve web traffic there; a server
-     * that dislikes the ALPN still has to answer with a close, and an answer is the observation.
+     * The public half of a throwaway X25519 key, so the key_share extension names a group the
+     * bytes actually belong to.
      *
-     * [keySharePublic] is an X25519-sized public value so the extension parses. There is no
-     * matching private half: the probe never intends to finish a handshake, and holding handshake
-     * state for a packet sent at a third party's server would buy nothing.
+     * A random 32 bytes parses as a share too, but it is invented: whatever a filter learns from
+     * our hello is learned from noise where a browser would show a real key. Generating the pair
+     * costs one call, and the private half is dropped right here - this object never completes a
+     * handshake, so nothing is being agreed with anybody. A platform whose providers have no
+     * X25519 falls back to random bytes rather than failing the measurement over one field.
+     */
+    fun ephemeralKeyShare(): ByteArray = try {
+        rawPublicKeyOf(KeyPairGenerator.getInstance("X25519").generateKeyPair().public.encoded)
+    } catch (e: GeneralSecurityException) {
+        ByteArray(32).also { SecureRandom().nextBytes(it) }
+    }
+
+    /**
+     * The 32-byte group element out of whatever encoding the platform's provider hands back.
+     *
+     * Conscrypt returns the raw value; the JDK wraps it in a SubjectPublicKeyInfo, and the value is
+     * the BIT STRING content at the tail of that encoding. Taking it from the wrong offset would
+     * put DER bytes into the hello, and a server would answer that the same way it answers a
+     * malformed one: by not answering at all.
+     */
+    internal fun rawPublicKeyOf(encoded: ByteArray): ByteArray = when {
+        encoded.size == 32 -> encoded
+        encoded.size > 32 -> encoded.copyOfRange(encoded.size - 32, encoded.size)
+        else -> throw NoSuchAlgorithmException("публичный ключ X25519 короче 32 байт: ${encoded.size}")
+    }
+
+    /**
+     * A ClientHello, hand-encoded, aimed at whatever actually listens on the address being
+     * measured. [alpn] carries the protocol that endpoint advertises - h3 for a web resolver, doq
+     * for a DNS-over-QUIC one - because a server that dislikes the ALPN still has to answer with a
+     * close, and an answer is the observation.
+     *
+     * [keySharePublic] is the public value the key_share carries; [ephemeralKeyShare] produces a
+     * real one and the pair's private half is dropped with the socket. There is no handshake state,
+     * because there is no handshake intended.
      */
     fun clientHello(serverName: String, alpn: String, keySharePublic: ByteArray): ByteArray {
         require(keySharePublic.size == 32) { "key_share для x25519 всегда 32 байта" }

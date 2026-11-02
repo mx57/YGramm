@@ -331,7 +331,11 @@ object YggNetworkFilterProbe {
     }
 
     enum class UdpVerdict(val labelRu: String, val carriesUdp: Boolean) {
-        ANSWERED("UDP/443 проходит, адрес отвечает", carriesUdp = true),
+        ANSWERED("UDP/443 проходит, адрес отвечает по QUIC", carriesUdp = true),
+        PATH_OPEN_NOT_QUIC(
+            "UDP/443 проходит, но отвечающий не подтверждает QUIC",
+            carriesUdp = true
+        ),
         PATH_OPEN("UDP/443 проходит, слушателя на порту нет", carriesUdp = true),
         SILENT("UDP/443 молчит", carriesUdp = false),
         LOCAL_FAILURE("UDP не проходит на этом устройстве", carriesUdp = false),
@@ -351,16 +355,53 @@ object YggNetworkFilterProbe {
         val port: Int,
         val serverName: String,
         val alpn: String
-    )
+    ) {
+        /** Which address family the literal belongs to: the only family that decides a claim. */
+        val familyRu: String get() = if (host.contains(':')) "IPv6" else "IPv4"
 
-    data class UdpObservation(val outcome: UdpOutcome, val replyBytes: Int, val detail: String)
+        /** Bracketed so an IPv6 literal does not read as a port-heavy string in the evidence row. */
+        val targetRu: String get() = if (host.contains(':')) "[$host]:$port" else "$host:$port"
+    }
+
+    /**
+     * Whether the bytes that came back can be read as QUIC.
+     *
+     * Any reply at all proves the path carries datagrams both ways, and that is the question this
+     * probe was built to answer. It does not prove a QUIC server sits there: a captive portal, a
+     * unrelated service or a stateless reset all answer too, and only the header bits tell them
+     * apart. Splitting the two keeps "quic:// пиры достижимы" out of a measurement that did not
+     * establish it.
+     */
+    enum class UdpReply(val labelRu: String) {
+        /** Long header whose version field is 0x00000001: a server's first packet or a Retry. */
+        QUIC_V1("первый пакет сервера читается как QUIC версии 1"),
+
+        /**
+         * Long header, but a version this probe did not ask for. Version 0 is the negotiation
+         * packet and any other number belongs to a QUIC we do not speak: the framing is real, the
+         * agreement with our hello is not, and a stateless reset - which by RFC 9000 §10.3 is
+         * designed to be indistinguishable - would land here too.
+         */
+        QUIC_UNDETERMINED("заголовок как у QUIC, но версии 1 в ответах не видно"),
+
+        NOT_QUIC("по ответу QUIC не читается"),
+        NOTHING("ответа нет")
+    }
+
+    data class UdpObservation(
+        val outcome: UdpOutcome,
+        val replyBytes: Int,
+        val detail: String,
+        val reply: UdpReply = UdpReply.NOTHING
+    )
 
     data class UdpProbe(
         val reference: UdpReference,
         val outcome: UdpOutcome,
         val replyBytes: Int,
         val elapsedMs: Long,
-        val detail: String
+        val detail: String,
+        val reply: UdpReply = UdpReply.NOTHING
     )
 
     data class UdpReport(
@@ -375,11 +416,17 @@ object YggNetworkFilterProbe {
     /**
      * Literal addresses only: resolving a name here would mix a DNS question into a UDP question,
      * and the TCP half of this probe already measures DNS separately.
+     *
+     * Both families are measured because they are two different questions. A network that carries
+     * our IPv4 datagram may have no working IPv6 route at all, and the overlay - the thing this
+     * verdict is supposed to inform - only ever speaks IPv6.
      */
     internal val udpReferences = listOf(
         UdpReference("Google (UDP/443)", "8.8.8.8", 443, "www.google.com", "h3"),
         UdpReference("Cloudflare (UDP/443)", "1.1.1.1", 443, "cloudflare.com", "h3"),
-        UdpReference("Quad9 (UDP/443)", "9.9.9.9", 443, "dns.quad9.net", "h3")
+        UdpReference("Quad9 (UDP/443)", "9.9.9.9", 443, "dns.quad9.net", "h3"),
+        UdpReference("Google DNS-over-QUIC (UDP/443)", "2001:4860:4860::8888", 443, "dns.google", "doq"),
+        UdpReference("Cloudflare DNS-over-QUIC (UDP/443)", "2606:4700:4700::1111", 443, "cloudflare-dns.com", "doq")
     )
 
     /** Opened for tests: sends one datagram and reports what, if anything, came back. */
@@ -412,7 +459,7 @@ object YggNetworkFilterProbe {
             clientHello = YggQuicInitial.clientHello(
                 serverName = reference.serverName,
                 alpn = reference.alpn,
-                keySharePublic = randomBytes(32)
+                keySharePublic = YggQuicInitial.ephemeralKeyShare()
             )
         )
         val startedAt = System.nanoTime()
@@ -426,29 +473,35 @@ object YggNetworkFilterProbe {
             observation.outcome,
             observation.replyBytes,
             (System.nanoTime() - startedAt) / 1_000_000L,
-            observation.detail
+            observation.detail,
+            observation.reply
         )
     }
 
-    private fun queryUdp(reference: UdpReference, packet: ByteArray, timeoutMs: Int): UdpObservation =
-        try {
-            DatagramSocket().use { socket ->
-                socket.soTimeout = timeoutMs
-                val address = InetAddress.getByName(reference.host)
-                // Connected on purpose: an unconnected UDP socket drops the ICMP error for a
-                // destination this app never sent to, while a connected one reports ECONNREFUSED
-                // back to receive() - which is the difference between "no listener" and "no answer".
-                socket.connect(address, reference.port)
-                socket.send(DatagramPacket(packet, packet.size))
-                val buffer = ByteArray(2048)
-                val reply = DatagramPacket(buffer, buffer.size)
-                socket.receive(reply)
-                UdpObservation(
-                    UdpOutcome.ANSWERED,
-                    reply.length,
-                    "ответ ${reply.length} байт от ${reference.host}:${reference.port}"
-                )
-            }
+    private fun queryUdp(reference: UdpReference, packet: ByteArray, timeoutMs: Int): UdpObservation {
+        // Closed by hand rather than through use {}: the extension dispatches Closeable.close()
+        // through an interface, and that declaration is not something worth betting a probe on.
+        var socket: DatagramSocket? = null
+        return try {
+            socket = DatagramSocket()
+            socket.soTimeout = timeoutMs
+            val address = InetAddress.getByName(reference.host)
+            // Connected on purpose: an unconnected UDP socket drops the ICMP error for a
+            // destination this app never sent to, while a connected one reports ECONNREFUSED
+            // back to receive() - which is the difference between "no listener" and "no answer".
+            socket.connect(address, reference.port)
+            socket.send(DatagramPacket(packet, packet.size))
+            val buffer = ByteArray(2048)
+            val reply = DatagramPacket(buffer, buffer.size)
+            socket.receive(reply)
+            val shape = classifyReply(reply.data, reply.length)
+            UdpObservation(
+                UdpOutcome.ANSWERED,
+                reply.length,
+                "ответ ${reply.length} байт от ${reference.host}:${reference.port} • " +
+                    shape.labelRu,
+                shape
+            )
         } catch (e: SocketTimeoutException) {
             UdpObservation(UdpOutcome.SILENT, 0, "за ${timeoutMs} мс не вернулось ничего")
         } catch (e: IOException) {
@@ -463,10 +516,42 @@ object YggNetworkFilterProbe {
             } else {
                 UdpObservation(UdpOutcome.FAILED, 0, "${e.javaClass.simpleName} • ${e.message ?: ""}")
             }
+        } finally {
+            socket?.close()
         }
+    }
 
     private fun randomBytes(count: Int): ByteArray =
         ByteArray(count).also { SecureRandom().nextBytes(it) }
+
+    /**
+     * Reads only the header bits of a reply, never its body.
+     *
+     * The body of a server Initial is encrypted under keys this probe does not hold, so the honest
+     * ceiling is the long-header bit and the version field. That is enough to tell a QUIC server's
+     * first packet from a portal answering with HTML, and enough to refuse to claim more than the
+     * bits support.
+     */
+    internal fun classifyReply(data: ByteArray, length: Int): UdpReply {
+        if (length < 5) return UdpReply.NOT_QUIC
+        // RFC 9000 §17.2: a long header sets the header-form bit and carries the version in the
+        // four bytes after it. Header protection masks only the low nibble of the first byte, so
+        // both facts arrive unmasked.
+        if (data[0].toInt() and 0x80 != 0) {
+            val version = ((data[1].toInt() and 0xFF) shl 24) or
+                ((data[2].toInt() and 0xFF) shl 16) or
+                ((data[3].toInt() and 0xFF) shl 8) or
+                (data[4].toInt() and 0xFF)
+            // Version 0 is the version-negotiation packet and any other number a QUIC this probe
+            // did not ask for: real framing, but nothing in it accepted this version 1 hello.
+            return if (version == YggQuicInitial.QUIC_V1) UdpReply.QUIC_V1 else UdpReply.QUIC_UNDETERMINED
+        }
+        // A short header has no version field, and a server never answers a client Initial with
+        // one: the only packet in that shape is a stateless reset, which carries a token this
+        // connection never issued. An answer that reads as ASCII - a portal's "HTTP/1.1" - or any
+        // other stray datagram is somebody else's traffic, not this protocol replying.
+        return UdpReply.NOT_QUIC
+    }
 
     /**
      * Decides from the outcomes, and never from silence alone.
@@ -480,25 +565,54 @@ object YggNetworkFilterProbe {
         if (probes.isEmpty()) return UdpVerdict.NOT_MEASURED
         val answered = probes.count { it.outcome == UdpOutcome.ANSWERED }
         val unreachable = probes.count { it.outcome == UdpOutcome.NO_LISTENER }
+        val failed = probes.count { it.outcome == UdpOutcome.FAILED }
+        val quic = probes.count {
+            it.outcome == UdpOutcome.ANSWERED &&
+                (it.reply == UdpReply.QUIC_V1 || it.reply == UdpReply.QUIC_UNDETERMINED)
+        }
         return when {
-            answered > 0 -> UdpVerdict.ANSWERED
+            quic > 0 -> UdpVerdict.ANSWERED
+            // Something answered on 443/udp, and the way home worked, but no reply could be read
+            // as QUIC. The path verdict stands; the quic:// verdict does not.
+            answered > 0 -> UdpVerdict.PATH_OPEN_NOT_QUIC
             unreachable > 0 -> UdpVerdict.PATH_OPEN
-            probes.all { it.outcome == UdpOutcome.FAILED } -> UdpVerdict.LOCAL_FAILURE
+            // Any send that never left the phone outranks silence: if this app could not put a
+            // datagram on the wire, the silence of the remaining addresses says nothing at all,
+            // and reporting it as "the network is quiet" would blame the carrier for a fault in
+            // the measurement.
+            failed > 0 -> UdpVerdict.LOCAL_FAILURE
             else -> UdpVerdict.SILENT
         }
     }
 
     internal fun udpSummary(verdict: UdpVerdict, probes: List<UdpProbe>): String {
         val total = probes.size
+        val answeredCount = probes.count { it.outcome == UdpOutcome.ANSWERED }
         val fastest = probes.filter { it.outcome == UdpOutcome.ANSWERED }.minByOrNull { it.elapsedMs }
         val refusedNote = probes.filter { it.outcome == UdpOutcome.NO_LISTENER }
             .maxByOrNull { it.elapsedMs }?.elapsedMs
-        return when (verdict) {
-            UdpVerdict.ANSWERED ->
+        val base = when (verdict) {
+            UdpVerdict.ANSWERED -> {
+                val versionOne = probes.any {
+                    it.outcome == UdpOutcome.ANSWERED && it.reply == UdpReply.QUIC_V1
+                }
                 "UDP/443 проходит: ${fastest?.reference?.label ?: "адрес"} ответил за " +
-                    "${fastest?.elapsedMs ?: 0} мс (ответ ${fastest?.replyBytes ?: 0} байт). " +
-                    "quic:// пиры на этой сети достижимы по транспорту — жив ли сам узел, скажет " +
-                    "рукопожатие оверлея."
+                    "${fastest?.elapsedMs ?: 0} мс (ответ ${fastest?.replyBytes ?: 0} байт, " +
+                    "${fastest?.reply?.labelRu ?: "ответ без классификации"}). " +
+                    if (versionOne) {
+                        "Значит, по этому пути ходят пакеты QUIC версии 1 — нашей схемы. Достижим " +
+                            "ли конкретный quic:// узел, и жив ли он, скажет рукопожатие оверлея, " +
+                            "этот замер про него ничего не утверждает."
+                    } else {
+                        "Заголовок QUIC на этом пути есть, но версии 1 в ответах не видно: " +
+                            "договорится ли оверлей о схеме с таким UDP, этот замер не решает."
+                    }
+            }
+            UdpVerdict.PATH_OPEN_NOT_QUIC ->
+                "UDP/443 проходит: $answeredCount из $total адресов ответили за " +
+                    "${fastest?.elapsedMs ?: 0} мс, датаграмма нашла дорогу обратно. Ни в одном " +
+                    "ответе не читается QUIC-заголовок, поэтому замер говорит только о пути: " +
+                    "сеть датаграммы носит, а достижимость quic:// пиров этим не доказана."
             UdpVerdict.PATH_OPEN ->
                 "UDP/443 проходит: датаграмма дошла и вернулась ICMP-недоступностью порта " +
                     "(быстрее всех за ${refusedNote ?: 0} мс). Путь открыт, но на 443/udp у этих " +
@@ -510,19 +624,50 @@ object YggNetworkFilterProbe {
                     "это одно и то же наблюдение в двух разных ситуациях: сеть режет UDP, или " +
                     "адрес проигнорировал наш пакет. Утверждать, что UDP не проходит, по этому " +
                     "замеру нельзя; quic:// пиры на такой связи остаются непроверенными, а не отвергнутыми."
-            UdpVerdict.LOCAL_FAILURE ->
-                "UDP не отправился с этого устройства: ${probes.first().detail}. Это наблюдение " +
-                    "про само приложение, а не про сеть: пока зонд не может послать датаграмму, " +
-                    "про quic:// не утверждается ничего."
+            UdpVerdict.LOCAL_FAILURE -> {
+                val failed = probes.first { it.outcome == UdpOutcome.FAILED }
+                val silent = probes.count { it.outcome == UdpOutcome.SILENT }
+                "UDP не отправился с этого устройства: ${failed.detail}. Это наблюдение про само " +
+                    "приложение, а не про сеть" +
+                    if (silent > 0) {
+                        "; ещё $silent адресов молчат, но при сорванной отправке их молчание " +
+                            "ничего не доказывает"
+                    } else {
+                        ""
+                    } +
+                    ", поэтому про quic:// не утверждается ничего."
+            }
             UdpVerdict.NOT_MEASURED ->
                 "UDP-адреса не проверялись: измерения нет, поэтому про путь quic:// ничего не " +
                     "утверждается."
         }
+        return base + familyNote(probes)
+    }
+
+    /**
+     * Which address family answered, said out loud whenever both families were measured.
+     *
+     * The overlay is IPv6-only: 0200::/7 addresses are reached over v6, and a QUIC answer from an
+     * IPv4 resolver says nothing about whether this phone can put a datagram on a v6 route. Left
+     * unsplit, one IPv4 reply would read as "UDP works" and the reader would apply it to the family
+     * their peers actually live in.
+     */
+    private fun familyNote(probes: List<UdpProbe>): String {
+        val v4 = probes.filter { it.reference.familyRu == "IPv4" }
+        val v6 = probes.filter { it.reference.familyRu == "IPv6" }
+        if (v4.isEmpty() || v6.isEmpty()) return ""
+
+        fun carried(list: List<UdpProbe>) = list.count {
+            it.outcome == UdpOutcome.ANSWERED || it.outcome == UdpOutcome.NO_LISTENER
+        }
+        return " По семействам: IPv4 — дорога обратно у ${carried(v4)} из ${v4.size}, " +
+            "IPv6 — у ${carried(v6)} из ${v6.size}. Пиры оверлея живут в IPv6, поэтому для quic:// " +
+            "решает вторая цифра, а не первая."
     }
 
     /** Per-address evidence for the network screen, one line each. */
     fun udpEvidenceLines(report: UdpReport): List<String> = report.probes.map {
-        "${it.outcome.labelRu} • ${it.reference.label} ${it.reference.host}:${it.reference.port} " +
+        "${it.outcome.labelRu} • ${it.reference.familyRu} ${it.reference.label} ${it.reference.targetRu} " +
             "(${it.reference.alpn}, ${it.reference.serverName}) • ${it.detail} • ${it.elapsedMs} мс"
     }
 }

@@ -36,7 +36,15 @@ object YggCryptoEngine {
     }
 
     // BigInteger field arithmetic caches for the curve implementations below.
-    private val fieldP: BigInteger = BigInteger.TWO.pow(255).subtract(BigInteger.valueOf(19))
+    //
+    // The prime is written out rather than computed as TWO.pow(255)-19: BigInteger.TWO is declared
+    // from API 36 up, so reading it here makes this object's initialiser a launch crash on any
+    // runtime that predates that declaration - a real device reported exactly that,
+    // NoSuchFieldError: No static field TWO, before the first screen drew. The literal is 2^255-19,
+    // and the mnemonic-to-node-key vectors in YggCryptoParityTest change if it is wrong, so the
+    // value is still pinned by arithmetic rather than by trust.
+    private val fieldP: BigInteger =
+        BigInteger("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed", 16)
     private val curveD: BigInteger = BigInteger.valueOf(-121665L)
         .multiply(BigInteger.valueOf(121666L).modInverse(fieldP))
         .mod(fieldP)

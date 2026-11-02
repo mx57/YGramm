@@ -257,19 +257,26 @@ class YggNetworkFilterProbeTest {
     private fun udpProbe(
         referenceIndex: Int,
         outcome: YggNetworkFilterProbe.UdpOutcome,
-        replyBytes: Int = 0
+        replyBytes: Int = 0,
+        reply: YggNetworkFilterProbe.UdpReply = YggNetworkFilterProbe.UdpReply.NOTHING
     ) = YggNetworkFilterProbe.UdpProbe(
         YggNetworkFilterProbe.udpReferences[referenceIndex],
         outcome,
         replyBytes,
         elapsedMs = 40,
-        detail = outcome.labelRu
+        detail = outcome.labelRu,
+        reply = reply
     )
 
     @Test
     fun `one answering udp reference proves the path carries`() {
         val probes = listOf(
-            udpProbe(0, YggNetworkFilterProbe.UdpOutcome.ANSWERED, replyBytes = 1200),
+            udpProbe(
+                0,
+                YggNetworkFilterProbe.UdpOutcome.ANSWERED,
+                replyBytes = 1200,
+                reply = YggNetworkFilterProbe.UdpReply.QUIC_V1
+            ),
             udpProbe(1, YggNetworkFilterProbe.UdpOutcome.SILENT),
             udpProbe(2, YggNetworkFilterProbe.UdpOutcome.SILENT)
         )
@@ -280,6 +287,66 @@ class YggNetworkFilterProbeTest {
         assertTrue("Must say the transport path exists: $summary", summary.contains("UDP/443 проходит"))
         // Peer liveness is a separate fact and the summary must not invent it.
         assertTrue("Must not promise the peer is alive: $summary", !summary.contains("пир жив"))
+    }
+
+    @Test
+    fun `a reply that does not read as quic proves the path but not the transport`() {
+        // A portal, an unrelated service or a TCP-tls responder on 443/udp all answer, and each
+        // answer proves the same thing about the network: datagrams go out and come back. None of
+        // them says anything about whether a quic:// peer could be reached, and the verdict must
+        // keep those two claims apart.
+        val probes = listOf(
+            udpProbe(
+                0,
+                YggNetworkFilterProbe.UdpOutcome.ANSWERED,
+                replyBytes = 700,
+                reply = YggNetworkFilterProbe.UdpReply.NOT_QUIC
+            ),
+            udpProbe(
+                1,
+                YggNetworkFilterProbe.UdpOutcome.ANSWERED,
+                replyBytes = 120,
+                reply = YggNetworkFilterProbe.UdpReply.NOT_QUIC
+            ),
+            udpProbe(2, YggNetworkFilterProbe.UdpOutcome.SILENT)
+        )
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.PATH_OPEN_NOT_QUIC, verdict)
+        assertTrue("The path really did carry datagrams: $verdict", verdict.carriesUdp)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        assertTrue("Must keep the path verdict: $summary", summary.contains("UDP/443 проходит"))
+        assertTrue("Must name the missing quic header: $summary", summary.contains("не читается QUIC"))
+        assertFalse("Must not claim quic peers are reachable: $summary", summary.contains("достижимы"))
+    }
+
+    @Test
+    fun `the header bits of a reply decide how far the claim reaches`() {
+        val initial = byteArrayOf(0xC3.toByte(), 0, 0, 0, 1, 8, 1, 2, 3)
+        assertEquals(YggNetworkFilterProbe.UdpReply.QUIC_V1, YggNetworkFilterProbe.classifyReply(initial, initial.size))
+        val retry = byteArrayOf(0xFF.toByte(), 0, 0, 0, 1, 0)
+        assertEquals(YggNetworkFilterProbe.UdpReply.QUIC_V1, YggNetworkFilterProbe.classifyReply(retry, retry.size))
+        // Version negotiation is a long header too, just not v1: QUIC framing, but it says nothing
+        // about whether this hello was accepted.
+        val versionNegotiation = byteArrayOf(0x80.toByte(), 0, 0, 0, 0)
+        assertEquals(
+            YggNetworkFilterProbe.UdpReply.QUIC_UNDETERMINED,
+            YggNetworkFilterProbe.classifyReply(versionNegotiation, versionNegotiation.size)
+        )
+        val otherVersion = byteArrayOf(0xC1.toByte(), 0x6b, 0x33, 0x43, 0xcf.toByte())
+        assertEquals(
+            YggNetworkFilterProbe.UdpReply.QUIC_UNDETERMINED,
+            YggNetworkFilterProbe.classifyReply(otherVersion, otherVersion.size)
+        )
+        // Short header: no version field, and nothing in QUIC answers a client Initial this way.
+        val shortHeader = byteArrayOf(0x40.toByte(), 1, 2, 3, 4)
+        assertEquals(
+            YggNetworkFilterProbe.UdpReply.NOT_QUIC,
+            YggNetworkFilterProbe.classifyReply(shortHeader, shortHeader.size)
+        )
+        // An HTTP/1.1 answer starts with 'H' - header form bit clear, so this is not QUIC at all.
+        val portal = "HTTP/1.1 302 Found".toByteArray(Charsets.US_ASCII)
+        assertEquals(YggNetworkFilterProbe.UdpReply.NOT_QUIC, YggNetworkFilterProbe.classifyReply(portal, portal.size))
+        assertEquals(YggNetworkFilterProbe.UdpReply.NOT_QUIC, YggNetworkFilterProbe.classifyReply(byteArrayOf(0x7F, 1), 2))
     }
 
     @Test
@@ -325,6 +392,28 @@ class YggNetworkFilterProbeTest {
     }
 
     @Test
+    fun `one broken send outranks the silence of the rest`() {
+        // The trap this closes: two addresses time out and one socket never even started. Reading
+        // that as "the network is quiet" accuses the carrier of filtering UDP when this app could
+        // not put a datagram on the wire.
+        val probes = listOf(
+            udpProbe(0, YggNetworkFilterProbe.UdpOutcome.SILENT),
+            udpProbe(1, YggNetworkFilterProbe.UdpOutcome.FAILED),
+            udpProbe(2, YggNetworkFilterProbe.UdpOutcome.SILENT)
+        )
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        assertEquals(YggNetworkFilterProbe.UdpVerdict.LOCAL_FAILURE, verdict)
+        assertFalse(verdict.carriesUdp)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        assertTrue("Must still name the device: $summary", summary.contains("этого устройства"))
+        assertTrue(
+            "Must say the remaining silence proves nothing: $summary",
+            summary.contains("ничего не доказывает")
+        )
+        assertFalse("Must not blame the link: $summary", summary.contains("сеть режет"))
+    }
+
+    @Test
     fun `an unmeasured udp path stays unmeasured`() {
         assertEquals(
             YggNetworkFilterProbe.UdpVerdict.NOT_MEASURED,
@@ -335,15 +424,51 @@ class YggNetworkFilterProbeTest {
 
     @Test
     fun `udp references are literal addresses so dns never enters the measurement`() {
+        fun isDottedQuad(host: String) =
+            host.split('.').size == 4 && host.split('.').all { it.toIntOrNull() != null }
+
+        fun isIpv6Literal(host: String) = host.contains(':') &&
+            host.count { it == ':' } >= 2 &&
+            host.all { it.isDigit() || it in 'a'..'f' || it == ':' }
+
         assertTrue(
             "UDP-референсы обязаны быть адресами: иначе замер смешает DNS и UDP",
             YggNetworkFilterProbe.udpReferences.all {
-                it.host.split('.').all { part -> part.toIntOrNull() != null } &&
-                    it.host.count { ch -> ch == '.' } == 3
+                isDottedQuad(it.host) || isIpv6Literal(it.host)
             }
         )
         assertTrue(YggNetworkFilterProbe.udpReferences.all { it.port == 443 })
         assertTrue(YggNetworkFilterProbe.udpReferences.all { it.serverName.isNotBlank() })
+    }
+
+    @Test
+    fun `both address families are measured and the split is stated`() {
+        // The overlay reaches peers over IPv6 only, so an IPv4-only answer must not be readable as
+        // "UDP works" by a reader whose contacts live on v6 routes.
+        val families = YggNetworkFilterProbe.udpReferences.map { it.familyRu }.distinct().sorted()
+        assertEquals(listOf("IPv4", "IPv6"), families)
+        assertTrue(
+            "IPv6-адрес в строке доказательства обязан быть в скобках: ",
+            YggNetworkFilterProbe.udpReferences.first { it.familyRu == "IPv6" }.targetRu.startsWith("[")
+        )
+
+        val probes = YggNetworkFilterProbe.udpReferences.map { reference ->
+            YggNetworkFilterProbe.UdpProbe(
+                reference,
+                if (reference.familyRu == "IPv4") YggNetworkFilterProbe.UdpOutcome.ANSWERED
+                else YggNetworkFilterProbe.UdpOutcome.SILENT,
+                replyBytes = if (reference.familyRu == "IPv4") 1200 else 0,
+                elapsedMs = 40,
+                detail = "тест",
+                reply = if (reference.familyRu == "IPv4") YggNetworkFilterProbe.UdpReply.QUIC_V1
+                else YggNetworkFilterProbe.UdpReply.NOTHING
+            )
+        }
+        val verdict = YggNetworkFilterProbe.classifyUdp(probes)
+        val summary = YggNetworkFilterProbe.udpSummary(verdict, probes)
+        assertTrue("Оба семейства должны быть названы: $summary", summary.contains("IPv4"))
+        assertTrue("Оба семейства должны быть названы: $summary", summary.contains("IPv6"))
+        assertTrue("Должно быть видно, какое семейство решает: $summary", summary.contains("решает вторая цифра"))
     }
 
     @Test
@@ -352,7 +477,12 @@ class YggNetworkFilterProbeTest {
         YggNetworkFilterProbe.udpQuerier = { reference, packet, _ ->
             sent[reference.host] = packet.size to packet
             if (reference.host == "8.8.8.8") {
-                YggNetworkFilterProbe.UdpObservation(YggNetworkFilterProbe.UdpOutcome.ANSWERED, 1200, "тест")
+                YggNetworkFilterProbe.UdpObservation(
+                    YggNetworkFilterProbe.UdpOutcome.ANSWERED,
+                    1200,
+                    "тест",
+                    YggNetworkFilterProbe.UdpReply.QUIC_V1
+                )
             } else {
                 YggNetworkFilterProbe.UdpObservation(YggNetworkFilterProbe.UdpOutcome.SILENT, 0, "тест")
             }

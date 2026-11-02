@@ -106,7 +106,10 @@ object YggTransportMatrix {
     private fun udpOutbound(verdict: YggNetworkFilterProbe.UdpVerdict?): String = when (verdict) {
         null, YggNetworkFilterProbe.UdpVerdict.NOT_MEASURED -> "UDP/443 не измерялся"
         YggNetworkFilterProbe.UdpVerdict.ANSWERED ->
-            "UDP/443 проходит и адрес отвечает: путь для quic:// есть"
+            "UDP/443 проходит и адрес отвечает по QUIC: путь для quic:// есть"
+        YggNetworkFilterProbe.UdpVerdict.PATH_OPEN_NOT_QUIC ->
+            "UDP/443 проходит, датаграммы возвращаются, но в ответах не читается QUIC: " +
+                "путь открыт, а достижимость quic:// этим не доказана"
         YggNetworkFilterProbe.UdpVerdict.PATH_OPEN ->
             "UDP/443 проходит (вернулась ICMP-недоступность порта): сеть носит датаграммы, " +
                 "слушателя на порту нет"

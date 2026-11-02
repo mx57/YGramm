@@ -22,12 +22,16 @@ android {
 
   defaultConfig {
     applicationId = "com.aistudio.ygggram.vxkprm"
-    minSdk = 24
+    // java.util.Base64 is declared from API 26 up and it carries the attachment, PROFILE and call
+    // media frames, so an API 24/25 install met NoSuchMethodError at the first one of those.
+    // The floor now states what the code needs rather than promising an Android 7 build that
+    // cannot deliver; that failure is read off the API contract, not reproduced on a device.
+    minSdk = 26
     targetSdk = 36
-    versionCode = 28
+    versionCode = 29
     // The suffix is the only thing that tells a tester whether the node on the screen can
     // be the shipped one: an emulator build carries the x86_64 core, a release build arm64.
-    versionName = "1.7.11" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
+    versionName = "1.7.12" + if (providers.gradleProperty("emuX86").isPresent) "-emu-x86_64" else "-arm64-v8a"
 
     ndk {
       abiFilters += listOf("arm64-v8a")
