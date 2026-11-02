@@ -22,10 +22,10 @@ android {
 
   defaultConfig {
     applicationId = "com.aistudio.ygggram.vxkprm"
-    // java.util.Base64 is declared from API 26 up and it sits on the send path (envelopes,
-    // attachments, profile frames), so an API 24/25 install reached a NoSuchMethodError as soon as
-    // it sent its first message. The floor now states what the code needs rather than promising an
-    // Android 7 build that cannot deliver.
+    // java.util.Base64 is declared from API 26 up and it carries the attachment, PROFILE and call
+    // media frames, so an API 24/25 install met NoSuchMethodError at the first one of those.
+    // The floor now states what the code needs rather than promising an Android 7 build that
+    // cannot deliver; that failure is read off the API contract, not reproduced on a device.
     minSdk = 26
     targetSdk = 36
     versionCode = 29
