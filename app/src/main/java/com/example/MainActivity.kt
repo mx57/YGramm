@@ -171,17 +171,24 @@ fun YggGramRootApp(
         contract = ActivityResultContracts.RequestPermission()
     ) { }
     var pendingAcceptCallId by rememberSaveable { mutableStateOf("") }
+    var pendingStartVoiceCallChatId by rememberSaveable { mutableStateOf("") }
     val callMicPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         val targetCallId = pendingAcceptCallId
+        val targetStartChatId = pendingStartVoiceCallChatId
         pendingAcceptCallId = ""
+        pendingStartVoiceCallChatId = ""
         if (granted) {
-            viewModel.acceptIncomingCall()
+            if (targetCallId.isNotBlank()) {
+                viewModel.acceptIncomingCall()
+            } else if (targetStartChatId.isNotBlank()) {
+                viewModel.startVoiceCall(targetStartChatId)
+            }
         } else {
             Toast.makeText(
                 context,
-                "Без доступа к микрофону принять звонок невозможно",
+                "Без доступа к микрофону звонки невозможны",
                 Toast.LENGTH_LONG
             ).show()
             if (targetCallId.isNotBlank()) {
@@ -198,6 +205,18 @@ fun YggGramRootApp(
             viewModel.acceptIncomingCall()
         } else {
             pendingAcceptCallId = uiState.activeVoiceCall?.callId.orEmpty()
+            callMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    val startVoiceCallWithPermission: (String) -> Unit = { chatId ->
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.startVoiceCall(chatId)
+        } else {
+            pendingStartVoiceCallChatId = chatId
             callMicPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
@@ -220,16 +239,15 @@ fun YggGramRootApp(
     var showProfileQuickMenu by rememberSaveable { mutableStateOf(false) }
 
     // Show the ring screen over the lock screen, like a system phone call.
-    val incomingRinging = uiState.activeVoiceCall?.isIncoming == true &&
-        uiState.activeVoiceCall?.callStatus == "RINGING_INCOMING"
-    LaunchedEffect(incomingRinging) {
+    val hasActiveOrRingingCall = uiState.activeVoiceCall != null
+    LaunchedEffect(hasActiveOrRingingCall) {
         val activity = context.findHostActivity() ?: return@LaunchedEffect
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            activity.setShowWhenLocked(incomingRinging)
-            activity.setTurnScreenOn(incomingRinging)
+            activity.setShowWhenLocked(hasActiveOrRingingCall)
+            activity.setTurnScreenOn(hasActiveOrRingingCall)
         } else {
             @Suppress("DEPRECATION")
-            if (incomingRinging) {
+            if (hasActiveOrRingingCall) {
                 activity.window.addFlags(
                     android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
                         android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
@@ -690,7 +708,7 @@ fun YggGramRootApp(
                                 onForwardMessage = viewModel::forwardMessage,
                                 onTyping = viewModel::notifyTyping,
                                 onToggleReaction = viewModel::toggleMessageReaction,
-                                onStartVoiceCall = viewModel::startVoiceCall,
+                                onStartVoiceCall = startVoiceCallWithPermission,
                                 onAddContactFromQr = viewModel::addContactFromQrPayload,
                                 onCreateNewChat = viewModel::createNewChat,
                                 onCreateGroup = viewModel::createGroup,

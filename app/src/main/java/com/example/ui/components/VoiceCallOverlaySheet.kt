@@ -197,8 +197,9 @@ fun VoiceCallOverlaySheet(
                                 tint = CyberTealSecondary,
                                 modifier = Modifier.size(16.dp)
                             )
+                            val rttText = if (callState.liveRttMs > 0) " • RTT ${callState.liveRttMs} мс" else ""
                             Text(
-                                text = "PCM ${callState.audioBitrateKbps} kbps • Кадры TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}",
+                                text = "PCM ${callState.audioBitrateKbps} kbps • TX:${callState.txAudioFrames} / RX:${callState.rxAudioFrames}$rttText",
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                                 color = CyberTealSecondary
                             )

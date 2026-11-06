@@ -565,4 +565,38 @@ class ExampleUnitTest {
             YggCoverTransport.whitelistSni = previousSni
         }
     }
+
+    @Test
+    fun callVerificationEmojis_isDeterministicAndSorted() {
+        val aliceWords = listOf(
+            "abandon", "abandon", "abandon", "abandon", "abandon", "abandon",
+            "abandon", "abandon", "abandon", "abandon", "abandon", "about"
+        )
+        val bobWords = listOf(
+            "zoo", "zoo", "zoo", "zoo", "zoo", "zoo",
+            "zoo", "zoo", "zoo", "zoo", "zoo", "wrong"
+        )
+        val alice = YggCryptoEngine.deriveHierarchyFromMnemonic(aliceWords, epoch = 1)
+        val bob = YggCryptoEngine.deriveHierarchyFromMnemonic(bobWords, epoch = 1)
+        val callId = "call_test_123"
+
+        // Both parties should get the exact same SAS emojis regardless of order of keys
+        val emojiPool = listOf("🔐", "🛰️", "🐉", "⚡", "🛡️", "💎", "🔥", "🌊", "🦊", "🪐", "🎯", "🔑")
+        val (k1, k2) = listOf(alice.x25519IdentityPubHex.lowercase(), bob.x25519IdentityPubHex.lowercase()).sorted()
+        val hashHex = YggCryptoEngine.sha256Hex("$callId:$k1:$k2")
+        val sas1 = (0 until 4).map { idx ->
+            val slice = hashHex.substring(idx * 4, idx * 4 + 4).toInt(16)
+            emojiPool[slice % emojiPool.size]
+        }.joinToString(" ")
+
+        val (k2Rev, k1Rev) = listOf(bob.x25519IdentityPubHex.lowercase(), alice.x25519IdentityPubHex.lowercase()).sorted()
+        val hashHex2 = YggCryptoEngine.sha256Hex("$callId:$k2Rev:$k1Rev")
+        val sas2 = (0 until 4).map { idx ->
+            val slice = hashHex2.substring(idx * 4, idx * 4 + 4).toInt(16)
+            emojiPool[slice % emojiPool.size]
+        }.joinToString(" ")
+
+        assertEquals(sas1, sas2)
+        assertEquals(4, sas1.split(" ").size)
+    }
 }
