@@ -5797,6 +5797,9 @@ class YggTwinP2PBridge(
         allowLanFallback: Boolean = allowDirectLanRouting,
         timeoutMs: Long = 18_000L
     ): CallSignalDispatchResult = withContext(Dispatchers.IO) {
+        if (directEndpointHint.isNotBlank()) {
+            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
+        }
         val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()] ?: ""
         val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
         val directAddress = resolveDirectSocketAddress(
@@ -5962,6 +5965,9 @@ class YggTwinP2PBridge(
         directEndpointHint: String = "",
         allowLanFallback: Boolean = allowDirectLanRouting
     ): CallMediaChannelResult = withContext(Dispatchers.IO) {
+        if (directEndpointHint.isNotBlank()) {
+            registerDirectEndpointForPeer(peerIpv6, directEndpointHint)
+        }
         closeCallMediaChannel(callId)
         val senderProfileId = ipv6ToProfileIdMap[senderIpv6.lowercase()] ?: ""
         val recipientKeyHex = resolveRecipientNodeKey(peerIpv6, recipientNodePubKeyHex)
@@ -6183,11 +6189,18 @@ class YggTwinP2PBridge(
      * address written differently from the profile record.
      */
     private fun isCallAddressedToLocalNode(ipv6: String): Boolean {
-        val canonical = YggCryptoEngine.normalizeIpv6Literal(ipv6) ?: return false
-        if (ipv6ToProfileIdMap.keys.any { YggCryptoEngine.normalizeIpv6Literal(it) == canonical }) return true
+        val clean = ipv6.trim().lowercase()
+        if (clean.isBlank()) return true
+        val canonical = YggCryptoEngine.normalizeIpv6Literal(clean)
+        if (canonical != null) {
+            if (ipv6ToProfileIdMap.keys.any { YggCryptoEngine.normalizeIpv6Literal(it) == canonical }) return true
+            if (profileIdToPubKeyMap.values.any { YggCryptoEngine.addressMatchesEd25519Key(canonical, it) }) return true
+        }
+        if (ipv6ToProfileIdMap.containsKey(clean)) return true
         // A profile row can hold no usable address while its node key is correct, and an
         // overlay address is nothing but that key written differently.
-        return profileIdToPubKeyMap.values.any { YggCryptoEngine.addressMatchesEd25519Key(ipv6, it) }
+        if (profileIdToPubKeyMap.values.any { YggCryptoEngine.addressMatchesEd25519Key(clean, it) }) return true
+        return false
     }
 
     /**
@@ -6257,8 +6270,8 @@ class YggTwinP2PBridge(
                     onTwinReachableChanged(true)
                     // This socket proves nothing about who answered, so the frame carries no
                     // sender key and a group message is not attributed to a member here.
-                    onDeliveryAckReceived(chatId, messageId, rtt, "", ackMap?.get("envVersions").orEmpty())
-                    if (ackMap != null) reportPeerVoiceCodecs(chatId, "", ackMap)
+                    onDeliveryAckReceived(chatId, messageId, rtt, "", ackMap.get("envVersions").orEmpty())
+                    reportPeerVoiceCodecs(chatId, "", ackMap)
                     logPacket(
                         direction = "ACK <- PEER",
                         summary = "Доставка подтверждена ACK через ${targetSocket.hostString}:${targetSocket.port} (RTT: $rtt мс)",
